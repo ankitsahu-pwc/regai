@@ -1,0 +1,16 @@
+# Force a consistent light theme so the high-contrast CSS in app.py works
+# uniformly regardless of the user's OS dark-mode preference.
+[theme]
+base = "light"
+primaryColor = "#d04a02"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#fff8f2"
+textColor = "#1a1a1a"
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+
+[browser]
+gatherUsageStats = false
