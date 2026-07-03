@@ -349,7 +349,7 @@ def _probe_genai(*, force_reload_env: bool = False) -> None:
 
     import os
     if force_reload_env:
-        load_dotenv(override=True)
+        load_dotenv()
 
     from services.genai_service import (
         build_http_client,
