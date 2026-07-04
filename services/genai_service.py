@@ -206,24 +206,65 @@ def build_http_client(settings: Optional[GenAISettings] = None) -> httpx.Client:
         ),
     )
 
+def _mask_secret(value: str) -> str:
+    """Return safe-to-log secret metadata without exposing the secret."""
+    value = (value or "").strip()
+    if not value:
+        return "missing"
+    if len(value) <= 8:
+        return f"present, length={len(value)}, masked=****"
+    return f"present, length={len(value)}, masked={value[:4]}...{value[-4:]}"
+
 
 def preflight_openai_connectivity(
     http_client: httpx.Client,
     settings: Optional[GenAISettings] = None,
-) -> bool:
-    """Lightweight chat-completions ping. Returns True if a 200 was observed."""
+) -> tuple[bool, str]:
+    """
+    Lightweight chat-completions ping.
+
+    Returns:
+        (success, diagnostic_message)
+
+    This intentionally logs config metadata and HTTP result, but never logs
+    the full API key.
+    """
     settings = settings or get_settings()
 
-    if settings.skip_api:
-        return False
-
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY", "")
+    target_url = f"{settings.base_url}/chat/completions"
+
+    diagnostics = [
+        "GenAI preflight diagnostics",
+        f"OPENAI_SKIP_API={settings.skip_api}",
+        f"base_url={settings.base_url}",
+        f"target_url={target_url}",
+        f"model={settings.model}",
+        f"timeout_seconds={settings.timeout_seconds}",
+        f"verify_ssl={settings.verify_ssl}",
+        f"ssl_strategy={settings.ssl_strategy}",
+        f"explicit_ca_bundle={settings.explicit_ca_bundle or 'not set'}",
+        f"HTTPS_PROXY={'set' if settings.https_proxy else 'not set'}",
+        f"HTTP_PROXY={'set' if settings.http_proxy else 'not set'}",
+        f"API_KEY={_mask_secret(os.getenv('API_KEY', ''))}",
+        f"OPENAI_API_KEY={_mask_secret(os.getenv('OPENAI_API_KEY', ''))}",
+    ]
+
+    if settings.skip_api:
+        diagnostics.append("Result=offline forced because OPENAI_SKIP_API=true")
+        message = "\n".join(diagnostics)
+        print(message, flush=True)
+        return False, message
+
     if not api_key:
-        return False
+        diagnostics.append("Result=API key missing. Set API_KEY in Azure App Settings.")
+        message = "\n".join(diagnostics)
+        print(message, flush=True)
+        return False, message
 
     try:
         response = http_client.post(
-            f"{settings.base_url}/chat/completions",
+            target_url,
             headers={
                 "accept": "application/json",
                 "Authorization": f"Bearer {api_key}",
@@ -236,13 +277,44 @@ def preflight_openai_connectivity(
                 "temperature": 0,
             },
         )
-    except Exception:
-        return False
 
-    if response.status_code == 200:
-        return True
-    return False
+        response_text = response.text or ""
+        diagnostics.extend(
+            [
+                f"HTTP status={response.status_code}",
+                f"HTTP reason={response.reason_phrase}",
+                f"response_content_type={response.headers.get('content-type', 'not set')}",
+                f"response_body_first_1000_chars={response_text[:1000]}",
+            ]
+        )
 
+        if response.status_code == 200:
+            diagnostics.append("Result=connected")
+            message = "\n".join(diagnostics)
+            print(message, flush=True)
+            return True, message
+
+        diagnostics.append("Result=HTTP call completed but did not return 200")
+        message = "\n".join(diagnostics)
+        print(message, flush=True)
+        return False, message
+
+    except httpx.ConnectTimeout as exc:
+        diagnostics.append(f"Result=ConnectTimeout: {exc}")
+    except httpx.ReadTimeout as exc:
+        diagnostics.append(f"Result=ReadTimeout: {exc}")
+    except httpx.ProxyError as exc:
+        diagnostics.append(f"Result=ProxyError: {exc}")
+    except httpx.ConnectError as exc:
+        diagnostics.append(f"Result=ConnectError: {exc}")
+    except httpx.TransportError as exc:
+        diagnostics.append(f"Result=TransportError: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        diagnostics.append(f"Result=UnexpectedError: {type(exc).__name__}: {exc}")
+
+    message = "\n".join(diagnostics)
+    print(message, flush=True)
+    return False, message
 
 def create_configured_llm(
     api_key: str,
@@ -349,7 +421,12 @@ class GenAIClient:
             return None
 
         http_client = build_http_client(settings)
-        if not preflight_openai_connectivity(http_client, settings):
+        # if not preflight_openai_connectivity(http_client, settings):
+        #     http_client.close()
+        #     return None
+        ok, diagnostic_message = preflight_openai_connectivity(http_client, settings)
+        if not ok:
+            print(diagnostic_message, flush=True)
             http_client.close()
             return None
 

@@ -349,7 +349,7 @@ def _probe_genai(*, force_reload_env: bool = False) -> None:
 
     import os
     if force_reload_env:
-        load_dotenv()
+        load_dotenv(override=False)
 
     from services.genai_service import (
         build_http_client,
@@ -363,6 +363,7 @@ def _probe_genai(*, force_reload_env: bool = False) -> None:
     message = ""
     settings = get_settings()
     if settings.skip_api:
+        # message = "OPENAI_SKIP_API=true in .env — offline mode forced."
         message = "OPENAI_SKIP_API=true in .env — offline mode forced."
     else:
         try:
@@ -374,7 +375,8 @@ def _probe_genai(*, force_reload_env: bool = False) -> None:
         if api_key:
             http_client = build_http_client(settings)
             try:
-                ok = preflight_openai_connectivity(http_client, settings)
+                # ok = preflight_openai_connectivity(http_client, settings)
+                ok, preflight_message = preflight_openai_connectivity(http_client, settings)
             except Exception as exc:
                 ok = False
                 message = f"Preflight raised {type(exc).__name__}: {exc}"
@@ -392,9 +394,11 @@ def _probe_genai(*, force_reload_env: bool = False) -> None:
                     message = f"LLM init failed: {type(exc).__name__}: {exc}"
             else:
                 http_client.close()
-                if not message:
-                    message = ("Preflight HTTP call did not return 200. "
-                               "Check API_KEY, model name, network/VPN, and proxy.")
+                # if not message:
+                #     message = ("Preflight HTTP call did not return 200. "
+                #                "Check API_KEY, model name, network/VPN, and proxy.")
+                
+                message = preflight_message
 
     st.session_state["genai_available"] = st.session_state.get("_genai_client") is not None
     st.session_state["genai_probe_message"] = message
