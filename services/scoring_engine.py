@@ -714,19 +714,25 @@ def score_value(value: Any, question: Optional[Mapping[str, Any]] = None) -> Opt
 
 
 def cxo_status(score: float) -> Tuple[str, str]:
-    """Return the canonical severity label + executive action for a score.
+    """Return the canonical severity label + executive action for a
+    readiness / compliance score.
 
-    Bands aligned across the app:
-        - score >= 90        -> Ready
-        - score 75 - 90     -> Watch
-        - score 50 - 75     -> At risk
-        - score <  50        -> Critical
+    Readiness bands aligned across the app (higher readiness = better):
+        - score >= 75        -> Ready
+        - score 50 - 75      -> Watch
+        - score 25 - 50      -> At risk
+        - score <  25        -> Critical
+
+    Impact = 100 - readiness. The impact-facing ladder is symmetric
+    (>=75 impact -> Critical, 50-75 -> At risk, 25-50 -> Watch,
+    <25 -> Ready), so a readiness score of 71.5% (impact 28.5%) reads
+    as "Watch" on both axes.
     """
-    if score >= 90:
-        return "Ready", "Maintain evidence and periodic validation."
     if score >= 75:
-        return "Watch", "Resolve targeted gaps before executive sign-off."
+        return "Ready", "Maintain evidence and periodic validation."
     if score >= 50:
+        return "Watch", "Resolve targeted gaps before executive sign-off."
+    if score >= 25:
         return "At risk", "Prioritise remediation plan, owners and evidence."
     return "Critical", "Escalate to governance and define funded remediation."
 

@@ -255,12 +255,13 @@ button[data-testid="stBaseButton-primary"]:hover {
 .rap-table-wrap {
     border: 2px solid #1a1a1a;
     border-radius: 8px;
-    padding: 0;
+    padding: 0 0 10px 0;
     background: #ffffff;
     margin: 0.35rem 0 0.9rem;
     overflow-x: auto;
     overflow-y: hidden;
     box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    scrollbar-gutter: stable;
 }
 .rap-table-wrap [data-testid="stDataFrame"] {
     border: none !important;
@@ -300,7 +301,8 @@ button[data-testid="stBaseButton-primary"]:hover {
     max-height: 380px;
     overflow-y: auto;
     overflow-x: auto;
-    scrollbar-gutter: stable;
+    padding-bottom: 10px;
+    scrollbar-gutter: stable both-edges;
 }
 /* Slim, subtle scrollbar to match the Regulatory Obligations
    (st.dataframe) look — applied to every wrapped table + expanders. */
@@ -448,11 +450,13 @@ button[data-testid="stBaseButton-primary"]:hover {
 
 /* ------------------------------------------------------------------ */
 /* Rules-Engine dashboard (Page 5) — palette + card / heatmap system.  */
-/* Anchored to a T+1 style reference:                                  */
-/*   Red   #e52528  = Critical (impact >= 60 or score < 40)             */
-/*   Amber #f2b91b  = At risk  (impact 35-59 or score 40-64)            */
-/*   Peach #fde7d6  = Watch    (impact < 35 or score 65-84)             */
-/*   Green #2e7d32  = Ready    (score >= 85)                            */
+/* Symmetric four-band ladder (aligned across the app):                */
+/*   Red   #ffb3b3 tile / #e52528 accent = Critical (readiness < 25%)   */
+/*   Amber #f2b91b tile                    = At risk  (readiness 25-50%)*/
+/*   Green #a8e6a8 tile                    = Watch    (readiness 50-75%)*/
+/*   Green #b7e4c0 tile / #14572d accent = Ready    (readiness >= 75%)  */
+/* Tile *body* text is always #111 for readability; only the dark-grey  */
+/* group-heading strip above uses white text.                          */
 /* ------------------------------------------------------------------ */
 :root {
     --dash-red: #e52528;
@@ -910,7 +914,14 @@ button[data-testid="stBaseButton-primary"]:hover {
     align-items: center;
     letter-spacing: 0.2px;
 }
-.dash-heatgroup-title, .dash-heatgroup-title * {
+/* Streamlit's global stMarkdownContainer span rule (color: #1a1a1a) wins by
+   specificity, so we scope the white override to the same container. */
+.dash-heatgroup-title,
+.dash-heatgroup-title *,
+[data-testid="stMarkdownContainer"] .dash-heatgroup-title,
+[data-testid="stMarkdownContainer"] .dash-heatgroup-title *,
+[data-testid="stMarkdownContainer"] .dash-heatgroup-title span,
+[data-testid="stMarkdownContainer"] .dash-heatgroup-title strong {
     color: #ffffff !important;
 }
 .dash-heatgroup-title .dash-heatgroup-avg {
@@ -940,15 +951,46 @@ button[data-testid="stBaseButton-primary"]:hover {
     line-height: 1.15;
     border: 1px solid #ffffff;
 }
-.dash-heat-tile.crit  { background: var(--dash-red);   color: #ffffff; }
-.dash-heat-tile.risk  { background: var(--dash-amber); color: #111111; }
-.dash-heat-tile.watch { background: #a8e6a8;           color: #0f3d0f; }
-.dash-heat-tile.ready { background: #14572d;           color: #ffffff; }
-.dash-heat-tile.none  { background: #eef0f3;           color: #6a6a6a; }
-.dash-heat-cap  { font-size: 0.78rem; font-weight: 600; }
-.dash-heat-score { font-size: 0.72rem; font-weight: 700; margin-top: 4px; }
+/* Tile backgrounds keep their four-band colour, but the tile *body* text
+   (function name + Impact / Readiness lines) is always dark so it reads
+   as data. Only the group heading strip above uses white on dark grey. */
+.dash-heat-tile.crit  { background: #ffb3b3;           color: #111111 !important; }
+.dash-heat-tile.risk  { background: var(--dash-amber); color: #111111 !important; }
+.dash-heat-tile.watch { background: #a8e6a8;           color: #111111 !important; }
+.dash-heat-tile.ready { background: #b7e4c0;           color: #111111 !important; }
+.dash-heat-tile.none  { background: #eef0f3;           color: #6a6a6a !important; }
+/* High-specificity overrides so Streamlit's stMarkdownContainer span rule
+   (color: #1a1a1a !important) doesn't leak white into these tiles. */
+.dash-heat-tile.crit,
+.dash-heat-tile.crit  *,
+.dash-heat-tile.risk,
+.dash-heat-tile.risk  *,
+.dash-heat-tile.watch,
+.dash-heat-tile.watch *,
+.dash-heat-tile.ready,
+.dash-heat-tile.ready *,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.crit,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.crit *,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.risk,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.risk *,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.watch,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.watch *,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.ready,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.ready * {
+    color: #111111 !important;
+    text-shadow: none !important;
+}
+[data-testid="stMarkdownContainer"] .dash-heat-tile.none,
+[data-testid="stMarkdownContainer"] .dash-heat-tile.none * {
+    color: #6a6a6a !important;
+}
+.dash-heat-cap   { font-size: 0.80rem; font-weight: 800; }
+.dash-heat-score { font-size: 0.74rem; font-weight: 700; margin-top: 4px; }
 
-/* Question-Level Scoring Detail — dense reference-style table. */
+/* Question-Level Scoring Detail — dense reference-style table.
+   Scrollbars are placed *outside* the text using scrollbar-gutter so
+   they never overlap the last column, and a bottom padding equal to
+   the scrollbar height keeps the horizontal bar clear of the last row. */
 .dash-qtable-wrap {
     max-height: 480px;
     overflow: auto;
@@ -956,6 +998,26 @@ button[data-testid="stBaseButton-primary"]:hover {
     border-radius: 8px;
     background: #ffffff;
     margin: 0.25rem 0 0.6rem;
+    padding-bottom: 10px;
+    scrollbar-gutter: stable both-edges;
+    scrollbar-width: thin;
+    scrollbar-color: #bfae9a #f4ece2;
+}
+.dash-qtable-wrap::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+.dash-qtable-wrap::-webkit-scrollbar-track {
+    background: #f4ece2;
+    border-radius: 8px;
+}
+.dash-qtable-wrap::-webkit-scrollbar-thumb {
+    background: #bfae9a;
+    border-radius: 8px;
+    border: 2px solid #f4ece2;
+}
+.dash-qtable-wrap::-webkit-scrollbar-thumb:hover {
+    background: #a0895f;
 }
 .dash-qtable {
     width: 100%;
@@ -969,19 +1031,23 @@ button[data-testid="stBaseButton-primary"]:hover {
     background: var(--dash-blue);
     color: #ffffff;
     text-align: left;
-    padding: 8px 10px;
+    padding: 8px 12px;
     font-weight: 800;
     text-transform: capitalize;
     letter-spacing: 0.2px;
     z-index: 1;
     border-bottom: 1.5px solid #0b3a5a;
 }
+.dash-qtable thead th:first-child { padding-left: 14px; }
+.dash-qtable thead th:last-child  { padding-right: 14px; }
 .dash-qtable tbody td {
     border-top: 1px solid var(--dash-border);
-    padding: 7px 10px;
+    padding: 7px 12px;
     vertical-align: top;
     color: #1a1a1a;
 }
+.dash-qtable tbody td:first-child { padding-left: 14px; }
+.dash-qtable tbody td:last-child  { padding-right: 14px; }
 .dash-qtable tbody tr:nth-child(even) td { background: #fbfbfb; }
 .dash-qtable tbody tr:hover td { background: #fdf6f0; }
 
@@ -1235,7 +1301,9 @@ button[data-testid="stBaseButton-primary"]:hover {
             color: #ffffff !important;}
 .pwc-title .pwc-title-accent {color: #ffd7b8 !important; font-weight: 800;}
 .pwc-subtitle {font-size: 0.98rem; margin-top: .35rem; opacity: .95;
-               color: #f7e6dc !important; font-weight: 400;}
+               color: #f7e6dc !important; font-weight: 400;
+               text-transform: none !important;}
+.pwc-subtitle::first-letter {text-transform: uppercase;}
 
 /* ------------------------------------------------------------------ */
 /* Optional regulation document — colourful side card                  */
@@ -1489,13 +1557,13 @@ html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
     background: #ffffff;
     border: 1px solid #ead8cc;
     border-radius: 12px;
-    padding: 0.75rem 0.9rem 0.9rem;
+    padding: 0.75rem 0.9rem 1.1rem;
     box-shadow: 0 2px 8px rgba(0,0,0,0.04);
     margin: 0.35rem 0 0.6rem;
     max-height: 380px;
     overflow-x: auto;
     overflow-y: auto;
-    scrollbar-gutter: stable;
+    scrollbar-gutter: stable both-edges;
     scrollbar-width: thin;
     scrollbar-color: #bfae9a #f4ece2;
 }
@@ -1593,8 +1661,8 @@ def _render_hero() -> str:
         '<p class="pwc-title"><span class="pwc-title-accent">Reg AI RAP</span>'
         " &nbsp;&ndash;&nbsp; A Complete Regulatory Impact Assessment &amp;"
         " Readiness Platform</p>"
-        '<p class="pwc-subtitle">Upload a regulation and get clear business'
-        " impact, required actions, and practical recommendations.</p>"
+        '<p class="pwc-subtitle">Upload a Regulation and get clear Business'
+        " Impact, Required Actions, and Practical Recommendations.</p>"
         "</div>"
     )
 
@@ -3554,10 +3622,10 @@ def _clear_questionnaire_answers() -> None:
 
 
 # Seed target scores for the four severity bands used on the dashboard.
-# Critical / At risk / Watch / Ready. The outer targets are intentionally
-# extreme (0.10 and 0.98) so per-area averages actually cross the < 40%
-# and >= 85% thresholds even after the scoring engine's averaging noise.
-_SEED_BAND_TARGETS: Tuple[float, ...] = (0.10, 0.50, 0.75, 0.98)
+# Critical / At risk / Watch / Ready. Values chosen so per-area averages
+# actually cross the readiness ladder (< 25% / 25-50% / 50-75% / >= 75%)
+# even after the scoring engine's per-question averaging noise.
+_SEED_BAND_TARGETS: Tuple[float, ...] = (0.15, 0.38, 0.62, 0.90)
 
 
 def _seed_target_for_area(area: str) -> float:
@@ -4337,9 +4405,11 @@ def render_dashboard_page() -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "Impact severity uses the same four-band ladder as the rest of "
-        "the dashboard: Critical (< 50%), At Risk (50 - 75%), "
-        "Watch (75 - 90%), Ready (\u2265 90%)."
+        "Impact severity uses the impact ladder (higher impact = worse): "
+        "Critical (\u2265 75%), At Risk (50 - 75%), "
+        "Watch (25 - 50%), Ready (< 25%). "
+        "Readiness scores use the mirror ladder (higher readiness = better) "
+        "so the two axes always agree."
     )
     _render_dashboard_impact_cards(area_summary)
 
@@ -4449,16 +4519,19 @@ def _autorun_recommendations_if_needed(
 # ---------------------------------------------------------------------------
 
 def _severity_class(score: Optional[float]) -> str:
-    """Map a compliance / readiness score to one of the four canonical
+    """Map a **readiness / compliance** score to one of the four canonical
     severity CSS classes used on Page 5. Mirrors ``cxo_status`` in
     ``services.scoring_engine`` so colour coding stays consistent with the
     text labels users see elsewhere in the app.
 
-    Bands (aligned across the app):
-        - score >= 90        -> Ready    (dark green)
-        - score 75  - 90    -> Watch    (light green)
-        - score 50  - 75    -> At risk  (amber)
-        - score <  50        -> Critical (red)
+    Readiness bands (higher readiness = better, aligned across the app):
+        - score >= 75        -> Ready    (dark green)
+        - score 50  - 75    -> Watch    (light green)
+        - score 25  - 50    -> At risk  (amber)
+        - score <  25        -> Critical (red)
+
+    Use :func:`_impact_class` for scores expressed as **impact %**
+    (higher impact = worse).
     """
     if score is None:
         return "none"
@@ -4466,13 +4539,38 @@ def _severity_class(score: Optional[float]) -> str:
         val = float(score)
     except (TypeError, ValueError):
         return "none"
-    if val >= 90:
-        return "ready"
     if val >= 75:
-        return "watch"
+        return "ready"
     if val >= 50:
+        return "watch"
+    if val >= 25:
         return "risk"
     return "crit"
+
+
+def _impact_class(impact: Optional[float]) -> str:
+    """Map an **impact %** (higher impact = worse) to a severity CSS class.
+
+    Impact bands (mirror of the readiness ladder, so impact and
+    readiness always agree once you flip the axis):
+        - impact >= 75       -> Critical (red)
+        - impact 50 - 75     -> At risk  (amber)
+        - impact 25 - 50     -> Watch    (light green)
+        - impact <  25       -> Ready    (dark green)
+    """
+    if impact is None:
+        return "none"
+    try:
+        val = float(impact)
+    except (TypeError, ValueError):
+        return "none"
+    if val >= 75:
+        return "crit"
+    if val >= 50:
+        return "risk"
+    if val >= 25:
+        return "watch"
+    return "ready"
 
 
 def _severity_label_from_status(status: Optional[str]) -> str:
@@ -4509,19 +4607,19 @@ def _dashboard_high_impact_area_count(area_summary: Dict[str, Dict[str, Any]]) -
     return count
 
 
-def _impact_severity_from_score(readiness: Optional[float]) -> Tuple[str, str]:
-    """Bucket an area's readiness score into one of the four canonical
-    impact severity labels + matching CSS class.
+def _readiness_severity_from_score(readiness: Optional[float]) -> Tuple[str, str]:
+    """Bucket a **readiness / compliance** score into one of the four
+    canonical severity labels + matching CSS class (higher readiness =
+    better).
 
-    Uses the same thresholds as ``_severity_class`` so the "Impact
-    assessment by area" tiles, "Area-wise readiness overview" tiles, and
-    the "Area x Function heatmap" cells all share the identical four-band
-    colour ladder:
+    Uses the same thresholds as :func:`_severity_class` so the "Area-Wise
+    Readiness Overview" tiles, area recommendation cards and the
+    heatmap all share one four-band colour ladder:
 
-      - readiness < 50%       -> CRITICAL   (crit  / red)
-      - readiness 50 - 75%    -> AT RISK    (risk  / amber)
-      - readiness 75 - 90%    -> WATCH      (watch / light green)
-      - readiness >= 90%      -> READY      (ready / dark green)
+      - readiness <  25%      -> CRITICAL   (crit  / red)
+      - readiness 25 - 50%    -> AT RISK    (risk  / amber)
+      - readiness 50 - 75%    -> WATCH      (watch / light green)
+      - readiness >= 75%      -> READY      (ready / dark green)
 
     Returns ``(label, css_class)``.
     """
@@ -4531,11 +4629,41 @@ def _impact_severity_from_score(readiness: Optional[float]) -> Tuple[str, str]:
         val = float(readiness)
     except (TypeError, ValueError):
         return ("N/A", "none")
-    if val < 50.0:
+    if val < 25.0:
         return ("Critical", "crit")
-    if val < 75.0:
+    if val < 50.0:
         return ("At Risk", "risk")
-    if val < 90.0:
+    if val < 75.0:
+        return ("Watch", "watch")
+    return ("Ready", "ready")
+
+
+def _impact_severity_from_score(impact: Optional[float]) -> Tuple[str, str]:
+    """Bucket an **impact %** (higher impact = worse) into one of the
+    four canonical severity labels + matching CSS class.
+
+    Impact bands (mirror of the readiness ladder):
+
+      - impact >= 75%         -> CRITICAL   (crit  / red)
+      - impact 50 - 75%       -> AT RISK    (risk  / amber)
+      - impact 25 - 50%       -> WATCH      (watch / light green)
+      - impact <  25%         -> READY      (ready / dark green)
+
+    Returns ``(label, css_class)``. Because impact = 100 - readiness,
+    calling this with impact and calling :func:`_readiness_severity_from_score`
+    with the matching readiness value always return the same label.
+    """
+    if impact is None:
+        return ("N/A", "none")
+    try:
+        val = float(impact)
+    except (TypeError, ValueError):
+        return ("N/A", "none")
+    if val >= 75.0:
+        return ("Critical", "crit")
+    if val >= 50.0:
+        return ("At Risk", "risk")
+    if val >= 25.0:
         return ("Watch", "watch")
     return ("Ready", "ready")
 
@@ -4543,15 +4671,15 @@ def _impact_severity_from_score(readiness: Optional[float]) -> Tuple[str, str]:
 def _render_dashboard_hero(*, readiness_pct: float, confidence_pct: float) -> None:
     """Render the two-tile hero strip for overall Impact and Readiness.
 
-    The overall impact severity (HIGH / MEDIUM / LOW) is derived from the
-    portfolio-wide readiness score using the same threshold ladder we
-    apply to per-area severity, so the hero and the area cards below
-    always agree.
+    Impact severity uses the impact ladder (higher impact = worse),
+    readiness severity uses the readiness ladder (higher readiness =
+    better). Since impact = 100 - readiness the two labels always
+    agree on the same underlying assessment.
     """
     readiness = max(0.0, min(100.0, readiness_pct))
     impact = max(0.0, min(100.0, 100.0 - readiness))
     read_css = _severity_class(readiness)
-    imp_label, imp_css = _impact_severity_from_score(readiness)
+    imp_label, imp_css = _impact_severity_from_score(impact)
     conf = max(0.0, min(100.0, confidence_pct))
     html_out = (
         '<div class="dash-hero">'
@@ -4638,7 +4766,7 @@ def _render_dashboard_impact_cards(area_summary: Dict[str, Dict[str, Any]]) -> N
 
     cards: List[str] = ['<div class="dash-cards impact-grid">']
     for name, readiness, impact, status in rows:
-        label, css = _impact_severity_from_score(readiness)
+        label, css = _impact_severity_from_score(impact)
         cards.append(
             f'<div class="dash-card {css}">'
             f'<div class="dash-card-title">{html.escape(name)}</div>'
@@ -4759,10 +4887,10 @@ def _render_dashboard_legend(
     total = sum(buckets.values()) or 1
 
     bands = [
-        ("crit",  "Critical", "< 50%",    "Immediate action"),
-        ("risk",  "At Risk",  "50 - 75%", "Elevated attention"),
-        ("watch", "Watch",    "75 - 90%", "Monitor and refine"),
-        ("ready", "Ready",    "\u2265 90%", "Meeting expectations"),
+        ("crit",  "Critical", "Readiness < 25%",       "Immediate action"),
+        ("risk",  "At Risk",  "Readiness 25 - 50%",    "Elevated attention"),
+        ("watch", "Watch",    "Readiness 50 - 75%",    "Monitor and refine"),
+        ("ready", "Ready",    "Readiness \u2265 75%",  "Meeting expectations"),
     ]
 
     cards: List[str] = ['<div class="sev-strip">']
@@ -4785,7 +4913,7 @@ def _render_dashboard_legend(
     st.markdown(
         '<div class="sev-caption">'
         '<span class="sev-caption-title">Severity distribution</span>'
-        '<span class="sev-caption-hint">Areas &middot; Functions &middot; Area \u00d7 Function pairs</span>'
+        '<span class="sev-caption-hint">Counts across scored areas, functions and area \u00d7 function pairs</span>'
         '<span class="sev-caption-live">Live</span>'
         '</div>'
         + "".join(cards),
@@ -4887,8 +5015,8 @@ def _render_dashboard_pair_heatmap(pair_scores: Dict[Any, float]) -> None:
                 )
                 continue
             impact = max(0.0, min(100.0, 100.0 - float(readiness)))
-            impact_label, _ = _impact_severity_from_score(100.0 - impact)
-            readiness_label, _ = _impact_severity_from_score(readiness)
+            impact_label, _ = _impact_severity_from_score(impact)
+            readiness_label, _ = _readiness_severity_from_score(readiness)
             css = _severity_class(readiness)
             html_out.append(
                 f'<div class="dash-heat-tile {css}">'
@@ -4988,11 +5116,12 @@ def _render_dashboard_area_recommendations(
             readiness = 0.0
         impact = max(0.0, min(100.0, 100.0 - readiness))
         status = str(summary.get("CXO status") or "").strip() or "\u2014"
-        label, css = _impact_severity_from_score(readiness)
+        label, css = _impact_severity_from_score(impact)
         area_recs = grouped.get(area, [])
         bullets = _build_area_recommendation_bullets(
             area=area,
             readiness=readiness,
+            impact=impact,
             status=status,
             severity_label=label,
             area_recs=area_recs,
@@ -5022,109 +5151,816 @@ def _render_dashboard_area_recommendations(
     st.markdown("".join(cards), unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Area-specific recommendation playbook (per-area × per-severity content)
+# ---------------------------------------------------------------------------
+#
+# Each area entry carries:
+#   - ``meta``: forum, executive owner, one-line "why it matters"
+#   - ``tiers``: a dict of severity -> {first_move, actions, evidence, success}
+#     with concrete, domain-appropriate content for that combination.
+#
+# Severity keys are the canonical labels used across the app:
+# "critical" (< 25% readiness), "at_risk" (25-50%), "watch" (50-75%),
+# "ready" (>= 75%). The lookup is prefix-based so "Cyber Security" also
+# resolves "Cyber Security & Resilience", and unknown areas fall back to
+# a neutral executive playbook.
+#
+# Adding a new area = add a new entry with 4 tiers × 4 bullet fragments.
+# Rewording an existing severity = edit exactly one string.
+
+_SEVERITY_KEYS = ("critical", "at_risk", "watch", "ready")
+
+
+def _canon_severity(label: str) -> str:
+    """Normalise a severity label (``Critical`` / ``At Risk`` / ``Watch``
+    / ``Ready``) to the tier key used by the playbook."""
+    s = (label or "").strip().lower()
+    if s == "critical":
+        return "critical"
+    if s in ("at risk", "at_risk"):
+        return "at_risk"
+    if s == "watch":
+        return "watch"
+    if s == "ready":
+        return "ready"
+    return "watch"
+
+
+_AREA_PLAYBOOK: Dict[str, Dict[str, Any]] = {
+    "Governance": {
+        "meta": {
+            "forum": "management body / board risk committee",
+            "owner": "Chief Compliance Officer",
+            "why": "Governance gaps expose the whole DORA programme to supervisory findings and undermine every downstream control.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Convene an extraordinary board risk session, table a DORA-specific charter and reset delegated authorities so ICT-risk decisions are traceable to a named accountable executive.",
+                "actions": "Publish a board-approved DORA governance charter, refresh the three-lines-of-defence RACI, and stand up a fortnightly management-body update until controls stabilise.",
+                "evidence": "Board pack extracts, revised terms of reference, RACI matrix and the last 6 sets of committee minutes evidencing effective challenge.",
+                "success": "Documented board approval of the DORA governance model plus two consecutive committee cycles with recorded challenge on ICT-risk items.",
+            },
+            "at_risk": {
+                "first_move": "Escalate to the next scheduled board risk committee with a red-flagged governance paper covering charter, mandate and accountability gaps.",
+                "actions": "Close open governance actions from the last 6 months, refresh delegated authorities and publish an updated ICT-risk policy for board sign-off.",
+                "evidence": "Committee minutes, action-log burndown, updated policy set and independent challenge notes from Risk / Audit.",
+                "success": "All open governance actions closed within 60 days and one clean quarter of board minutes evidencing DORA-specific challenge.",
+            },
+            "watch": {
+                "first_move": "Bring a themed governance update to the next scheduled committee to close residual policy and delegation gaps.",
+                "actions": "Confirm annual attestation of the DORA governance framework, refresh KRIs surfaced to the board and validate escalation thresholds.",
+                "evidence": "Annual attestation memo, KRI pack extract and delegation-of-authority matrix.",
+                "success": "Committee attestation signed on schedule and no open governance findings older than 90 days.",
+            },
+            "ready": {
+                "first_move": "Keep governance oversight on the standard committee agenda and preserve the current cadence of ICT-risk reporting to the board.",
+                "actions": "Run the annual governance refresh, benchmark against peer disclosures and archive prior-cycle evidence.",
+                "evidence": "Annual governance review memo, peer benchmark note and archived committee packs.",
+                "success": "Zero governance-related supervisory observations at the next thematic review.",
+            },
+        },
+    },
+    "Risk Management": {
+        "meta": {
+            "forum": "enterprise risk committee",
+            "owner": "Chief Risk Officer",
+            "why": "Weak ICT-risk oversight lets residual risk drift beyond appetite and undermines every downstream control decision.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze ICT-risk appetite decisions pending a full re-baselining of the ICT-risk register, and appoint a dedicated risk lead to shepherd the rebuild.",
+                "actions": "Rebuild the ICT-risk register end-to-end, redefine tolerance thresholds and stress-test each Tier-1 scenario with a fresh challenge session.",
+                "evidence": "Re-baselined ICT-risk register, revised tolerance schedule and Tier-1 scenario stress-test outputs with independent challenge notes.",
+                "success": "New risk register approved by the ERC and residual risk mapped inside tolerance for at least the top 10 ICT scenarios.",
+            },
+            "at_risk": {
+                "first_move": "Table a red-status ICT-risk update at the next ERC with a remediation plan for the top 5 out-of-tolerance risks.",
+                "actions": "Refresh the top-25 ICT risks, revalidate tolerance breaches and drive owner sign-off on mitigation plans with dated milestones.",
+                "evidence": "Updated top-25 heat map, breach log with mitigation plans and owner-signed remediation charters.",
+                "success": "Top-5 out-of-tolerance risks brought back inside appetite within 90 days.",
+            },
+            "watch": {
+                "first_move": "Refresh the ICT-risk challenge cadence at the next ERC and validate that KRIs still trigger the intended escalation.",
+                "actions": "Re-test KRI trigger points, review appetite thresholds for drift and refresh scenario libraries with fresh threat intel.",
+                "evidence": "KRI back-test results, threshold review memo and updated scenario library.",
+                "success": "All KRIs proven to trigger inside their SLA and no scenario library entry older than 12 months.",
+            },
+            "ready": {
+                "first_move": "Retain the current ICT-risk cadence at the ERC and roll the framework into the annual risk review.",
+                "actions": "Annual back-test of ICT-risk tolerances, peer-benchmark KRIs and archive the year's risk artefacts.",
+                "evidence": "Annual back-test report, benchmark memo and archived risk register versions.",
+                "success": "Annual risk attestation signed with zero material findings.",
+            },
+        },
+    },
+    "Business Continuity": {
+        "meta": {
+            "forum": "operational resilience steering committee",
+            "owner": "Business Continuity Manager",
+            "why": "Resilience gaps translate directly into breach of DORA Article 11 impact tolerances and undermine severe-but-plausible scenario response.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Halt any new critical-service go-lives, run a rapid BIA on the top 5 critical services and treat as a live crisis until impact tolerances are demonstrably deliverable.",
+                "actions": "Rebuild the BIA, redefine impact tolerances and execute a severe-but-plausible test for each Tier-1 service within 30 days.",
+                "evidence": "Refreshed BIA, tolerance schedule, scenario-test playbooks and post-exercise reports with root-cause and remediation actions.",
+                "success": "Every Tier-1 critical service demonstrably recoverable within its stated impact tolerance in a live test.",
+            },
+            "at_risk": {
+                "first_move": "Escalate the resilience gaps to the operational resilience committee with a dated recovery plan for the top exposed services.",
+                "actions": "Refresh the BIA for the top 20 critical services, close open scenario-test findings and re-run the two weakest scenarios.",
+                "evidence": "Updated BIA extracts, scenario-test findings register and re-run reports.",
+                "success": "All scenario-test findings closed within SLA and re-run scenarios pass tolerance.",
+            },
+            "watch": {
+                "first_move": "Confirm annual tolerance attestation is on track and validate the exercise calendar for the coming year.",
+                "actions": "Run the scheduled scenario cycle, refresh the third-party dependency map and stress-test the incident bridge.",
+                "evidence": "Exercise calendar, third-party dependency map and bridge-test after-action review.",
+                "success": "Scheduled scenarios executed on time with zero critical after-action items outstanding.",
+            },
+            "ready": {
+                "first_move": "Preserve the current test cadence and roll resilience into the annual DORA attestation.",
+                "actions": "Annual resilience review, external benchmark against peer tests and archive prior exercise evidence.",
+                "evidence": "Annual review memo, benchmark note and archived scenario evidence.",
+                "success": "Annual attestation signed with tolerances demonstrably met.",
+            },
+        },
+    },
+    "Incident": {
+        "meta": {
+            "forum": "ICT incident review board",
+            "owner": "ICT Incident Response Lead",
+            "why": "Incident classification and reporting gaps trigger DORA Article 19 notification failures and expose the firm to supervisory escalation.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Stand up a 24×7 incident bridge, rehearse the DORA classification workflow against the last 20 incidents and pre-stage regulator notifications.",
+                "actions": "Rebuild the incident classification model, dry-run the DORA 4-hour / 72-hour timelines and align severity thresholds with the ERC.",
+                "evidence": "Classification decision tree, walk-back of last 20 incidents, dry-run timelines and pre-staged regulator notification templates.",
+                "success": "Every dry-run classification decision defensible and the 4/72 hour timeline demonstrably met on at least three rehearsed incidents.",
+            },
+            "at_risk": {
+                "first_move": "Bring a themed incident-management update to the incident review board with a remediation plan for reporting and classification gaps.",
+                "actions": "Close the open post-incident actions, refresh the notification templates and rehearse the DORA timeline with front-line teams.",
+                "evidence": "Post-incident action log, refreshed notification templates and rehearsal after-action reviews.",
+                "success": "All open post-incident actions closed and one full rehearsal completed within SLA.",
+            },
+            "watch": {
+                "first_move": "Confirm the quarterly rehearsal cadence and validate that classification thresholds still align with recent incident trends.",
+                "actions": "Run the quarterly rehearsal, refresh the incident taxonomy against the latest trend data and update the on-call schedule.",
+                "evidence": "Rehearsal report, refreshed taxonomy and up-to-date on-call schedule.",
+                "success": "Quarterly rehearsal signed off with zero critical findings.",
+            },
+            "ready": {
+                "first_move": "Preserve the current incident-response cadence and roll capability into the annual attestation.",
+                "actions": "Annual review of incident metrics, external benchmark of MTTR/MTTC and archive rehearsal evidence.",
+                "evidence": "Annual metrics memo, benchmark note and archived rehearsal evidence.",
+                "success": "Annual attestation signed with all DORA notification timelines demonstrably met.",
+            },
+        },
+    },
+    "Third": {
+        "meta": {
+            "forum": "third-party risk oversight forum",
+            "owner": "Head of Vendor / Third-Party Risk",
+            "why": "Third-party gaps become concentration risk under the DORA critical-provider regime and expose contracts to unenforceable obligations.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze on-boarding of new ICT third parties, treat the critical-provider register as a live artefact and stand up a war room to remediate contracts and exit plans.",
+                "actions": "Re-tier every ICT vendor against Chapter V criteria, renegotiate contract clauses on audit, sub-contracting and exit, and re-execute exit tests for Tier-1 providers.",
+                "evidence": "Re-tiered critical-provider register, remediated contract clauses, updated exit playbooks and exit-test evidence for each Tier-1 provider.",
+                "success": "Every Tier-1 provider covered by a compliant contract clause set and a demonstrably executable exit plan.",
+            },
+            "at_risk": {
+                "first_move": "Bring a red-status third-party update to the oversight forum focused on Chapter V clause gaps and exit-plan freshness.",
+                "actions": "Remediate contract clauses on the top-30 providers, refresh sub-contractor visibility and re-run exit walkthroughs for the weakest 5 providers.",
+                "evidence": "Contract remediation tracker, sub-contractor register and exit-walkthrough after-action reviews.",
+                "success": "Top-30 provider contracts remediated within 90 days and sub-contractor visibility current.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual third-party attestation timeline and validate concentration KRIs at the oversight forum.",
+                "actions": "Refresh the concentration heat-map, re-run the annual exit test for one Tier-1 provider and update the sub-contractor register.",
+                "evidence": "Concentration heat-map, annual exit-test evidence and refreshed sub-contractor register.",
+                "success": "Annual attestation signed with concentration KRIs inside tolerance.",
+            },
+            "ready": {
+                "first_move": "Retain current provider oversight cadence and roll third-party into the annual DORA attestation.",
+                "actions": "Annual third-party review, benchmark critical-provider KPIs and archive prior-cycle exit-test evidence.",
+                "evidence": "Annual review memo, benchmark note and archived exit-test evidence.",
+                "success": "Annual attestation signed with zero material third-party findings.",
+            },
+        },
+    },
+    "Cyber": {
+        "meta": {
+            "forum": "cyber steering committee",
+            "owner": "Chief Information Security Officer",
+            "why": "Cyber gaps drive the residual likelihood of every operational-risk scenario and are the first line supervisors probe under DORA.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Convene a cyber war room, freeze non-essential change, and pre-scope a Threat-Led Penetration Test (TLPT) against Tier-1 services within 30 days.",
+                "actions": "Halve open critical vulnerabilities, expand MITRE ATT&CK detection coverage over the crown-jewels estate and rehearse ransomware playbooks with the incident bridge.",
+                "evidence": "12-month vulnerability trend, ATT&CK coverage matrix, TLPT scoping brief, ransomware playbook rehearsal report.",
+                "success": "Open critical vulnerabilities halved in 30 days and TLPT scope agreed with independent testers.",
+            },
+            "at_risk": {
+                "first_move": "Bring a red-status cyber update to the steering committee focused on detection coverage and TLPT readiness.",
+                "actions": "Close the open red-team findings, extend detection coverage to gap areas and run a targeted purple-team exercise on the weakest control family.",
+                "evidence": "Red-team findings tracker, detection coverage matrix and purple-team after-action review.",
+                "success": "All red-team findings closed within SLA and detection coverage above the agreed target.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual TLPT calendar and validate that detective controls still fire against current-year threat scenarios.",
+                "actions": "Run the annual purple-team cycle, refresh the ATT&CK coverage baseline and validate response SLAs on the SOC.",
+                "evidence": "Annual purple-team report, refreshed ATT&CK baseline and SOC SLA report.",
+                "success": "Annual purple-team signed off with zero unmitigated critical findings.",
+            },
+            "ready": {
+                "first_move": "Retain the current cyber cadence and roll defensive posture into the annual DORA attestation.",
+                "actions": "Annual cyber posture review, peer benchmark of ATT&CK coverage and archive prior-cycle test evidence.",
+                "evidence": "Annual posture memo, benchmark note and archived TLPT / purple-team evidence.",
+                "success": "Annual attestation signed with zero unmitigated critical cyber findings.",
+            },
+        },
+    },
+    "Technology": {
+        "meta": {
+            "forum": "technology risk & operations forum",
+            "owner": "Chief Technology Officer",
+            "why": "Unresolved technology gaps propagate to every business service that runs on the platform and degrade the reliability of every critical business flow.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Institute a change freeze on Tier-1 platforms, force a full asset-inventory reconciliation and stand up a daily production stability call.",
+                "actions": "Reconcile the asset inventory, force a baseline configuration on Tier-1 platforms and close all open Sev-1/2 production incidents within 30 days.",
+                "evidence": "Reconciled CMDB, baseline configuration report, patch compliance trend and post-incident review pack.",
+                "success": "CMDB reconciliation at 100% for Tier-1 assets and open Sev-1/2 incident tail cleared.",
+            },
+            "at_risk": {
+                "first_move": "Bring a red-status IT operations update to the technology forum focused on change failure rate and patch compliance.",
+                "actions": "Reduce change-failure rate below the agreed threshold, close the vulnerability backlog on Tier-1 assets and refresh the DR runbook for the two weakest services.",
+                "evidence": "Change-failure trend, vulnerability backlog burndown and refreshed DR runbook.",
+                "success": "Change-failure rate below target for three consecutive cycles and Tier-1 vulnerability backlog cleared.",
+            },
+            "watch": {
+                "first_move": "Confirm quarterly platform-health metrics are trending correctly and validate the DR test schedule.",
+                "actions": "Run the scheduled DR test, refresh the configuration baseline and validate SRE golden signals on Tier-1 services.",
+                "evidence": "DR-test after-action report, refreshed baseline and SRE golden-signals dashboard.",
+                "success": "DR test executed within SLA and golden signals green for three consecutive cycles.",
+            },
+            "ready": {
+                "first_move": "Maintain the current technology cadence and roll platform stability into the annual DORA attestation.",
+                "actions": "Annual platform-health review, peer benchmark of MTTR and archive DR-test evidence.",
+                "evidence": "Annual health memo, benchmark note and archived DR-test evidence.",
+                "success": "Annual attestation signed with platform-stability KPIs at or above target.",
+            },
+        },
+    },
+    "Data": {
+        "meta": {
+            "forum": "data governance council",
+            "owner": "Chief Data Officer",
+            "why": "Data-governance gaps directly compromise the accuracy of regulatory reporting and surface first in supervisory data-quality reviews.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze new reporting go-lives, launch a lineage rebuild for the top 10 regulatory reports and stand up a daily data-quality bridge.",
+                "actions": "Rebuild end-to-end lineage for Tier-1 reports, remediate reference-data ownership gaps and re-baseline reconciliation controls.",
+                "evidence": "Lineage diagrams, reference-data ownership matrix, reconciliation exception log and root-cause pack.",
+                "success": "Tier-1 reports each have signed-off lineage plus reconciliation controls proven for two consecutive cycles.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a red-status data-quality update to the governance council focused on reconciliation exceptions and reference-data ownership.",
+                "actions": "Close the top reconciliation exceptions, remediate reference-data owner assignments and re-run controls on the weakest reports.",
+                "evidence": "Reconciliation exception burndown, reference-data ownership tracker and control re-run evidence.",
+                "success": "Reconciliation exceptions cleared inside SLA and reference-data ownership at 100% for critical domains.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual data-quality attestation is on track and validate lineage completeness against the current reporting inventory.",
+                "actions": "Refresh the lineage completeness dashboard, re-run reference-data monitoring and validate controls sampling.",
+                "evidence": "Lineage completeness dashboard, monitoring reports and control-sample evidence.",
+                "success": "Annual attestation signed and lineage completeness above the agreed threshold.",
+            },
+            "ready": {
+                "first_move": "Preserve the current data-governance cadence and roll data quality into the annual DORA attestation.",
+                "actions": "Annual data-quality review, benchmark reconciliation timings and archive control-test evidence.",
+                "evidence": "Annual review memo, benchmark note and archived control-test evidence.",
+                "success": "Annual attestation signed with zero material data findings.",
+            },
+        },
+    },
+    "Reporting": {
+        "meta": {
+            "forum": "regulatory reporting steering group",
+            "owner": "Head of Regulatory Reporting",
+            "why": "Reporting gaps surface first in supervisory data-quality reviews and drive restatement risk.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze new report go-lives, initiate a restatement-risk review across the last 4 reporting cycles and appoint a dedicated remediation lead.",
+                "actions": "Rebuild the reporting inventory, redesign sign-off gates and re-run reconciliations for the last two cycles.",
+                "evidence": "Reporting inventory, sign-off gate design, reconciliation packs and restatement-risk assessment.",
+                "success": "All Tier-1 reports produced with clean reconciliations for two consecutive cycles.",
+            },
+            "at_risk": {
+                "first_move": "Bring a red-status reporting update to the steering group focused on sign-off timeliness and reconciliation quality.",
+                "actions": "Close the top reconciliation exceptions, tighten sign-off gates and refresh reviewer training.",
+                "evidence": "Exception burndown, sign-off gate memo and refreshed training record.",
+                "success": "Sign-off gates clean for three consecutive cycles.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual reporting attestation is on track and validate reviewer coverage on Tier-1 reports.",
+                "actions": "Refresh the reporting KRIs, re-run reconciliation sampling and validate reviewer allocation.",
+                "evidence": "KRI pack, reconciliation sample report and reviewer roster.",
+                "success": "Annual attestation signed with KRIs inside tolerance.",
+            },
+            "ready": {
+                "first_move": "Maintain the current reporting cadence and roll into annual attestation.",
+                "actions": "Annual reporting review, peer benchmark and archive control-test evidence.",
+                "evidence": "Annual review memo, benchmark note, archived evidence.",
+                "success": "Annual attestation signed with zero material reporting findings.",
+            },
+        },
+    },
+    "Audit": {
+        "meta": {
+            "forum": "audit committee",
+            "owner": "Head of Internal Audit",
+            "why": "Audit-coverage gaps prevent independent assurance over the DORA programme and limit challenge of control effectiveness.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Table an out-of-cycle audit-committee paper covering DORA-audit-coverage gaps and mobilise co-source support to close scope shortfalls.",
+                "actions": "Rebuild the DORA audit universe, refresh the annual audit plan and launch targeted deep-dives on Tier-1 domains.",
+                "evidence": "Refreshed audit universe, revised annual plan and Tier-1 deep-dive reports.",
+                "success": "DORA audit coverage at 100% for Tier-1 domains and audit-committee approval of the refreshed plan.",
+            },
+            "at_risk": {
+                "first_move": "Escalate an out-of-cycle status update to the audit committee focused on open finding tail and coverage gaps.",
+                "actions": "Close the tail of open audit findings past their SLA, refresh coverage on the weakest domains and rehearse regulator-facing narrative.",
+                "evidence": "Open-finding burndown, refreshed coverage plan and regulator-facing walk-through pack.",
+                "success": "Open findings past SLA reduced to zero within 90 days.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual audit plan is on track and validate coverage on Tier-1 domains.",
+                "actions": "Run the scheduled audit cycle, refresh coverage KRIs and validate committee-reporting quality.",
+                "evidence": "Cycle report, KRI pack and committee-reporting quality review.",
+                "success": "Scheduled audits delivered on time with clean committee reporting.",
+            },
+            "ready": {
+                "first_move": "Maintain the current audit cadence and roll assurance evidence into the annual attestation.",
+                "actions": "Annual assurance review, peer benchmark and archive prior-cycle audit evidence.",
+                "evidence": "Annual review memo, benchmark note and archived audit evidence.",
+                "success": "Annual attestation signed with zero unmitigated audit findings.",
+            },
+        },
+    },
+    "Operations": {
+        "meta": {
+            "forum": "operations risk forum",
+            "owner": "Head of Operations",
+            "why": "Operational-process gaps compound into settlement, reconciliation and client-impact risk that supervisors flag quickly.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Institute a daily ops-risk bridge, freeze non-critical process change and re-baseline end-to-end process maps for the top client-impacting flows.",
+                "actions": "Rebuild the top 10 process maps, redesign key controls and re-run the two weakest end-to-end walkthroughs.",
+                "evidence": "Refreshed process maps, key-control design memos and end-to-end walkthrough reports.",
+                "success": "Top 10 client-impacting flows each covered by a signed process map plus a live key-control test.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a themed ops-risk update to the risk forum focused on reconciliation breaks and manual-workaround dependencies.",
+                "actions": "Close the top reconciliation breaks, retire priority manual workarounds and refresh reviewer sign-off.",
+                "evidence": "Break-log burndown, workaround retirement tracker and reviewer sign-off pack.",
+                "success": "Top reconciliation break categories cleared and priority workarounds retired.",
+            },
+            "watch": {
+                "first_move": "Confirm quarterly ops-risk metrics are trending correctly and validate control testing coverage.",
+                "actions": "Run the scheduled control-testing cycle, refresh workaround inventory and validate reconciliation KRIs.",
+                "evidence": "Control-testing report, workaround inventory and KRI pack.",
+                "success": "Scheduled control tests delivered on time with clean sign-off.",
+            },
+            "ready": {
+                "first_move": "Maintain the current operations cadence and roll into annual attestation.",
+                "actions": "Annual ops-risk review, peer benchmark and archive prior-cycle evidence.",
+                "evidence": "Annual review memo, benchmark note and archived evidence.",
+                "success": "Annual attestation signed with zero material ops-risk findings.",
+            },
+        },
+    },
+    "Compliance": {
+        "meta": {
+            "forum": "compliance and financial-crime oversight forum",
+            "owner": "Chief Compliance Officer",
+            "why": "Compliance-monitoring gaps leave DORA obligations unmapped to executable controls and expose the firm to enforcement risk.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Publish a red-status DORA-compliance dashboard to the oversight forum and mobilise a dedicated compliance rebuild team.",
+                "actions": "Rebuild the obligations register, remap DORA articles to executable controls and refresh compliance monitoring for the weakest domains.",
+                "evidence": "Refreshed obligations register, article-to-control map and monitoring plan for the next 6 months.",
+                "success": "Every DORA article mapped to an owner and a testable control by the next oversight-forum cycle.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a themed compliance status update focused on monitoring frequency and closed-finding evidence.",
+                "actions": "Close the tail of open compliance findings, refresh monitoring cadence and rehearse regulator-facing narrative.",
+                "evidence": "Finding-burndown log, refreshed monitoring plan and regulator-facing walk-through pack.",
+                "success": "Open compliance findings past SLA reduced to zero within 90 days.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual compliance attestation is on track and validate monitoring coverage across DORA domains.",
+                "actions": "Run scheduled compliance monitoring, refresh KRIs and validate reviewer allocation.",
+                "evidence": "Monitoring reports, KRI pack and reviewer roster.",
+                "success": "Annual attestation signed with monitoring KRIs inside tolerance.",
+            },
+            "ready": {
+                "first_move": "Preserve the current compliance cadence and roll monitoring evidence into the annual attestation.",
+                "actions": "Annual compliance review, peer benchmark and archive prior-cycle evidence.",
+                "evidence": "Annual review memo, benchmark note and archived evidence.",
+                "success": "Annual attestation signed with zero material compliance findings.",
+            },
+        },
+    },
+    "Legal": {
+        "meta": {
+            "forum": "compliance and legal committee",
+            "owner": "General Counsel",
+            "why": "Legal-clause gaps expose contracts to unenforceable DORA obligations and undermine third-party risk remediation.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze new material contract signings, launch a contract-clause remediation programme and pre-brief the legal committee.",
+                "actions": "Remediate DORA clauses across all live Tier-1 contracts, refresh template libraries and rehearse enforcement scenarios.",
+                "evidence": "Contract remediation tracker, refreshed template library and enforcement-scenario memos.",
+                "success": "All Tier-1 contracts remediated within 90 days.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a red-status legal update focused on template freshness and horizon-scanning gaps.",
+                "actions": "Refresh contract templates, close open regulatory-change log items and re-train contract owners.",
+                "evidence": "Template refresh memo, regulatory-change log and training record.",
+                "success": "Regulatory-change log cleared and templates refreshed on schedule.",
+            },
+            "watch": {
+                "first_move": "Confirm the annual legal-risk review is on track and validate horizon scanning coverage.",
+                "actions": "Refresh the legal-risk register, re-run horizon scan and validate template usage.",
+                "evidence": "Legal-risk register, horizon-scan memo and template-usage report.",
+                "success": "Annual review signed with legal risks inside tolerance.",
+            },
+            "ready": {
+                "first_move": "Maintain the current legal cadence and roll into annual attestation.",
+                "actions": "Annual legal review, peer benchmark and archive evidence.",
+                "evidence": "Annual review memo, benchmark note and archived evidence.",
+                "success": "Annual attestation signed with zero material legal findings.",
+            },
+        },
+    },
+    "Programme": {
+        "meta": {
+            "forum": "DORA programme steering committee",
+            "owner": "DORA Programme Manager",
+            "why": "Programme-management gaps delay the DORA-readiness timeline and hide dependencies until they become critical-path issues.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Trigger a full programme reset: re-baseline the plan, refresh the RAID log and stand up a weekly steering committee until the critical path is stable.",
+                "actions": "Re-plan the DORA delivery roadmap, secure funding for the remaining critical path and refresh dependency management on Tier-1 workstreams.",
+                "evidence": "Re-baselined plan, refreshed RAID log, funding-approval memo and dependency map.",
+                "success": "Programme steering committee approves the re-baselined plan and burn-down starts trending on target.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a red-status programme paper to steering, focused on slippage on the critical path.",
+                "actions": "Close open programme risks past SLA, refresh critical-path forecast and rehearse the go-live cutover plan.",
+                "evidence": "Risk-log burndown, updated critical-path forecast and rehearsal after-action review.",
+                "success": "Critical-path slippage cleared within the next reporting period.",
+            },
+            "watch": {
+                "first_move": "Confirm milestone burn-down is on track and validate dependency risk against upcoming go-lives.",
+                "actions": "Refresh the milestone plan, re-run dependency checks and validate benefit tracking.",
+                "evidence": "Milestone plan, dependency report and benefit tracker.",
+                "success": "Milestones tracked on schedule with benefits realised on plan.",
+            },
+            "ready": {
+                "first_move": "Maintain the current programme cadence and prepare the closure pack for the DORA programme office.",
+                "actions": "Draft the programme closure pack, capture lessons learned and archive artefacts.",
+                "evidence": "Closure pack, lessons-learned memo and archived artefact index.",
+                "success": "Programme closes on plan with no open Sev-1/2 issues.",
+            },
+        },
+    },
+    "Human": {
+        "meta": {
+            "forum": "people risk & training committee",
+            "owner": "Head of HR / Talent",
+            "why": "People and training gaps undermine the human side of every ICT control and become the failure mode supervisors probe fastest.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Mandate an emergency DORA training refresh for Tier-1 roles and re-issue role descriptions with named accountabilities.",
+                "actions": "Redesign the DORA training curriculum, refresh the competency matrix and re-issue role descriptions for all DORA-critical roles.",
+                "evidence": "Refreshed curriculum, competency matrix, role descriptions and 90-day completion tracker.",
+                "success": "90%+ completion of the refreshed curriculum across all DORA-critical roles inside 90 days.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a themed people-risk paper focused on training completion and succession coverage for DORA-critical roles.",
+                "actions": "Close training completion tail, refresh succession plans and validate DORA-role compensation alignment.",
+                "evidence": "Completion tracker, succession plan and compensation-review memo.",
+                "success": "Training completion tail cleared and succession coverage documented for every DORA-critical role.",
+            },
+            "watch": {
+                "first_move": "Confirm quarterly training refresh is on track and validate succession coverage.",
+                "actions": "Run the scheduled training refresh, refresh succession plans and validate role clarity.",
+                "evidence": "Training report, succession plan and role clarity memo.",
+                "success": "Scheduled training completed with succession coverage green.",
+            },
+            "ready": {
+                "first_move": "Maintain the current training cadence and roll into annual attestation.",
+                "actions": "Annual people-risk review, benchmark completion rates and archive evidence.",
+                "evidence": "Annual review memo, benchmark note and archived evidence.",
+                "success": "Annual attestation signed with zero material people-risk findings.",
+            },
+        },
+    },
+    "Execution": {
+        "meta": {
+            "forum": "front-office / business risk forum",
+            "owner": "Front Office / Business Owner",
+            "why": "Execution-layer gaps translate directly into client-impacting incidents and become supervisory conduct concerns quickly.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": "Freeze new product launches, run rapid client-impact analyses on the top 5 business flows and stand up daily front-office / risk / operations calls.",
+                "actions": "Rebuild business-flow maps for Tier-1 activities, refresh product-approval gates and re-execute client-impact scenarios.",
+                "evidence": "Refreshed flow maps, product-approval gate memo and client-impact scenario reports.",
+                "success": "Tier-1 flows each have signed maps and demonstrably tested client-impact scenarios.",
+            },
+            "at_risk": {
+                "first_move": "Escalate a red-status execution-risk update to the business risk forum focused on control coverage and product-approval delays.",
+                "actions": "Close open execution-risk findings, refresh product-approval evidence and re-test the two weakest flows.",
+                "evidence": "Finding-burndown log, product-approval evidence and flow re-test after-action.",
+                "success": "Execution-risk findings past SLA cleared within 60 days.",
+            },
+            "watch": {
+                "first_move": "Confirm quarterly execution KRIs are trending correctly and validate product-approval effectiveness.",
+                "actions": "Refresh execution KRIs, run scheduled control tests and validate product-approval effectiveness.",
+                "evidence": "KRI pack, control-test reports and product-approval effectiveness memo.",
+                "success": "Execution KRIs green for three consecutive cycles.",
+            },
+            "ready": {
+                "first_move": "Maintain the current execution cadence and roll into annual attestation.",
+                "actions": "Annual execution-risk review, peer benchmark and archive evidence.",
+                "evidence": "Annual review memo, benchmark note and archived evidence.",
+                "success": "Annual attestation signed with zero material execution-risk findings.",
+            },
+        },
+    },
+}
+
+
+# Alias table so distinct area labels reuse the closest playbook entry
+# without duplicating content. Keys are lower-case substrings matched
+# against the incoming area name; the value is the canonical playbook key.
+_AREA_ALIAS: Dict[str, str] = {
+    "vendor": "Third",
+    "supplier": "Third",
+    "outsourc": "Third",
+    "security": "Cyber",
+    "resilience": "Business Continuity",
+    "continuity": "Business Continuity",
+    "settlement": "Operations",
+    "middle office": "Operations",
+    "back office": "Operations",
+    "client": "Execution",
+    "front office": "Execution",
+    "assurance": "Audit",
+    "internal audit": "Audit",
+    "hr": "Human",
+    "training": "Human",
+    "people": "Human",
+    "it ": "Technology",
+    "it,": "Technology",
+    "systems": "Technology",
+}
+
+
+def _lookup_area_playbook(area: str) -> Dict[str, Any]:
+    """Return the area-specific playbook entry (with ``meta`` + ``tiers``)
+    for ``area``. Matching is case-insensitive and prefix / alias-aware so
+    aliases like "IT, Systems & Technology" resolve to the "Technology"
+    playbook and "Third-Party Management" resolves to "Third". Falls back
+    to a neutral executive-sponsor playbook when nothing matches."""
+    key = (area or "").strip()
+    fallback: Dict[str, Any] = {
+        "meta": {
+            "forum": "executive risk forum",
+            "owner": "Executive sponsor",
+            "why": f"{key or 'This area'} contributes to overall DORA readiness and needs a named accountable owner.",
+        },
+        "tiers": {
+            "critical": {
+                "first_move": f"Escalate {key or 'this area'} to the executive risk forum immediately and mobilise a dedicated remediation team.",
+                "actions": f"Rebuild {key or 'the area'} controls end-to-end, refresh evidence and close open findings within 30 days.",
+                "evidence": f"{key or 'Area'} policies, control test evidence, remediation tracker and post-incident reviews.",
+                "success": f"Every open {key or 'area'} finding closed inside 30 days and readiness above 75%.",
+            },
+            "at_risk": {
+                "first_move": f"Escalate {key or 'this area'} at the next executive risk forum with a red-status paper and dated remediation plan.",
+                "actions": f"Close the top 5 {key or 'area'} findings, refresh evidence packs and rehearse the reporting narrative.",
+                "evidence": f"{key or 'Area'} finding tracker, refreshed evidence pack and reporting narrative memo.",
+                "success": f"Top {key or 'area'} findings closed inside 90 days.",
+            },
+            "watch": {
+                "first_move": f"Confirm {key or 'this area'} on the scheduled forum agenda and validate residual gaps.",
+                "actions": f"Refresh {key or 'area'} KRIs, close residual findings and validate reviewer coverage.",
+                "evidence": f"{key or 'Area'} KRI pack, residual-finding tracker and reviewer roster.",
+                "success": f"Residual {key or 'area'} gaps cleared before the next review cycle.",
+            },
+            "ready": {
+                "first_move": f"Maintain the current {key or 'area'} cadence and roll evidence into the annual attestation.",
+                "actions": f"Annual {key or 'area'} review, peer benchmark and archive evidence.",
+                "evidence": f"Annual {key or 'area'} review memo, benchmark note and archived evidence.",
+                "success": f"Annual attestation signed with zero material {key or 'area'} findings.",
+            },
+        },
+    }
+    if not key:
+        return fallback
+
+    lower = key.lower()
+
+    # Explicit alias match first
+    for alias, target in _AREA_ALIAS.items():
+        if alias in lower and target in _AREA_PLAYBOOK:
+            return _AREA_PLAYBOOK[target]
+
+    # Playbook prefix match
+    for prefix, entry in _AREA_PLAYBOOK.items():
+        if prefix.lower() in lower:
+            return entry
+
+    return fallback
+
+
+# Severity-tier metadata reused across all areas: cadence, horizon, target
+# and forum-verb. The area-specific action content lives in _AREA_PLAYBOOK.
+_SEVERITY_FRAME: Dict[str, Dict[str, Any]] = {
+    "critical": {
+        "cadence": "weekly status reviews",
+        "cadence_unit": "week",
+        "horizon": "Immediate (0-30 days)",
+        "forum_verb": "Escalate {area} to the {forum} this governance cycle",
+        "target": 75.0,
+    },
+    "at_risk": {
+        "cadence": "bi-weekly status reviews",
+        "cadence_unit": "fortnight",
+        "horizon": "Short-term (30-90 days)",
+        "forum_verb": "Bring {area} to the next {forum}",
+        "target": 75.0,
+    },
+    "watch": {
+        "cadence": "monthly readiness check-ins",
+        "cadence_unit": "month",
+        "horizon": "Medium-term (90-180 days)",
+        "forum_verb": "Keep {area} on the {forum} agenda",
+        "target": 90.0,
+    },
+    "ready": {
+        "cadence": "quarterly steady-state reviews",
+        "cadence_unit": "quarter",
+        "horizon": "Steady-state (periodic)",
+        "forum_verb": "Retain the {forum} slot for {area}",
+        "target": 92.0,
+    },
+}
+
+
 def _build_area_recommendation_bullets(
     *,
     area: str,
     readiness: float,
+    impact: float,
     status: str,
     severity_label: str,
     area_recs: List[Any],
 ) -> List[Dict[str, str]]:
-    """Compose 3-4 action bullets for an impacted area.
+    """Compose 4 area-specific action bullets tuned to the area's live
+    severity band.
 
-    The bullets are hand-crafted from three sources so they read as
-    "Agent 4 recommendations":
+    Content is drawn from the per-area × per-severity playbook so every
+    bullet reads as a domain-appropriate consulting recommendation
+    rather than a generic escalation template. When Agent 4 has attached
+    a top recommendation for the area (owner, horizon, branch evidence,
+    mapped requirement IDs) those live values override the playbook
+    defaults so the card reflects the real assessment state.
 
-      1. **Escalate & govern** - severity-driven escalation cadence.
-      2. **Ownership & horizon** - owner and horizon from the top Agent 4
-         recommendation for this area (or a severity fallback).
+    Bullet layout (same 4 titles for every card so the grid is scannable):
+
+      1. **Escalate & govern** - severity-aware forum action + why it matters.
+      2. **First moves** - area × severity specific tasks for the owner.
       3. **Evidence & controls** - branch-log evidence when available,
-         otherwise a control-hardening template.
+         otherwise the area × severity evidence focus.
       4. **Success criteria** - measurable target derived from the
-         current readiness score.
+         current readiness score and severity horizon.
     """
     def _get(r: Any, key: str, default: Any = "") -> Any:
         return getattr(r, key, None) if hasattr(r, key) else r.get(key, default)
 
     top = area_recs[0] if area_recs else None
-    owner = str(_get(top, "suggested_owner") or "Executive sponsor").strip() if top else "Executive sponsor"
-    horizon = str(_get(top, "horizon") or "").strip() if top else ""
-    action_text = str(_get(top, "suggested_action") or "").strip() if top else ""
     branch_evidence = str(_get(top, "branch_evidence") or "").strip() if top else ""
     mapped_ids = list(_get(top, "mapped_requirement_ids") or []) if top else []
+    rec_owner = str(_get(top, "suggested_owner") or "").strip() if top else ""
+    rec_horizon = str(_get(top, "horizon") or "").strip() if top else ""
 
-    # Severity labels come from ``_impact_severity_from_score`` which returns
-    # canonical "Critical" / "At Risk" / "Watch" / "Ready" strings. The
-    # bullet playbook only needs to distinguish HIGH (Critical) from
-    # MEDIUM (At Risk) from LOW (Watch / Ready), so we bucket the label
-    # here rather than tighten the caller contract.
-    _sev = str(severity_label or "").strip().lower()
-    is_high = _sev == "critical"
-    is_med = _sev in ("at risk", "at_risk")
+    playbook = _lookup_area_playbook(area)
+    meta = playbook.get("meta", {}) or {}
+    tiers = playbook.get("tiers", {}) or {}
+    forum = str(meta.get("forum") or "executive risk forum")
+    playbook_owner = str(meta.get("owner") or "Executive sponsor")
+    why_it_matters = str(meta.get("why") or "").rstrip(".") + "."
 
-    if is_high:
-        escalate = (
-            "Escalate to the management body this governance cycle and open a "
-            f"funded remediation programme for {area}. Weekly status reviews "
-            "until readiness clears 75%."
-        )
-        horizon_default = "Immediate (0-30 days)"
-        evidence_template = (
-            f"Rebuild the {area} evidence chain end-to-end: policy, procedure, "
-            "control test results and SME sign-off. Attach every artefact to "
-            "the impacted requirements in the RTM."
-        )
-        target = 80.0
-    elif is_med:
-        escalate = (
-            f"Bring {area} to the next quarterly risk committee with a named "
-            "accountable owner and a remediation charter covering the residual "
-            "gaps."
-        )
-        horizon_default = "Short-term (30-90 days)"
-        evidence_template = (
-            f"Refresh {area} evidence for the top 3 gap requirements: policy "
-            "citations, control walkthroughs and independent challenge records."
-        )
-        target = 85.0
-    else:
-        escalate = (
-            f"Keep {area} in the periodic monitoring pack and validate on the "
-            "next governance cycle - no immediate escalation required."
-        )
-        horizon_default = "Steady-state (periodic)"
-        evidence_template = (
-            f"Maintain the current {area} evidence cadence and ensure "
-            "artefacts refresh on the annual cycle."
-        )
-        target = 92.0
+    sev_key = _canon_severity(severity_label)
+    tier = tiers.get(sev_key) or tiers.get("watch") or {}
+    frame = _SEVERITY_FRAME.get(sev_key) or _SEVERITY_FRAME["watch"]
+
+    first_move = str(tier.get("first_move") or "").strip()
+    actions = str(tier.get("actions") or "").strip()
+    evidence = str(tier.get("evidence") or "").strip()
+    success_line = str(tier.get("success") or "").strip()
+
+    cadence = str(frame["cadence"])
+    horizon_default = str(frame["horizon"])
+    forum_action = frame["forum_verb"].format(area=area, forum=forum)
+    target = float(frame["target"])
+
+    owner = rec_owner or playbook_owner
+    horizon = rec_horizon or horizon_default
+    gap = max(0.0, target - readiness)
 
     bullets: List[Dict[str, str]] = []
-    bullets.append({"title": "Escalate & govern", "body": escalate})
 
-    ownership_body = (
-        f"Assign {owner} as the accountable owner over a "
-        f"{horizon or horizon_default} horizon."
+    # 1) Escalate & govern - area-specific forum + why-it-matters + live scores
+    bullets.append({
+        "title": "Escalate & govern",
+        "body": (
+            f"{forum_action}. {why_it_matters} Sustain {cadence} until "
+            f"{area} readiness clears {target:.0f}% "
+            f"(currently {readiness:.1f}% readiness / {impact:.1f}% impact)."
+        ),
+    })
+
+    # 2) First moves - concrete area × severity actions + accountable owner
+    first_moves_parts: List[str] = []
+    if first_move:
+        first_moves_parts.append(first_move)
+    if actions:
+        first_moves_parts.append(actions)
+    if not first_moves_parts:
+        first_moves_parts.append(
+            f"Assign {owner} to close the top gaps in {area} within a {horizon} horizon."
+        )
+    first_moves_body = " ".join(first_moves_parts)
+    first_moves_body = (
+        f"{first_moves_body} Owned by {owner} over a {horizon} horizon."
     )
-    if action_text:
-        ownership_body += " " + action_text
-    bullets.append({"title": "Ownership & horizon", "body": ownership_body})
+    bullets.append({"title": "First moves", "body": first_moves_body})
 
-    evidence_body = branch_evidence or evidence_template
+    # 3) Evidence & controls - branch-log when available + area × severity focus
+    if branch_evidence:
+        evidence_body = (
+            f"{branch_evidence.rstrip('.')}. "
+            f"Rebuild the {area} evidence pack: {evidence or 'policies, control tests and remediation trackers'}."
+        )
+    else:
+        evidence_body = (
+            f"Refresh the {area} evidence pack: "
+            f"{evidence or 'policies, control tests and remediation trackers'}. "
+            "Re-attach each artefact to the impacted requirements in the RTM."
+        )
     if mapped_ids:
         shortlist = ", ".join(str(mid) for mid in mapped_ids[:4])
         evidence_body += f" Priority requirement IDs: {shortlist}."
     bullets.append({"title": "Evidence & controls", "body": evidence_body})
 
-    gap = max(0.0, target - readiness)
-    bullets.append({
-        "title": "Success criteria",
-        "body": (
-            f"Target readiness of {target:.0f}% within the next review cycle "
-            f"(+{gap:.1f} pts from today). Track weekly via the Agent 4 "
-            "recommendation KPIs."
-        ),
-    })
+    # 4) Success criteria - measurable, per-severity target for THIS area
+    if success_line:
+        success_body = (
+            f"Target: lift {area} readiness from {readiness:.1f}% to at "
+            f"least {target:.0f}% within the next review cycle "
+            f"(+{gap:.1f} pts). Definition of done: {success_line} "
+            f"Track weekly on the Agent 4 KPI panel."
+        )
+    else:
+        success_body = (
+            f"Lift {area} readiness from {readiness:.1f}% to at least "
+            f"{target:.0f}% within the next review cycle "
+            f"(+{gap:.1f} pts). Track the delta each {frame['cadence_unit']} "
+            "on the Agent 4 recommendation KPIs."
+        )
+    bullets.append({"title": "Success criteria", "body": success_body})
+
     return bullets[:4]
 
 
