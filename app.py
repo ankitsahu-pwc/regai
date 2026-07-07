@@ -304,22 +304,39 @@ button[data-testid="stBaseButton-primary"]:hover {
     padding-bottom: 10px;
     scrollbar-gutter: stable both-edges;
 }
-/* Slim, subtle scrollbar to match the Regulatory Obligations
-   (st.dataframe) look — applied to every wrapped table + expanders. */
+/* ------------------------------------------------------------------ */
+/* Unified table scrollbar system — every scrollable table wrapper in  */
+/* the app shares the Regulatory Obligations pattern:                  */
+/*    - slim 10px scrollbar with #bfae9a thumb on a #f4ece2 track      */
+/*    - scrollbar-gutter reserves space so the bar never overlaps text */
+/*    - scrollbar-width: thin (Firefox) + scrollbar-color fallback     */
+/* Applies to:                                                         */
+/*    .rap-table-wrap                (Regulatory Obligations et al.)   */
+/*    .rap-table-wrap.rap-table-scroll (Parsed BRD requirements)       */
+/*    .reg-src-table-wrap             (Regulator Sources)              */
+/*    .dash-qtable-wrap               (Question-Level Scoring Detail)  */
+/*    [data-testid="stDataFrame"]     (any bare st.dataframe)          */
+/* ------------------------------------------------------------------ */
 .rap-table-wrap::-webkit-scrollbar,
 .rap-table-wrap.rap-table-scroll::-webkit-scrollbar,
+.reg-src-table-wrap::-webkit-scrollbar,
+.dash-qtable-wrap::-webkit-scrollbar,
 [data-testid="stDataFrame"] ::-webkit-scrollbar {
     width: 10px;
     height: 10px;
 }
 .rap-table-wrap::-webkit-scrollbar-track,
 .rap-table-wrap.rap-table-scroll::-webkit-scrollbar-track,
+.reg-src-table-wrap::-webkit-scrollbar-track,
+.dash-qtable-wrap::-webkit-scrollbar-track,
 [data-testid="stDataFrame"] ::-webkit-scrollbar-track {
     background: #f4ece2;
     border-radius: 8px;
 }
 .rap-table-wrap::-webkit-scrollbar-thumb,
 .rap-table-wrap.rap-table-scroll::-webkit-scrollbar-thumb,
+.reg-src-table-wrap::-webkit-scrollbar-thumb,
+.dash-qtable-wrap::-webkit-scrollbar-thumb,
 [data-testid="stDataFrame"] ::-webkit-scrollbar-thumb {
     background: #bfae9a;
     border-radius: 8px;
@@ -327,11 +344,15 @@ button[data-testid="stBaseButton-primary"]:hover {
 }
 .rap-table-wrap::-webkit-scrollbar-thumb:hover,
 .rap-table-wrap.rap-table-scroll::-webkit-scrollbar-thumb:hover,
+.reg-src-table-wrap::-webkit-scrollbar-thumb:hover,
+.dash-qtable-wrap::-webkit-scrollbar-thumb:hover,
 [data-testid="stDataFrame"] ::-webkit-scrollbar-thumb:hover {
     background: #a0895f;
 }
 .rap-table-wrap,
-.rap-table-wrap.rap-table-scroll {
+.rap-table-wrap.rap-table-scroll,
+.reg-src-table-wrap,
+.dash-qtable-wrap {
     scrollbar-width: thin;
     scrollbar-color: #bfae9a #f4ece2;
 }
@@ -988,36 +1009,20 @@ button[data-testid="stBaseButton-primary"]:hover {
 .dash-heat-score { font-size: 0.74rem; font-weight: 700; margin-top: 4px; }
 
 /* Question-Level Scoring Detail — dense reference-style table.
-   Scrollbars are placed *outside* the text using scrollbar-gutter so
-   they never overlap the last column, and a bottom padding equal to
-   the scrollbar height keeps the horizontal bar clear of the last row. */
+   Wrapper follows the Regulatory Obligations pattern (.rap-table-wrap)
+   so its scrollbars, border and shadow match every other table in the
+   app; visual scrollbar styling is defined once in the unified block
+   above so this rule only sets layout + sizing. */
 .dash-qtable-wrap {
     max-height: 480px;
     overflow: auto;
-    border: 1.5px solid #1a1a1a;
+    border: 2px solid #1a1a1a;
     border-radius: 8px;
     background: #ffffff;
-    margin: 0.25rem 0 0.6rem;
+    margin: 0.35rem 0 0.9rem;
     padding-bottom: 10px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
     scrollbar-gutter: stable both-edges;
-    scrollbar-width: thin;
-    scrollbar-color: #bfae9a #f4ece2;
-}
-.dash-qtable-wrap::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-}
-.dash-qtable-wrap::-webkit-scrollbar-track {
-    background: #f4ece2;
-    border-radius: 8px;
-}
-.dash-qtable-wrap::-webkit-scrollbar-thumb {
-    background: #bfae9a;
-    border-radius: 8px;
-    border: 2px solid #f4ece2;
-}
-.dash-qtable-wrap::-webkit-scrollbar-thumb:hover {
-    background: #a0895f;
 }
 .dash-qtable {
     width: 100%;
@@ -1482,14 +1487,12 @@ html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
     display: none !important;
 }
 
-/* Ensure every table's horizontal scrollbar renders *outside* the
-   table via the .rap-table-wrap container (overflow-x on the wrapper,
-   overflow: visible on the inner table). Applied globally so any
-   dataframe rendered without an explicit wrapper also gets an outer
-   scroll bar via its parent block. */
+/* Ensure every native Streamlit dataframe defers its horizontal scrollbar
+   to the wrapping .rap-table-wrap container so the bar renders *outside*
+   the cell text. Scrollbar styling itself lives in the unified block near
+   the top of this stylesheet (Regulatory Obligations pattern). */
 [data-testid="stDataFrame"] { overflow: visible !important; }
 [data-testid="stDataFrameResizable"] { overflow: visible !important; }
-.rap-table-wrap { scrollbar-gutter: stable both-edges; }
 
 /* Sidebar Agentic Workflow tiles — progressive reveal, one tile per agent  */
 .agent-tile {
@@ -1552,36 +1555,21 @@ html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
     transform: translateY(-1px);
 }
 
-/* Regulator sources table — Title is the hyperlink, no separate URL column */
+/* Regulator sources table — Title is the hyperlink, no separate URL column.
+   Wrapper follows the Regulatory Obligations pattern (.rap-table-wrap)
+   for a unified look-and-feel; visual scrollbar styling lives in the
+   unified block near the top of the stylesheet. */
 .reg-src-table-wrap {
     background: #ffffff;
-    border: 1px solid #ead8cc;
-    border-radius: 12px;
+    border: 2px solid #1a1a1a;
+    border-radius: 8px;
     padding: 0.75rem 0.9rem 1.1rem;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-    margin: 0.35rem 0 0.6rem;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    margin: 0.35rem 0 0.9rem;
     max-height: 380px;
     overflow-x: auto;
     overflow-y: auto;
     scrollbar-gutter: stable both-edges;
-    scrollbar-width: thin;
-    scrollbar-color: #bfae9a #f4ece2;
-}
-.reg-src-table-wrap::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-}
-.reg-src-table-wrap::-webkit-scrollbar-track {
-    background: #f4ece2;
-    border-radius: 8px;
-}
-.reg-src-table-wrap::-webkit-scrollbar-thumb {
-    background: #bfae9a;
-    border-radius: 8px;
-    border: 2px solid #f4ece2;
-}
-.reg-src-table-wrap::-webkit-scrollbar-thumb:hover {
-    background: #a0895f;
 }
 .reg-src-caption {
     font-size: 0.92rem;
