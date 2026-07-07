@@ -992,87 +992,87 @@ def _implementation_status_options(theme_label: str) -> List[Dict[str, Any]]:
 
 
 def _theme_question_text(theme_key: str, anchor: Requirement, pair: ImpactPair) -> Tuple[str, str]:
-    """Return ``(question_text, rationale)`` for the theme-specific deep dive."""
+    """Return ``(question_text, rationale)`` for the theme-specific deep dive.
+
+    Questions are intentionally written in **plain, business-friendly
+    English** so an SME can answer without decoding jargon or having to
+    look up an article number. The technical anchors (article, metric,
+    behaviour) are still surfaced in the rationale for auditability.
+    """
     label = _format_req_label(anchor)
     article = _extract_article(anchor) or pair.regulatory_basis
     metric = _extract_metric(anchor)
-    metric_clause = f" within the {metric} threshold" if metric else ""
     behaviour = _behavioural_anchor(anchor)
     if theme_key == "incident_reporting":
         text = (
-            f"For {label}, how does {pair.function} classify major ICT incidents and meet the initial "
-            f"notification deadline to the competent authority required by {article}{metric_clause}, "
-            f"covering: '{behaviour}'?"
+            f"For {label}, does {pair.function} report major incidents to the "
+            "regulator on time?"
         )
         rationale = (
-            "Tests whether the incident classification logic, severity thresholds and notification window "
-            "operate end-to-end against the requirement, not just on paper."
+            f"Tests classification, severity and notification-window "
+            f"execution for {article}. Behaviour anchor: '{behaviour}'."
+            + (f" Metric expected: {metric}." if metric else "")
         )
         return text, rationale
     if theme_key == "third_party":
         text = (
-            f"For {label}, do critical ICT third-party contracts used by {pair.area} include the mandatory "
-            f"clauses in {article} — audit/access rights, sub-outsourcing limits, data location, exit "
-            f"assistance and termination grounds — validated by Legal for {pair.function}?"
+            f"For {label}, do {pair.area} vendor contracts cover the "
+            "required audit, exit and data terms?"
         )
         rationale = (
-            "Probes contractual readiness: missing clauses are the single biggest gap that prevents DORA "
-            "sign-off for third-party ICT services."
+            f"Probes contractual readiness against {article} for {pair.function}. "
+            "Missing clauses are the biggest DORA third-party gap."
         )
         return text, rationale
     if theme_key == "resilience_testing":
         text = (
-            f"For {label}, has {pair.function} scheduled and executed the resilience testing required by "
-            f"{article} (including threat-led penetration testing where applicable){metric_clause}, with "
-            f"results traced back to '{behaviour}'?"
+            f"For {label}, has {pair.function} run its resilience tests "
+            "on schedule?"
         )
         rationale = (
-            "Validates that resilience testing is not only planned but executed within the regulatory "
-            "window and that findings are linked to the underlying requirement."
+            f"Validates that testing required by {article} is executed on time and "
+            f"linked to '{behaviour}'."
+            + (f" Metric expected: {metric}." if metric else "")
         )
         return text, rationale
     if theme_key == "security_access":
         text = (
-            f"For {label}, are the security controls in {pair.area} — privileged access reviews, encryption "
-            f"in transit/at rest, vulnerability management and SIEM event correlation — implemented and "
-            f"periodically reviewed as required by {article}, including for '{behaviour}'?"
+            f"For {label}, are the security controls in {pair.area} "
+            "working and reviewed regularly?"
         )
         rationale = (
-            "Tests both the design and the operating effectiveness of the security controls underpinning "
-            "the requirement, including evidence of review cadence."
+            f"Tests design and operating effectiveness of the controls behind "
+            f"{article}, including review cadence."
         )
         return text, rationale
     if theme_key == "governance":
         text = (
-            f"For {label}, has the management body formally approved the relevant policy/framework under "
-            f"{article}, with traceable approval evidence in the governance pack used by {pair.area} / "
-            f"{pair.function}, including sign-off on '{behaviour}'?"
+            f"For {label}, has the management body approved the policy "
+            "with documented evidence?"
         )
         rationale = (
-            "Confirms whether governance approval is documented and traceable — a frequent gap that blocks "
-            "evidence reviews and audit testing."
+            f"Confirms governance approval is documented and traceable for "
+            f"{article} in {pair.area} / {pair.function}."
         )
         return text, rationale
     if theme_key == "data_evidence":
         text = (
-            f"For {label}, is there an evidence dictionary mapping every {pair.function} control output for "
-            f"'{behaviour}' to a named artefact, owner, lineage source and retention schedule, traceable to "
-            f"{article}?"
+            f"For {label}, do we have an evidence trail linking each "
+            f"{pair.function} control output to an owner and source?"
         )
         rationale = (
-            "Tests data governance maturity. Without an evidence dictionary the requirement cannot be "
-            "audited and the scoring cannot be substantiated."
+            f"Tests evidence-dictionary maturity so {article} outcomes can be "
+            "audited and substantiated."
         )
         return text, rationale
     if theme_key == "reporting":
         text = (
-            f"For {label}, is the management reporting for {pair.area} / {pair.function} (dashboard or "
-            f"governance pack) populated with current KRI/KPI values traceable to '{behaviour}' as expected "
-            f"by {article}?"
+            f"For {label}, is the {pair.area} management dashboard "
+            "current and traceable?"
         )
         rationale = (
-            "Validates that reporting is alive, traceable to the underlying control and supports management "
-            "body oversight."
+            f"Validates that reporting for {pair.function} carries live KRI/KPI values "
+            f"traceable to '{behaviour}' as expected by {article}."
         )
         return text, rationale
     return "", ""
@@ -1177,8 +1177,8 @@ def build_closed_questions_for_pair(
             function=pair.function,
             question_type="Single Select",
             question=(
-                f"Is the {control_objective.lower()} implemented for {pair.area} / {pair.function} "
-                f"in line with {article}?"
+                f"Is the {control_objective.lower()} in place for "
+                f"{pair.area} / {pair.function}?"
             ),
             options=status_options,
             mapped_requirement_ids=req_ids,
@@ -1213,8 +1213,8 @@ def build_closed_questions_for_pair(
             function=pair.function,
             question_type="Single Select",
             question=(
-                f"Who is the named accountable owner for {control_objective.lower()} in "
-                f"{pair.area} / {pair.function}, with sign-off authority under {article}?"
+                f"Who owns the {control_objective.lower()} in "
+                f"{pair.area} / {pair.function}?"
             ),
             options=DEFAULT_OPTIONS["ownership"],
             mapped_requirement_ids=req_ids,
@@ -1245,8 +1245,8 @@ def build_closed_questions_for_pair(
             function=pair.function,
             question_type="Multi Select",
             question=(
-                f"What evidence can {pair.function} produce today to substantiate '{evidence}' "
-                f"in {pair.area}, traceable to {article}?"
+                f"What evidence can {pair.function} show today for "
+                f"{pair.area}?"
             ),
             options=DEFAULT_OPTIONS["evidence"],
             mapped_requirement_ids=req_ids,
@@ -1275,8 +1275,8 @@ def build_closed_questions_for_pair(
             function=pair.function,
             question_type="Single Select",
             question=(
-                f"What residual compliance / operational-resilience risk remains for "
-                f"{pair.area} / {pair.function} on '{behaviour_short}' after considering current controls?"
+                f"How much risk is still open for "
+                f"{pair.area} / {pair.function}?"
             ),
             options=DEFAULT_OPTIONS["risk_level"],
             mapped_requirement_ids=req_ids,
@@ -1307,9 +1307,8 @@ def build_closed_questions_for_pair(
             function=pair.function,
             question_type="Single Select",
             question=(
-                f"What is the remediation maturity for closing the open gap on '{behaviour_short}' "
-                f"in {pair.area} affecting {pair.function} — including funded actions, named owner "
-                f"and target dates aligned to {article}{metric_clause}?"
+                f"How mature is the remediation plan for "
+                f"{pair.area} / {pair.function}?"
             ),
             options=DEFAULT_OPTIONS["maturity"],
             mapped_requirement_ids=req_ids,
@@ -1372,49 +1371,46 @@ def build_closed_questions_for_pair(
 
 _THEME_FREE_TEXT_PROMPTS = {
     "Incident reporting": (
-        "Describe how {focus} handles major ICT incident classification, the trigger thresholds used by "
-        "{function}, and any cases in the last 12 months where the regulatory notification deadline was at "
-        "risk of being missed."
+        "How does {function} report major incidents on time for {focus}? "
+        "Share any recent close calls."
     ),
     "Third-party risk": (
-        "For {focus}, list the critical ICT third-parties supporting {function}, the specific contract "
-        "clauses still missing or under negotiation, and the residual exit-strategy risk."
+        "For {focus}, which key vendors support {function}, and what "
+        "contract or exit gaps are still open?"
     ),
     "Resilience testing": (
-        "For {focus}, describe the most recent resilience or recovery test executed by {function}, the "
-        "open findings still being remediated, and the planned scope for the next testing cycle."
+        "What was the last resilience test {function} ran for {focus}, "
+        "and what is still open?"
     ),
     "Security and access": (
-        "For {focus}, describe the privileged access, encryption, vulnerability management, and SIEM "
-        "coverage in place for {function}, including known exceptions and compensating controls."
+        "Describe the key security controls in place for {function} "
+        "covering {focus}, including known exceptions."
     ),
     "Governance": (
-        "For {focus}, describe the governance approval trail (management body, executive committee, risk "
-        "committee) and any approvals that are still pending or expired for {function}."
+        "Who approved the policy for {focus}, and are any approvals "
+        "still pending in {function}?"
     ),
     "Data and evidence": (
-        "For {focus}, describe the data lineage, metadata, and evidence dictionary used by {function} to "
-        "substantiate the control outcome, and any quality or retention gaps."
+        "For {focus}, how does {function} prove the control works — "
+        "which artefacts and any data gaps?"
     ),
     "Reporting": (
-        "For {focus}, describe how {function} reports control performance to the management body, the "
-        "KRIs/KPIs in use, and any reporting gaps that affect scoring confidence."
+        "How does {function} report on {focus} to leadership, and "
+        "what reporting gaps remain?"
     ),
     "ICT risk management": (
-        "For {focus}, describe how {function} integrates the requirement into the ICT risk management "
-        "framework, including risk acceptance, control register entries, and re-assessment cadence."
+        "How does {function} manage risk for {focus} — accepted risks, "
+        "register entries, and review cycle?"
     ),
 }
 
 _GENERIC_FREE_TEXT_PROMPTS = [
-    "Describe the most material implementation gaps that could prevent compliance with {ids}.",
-    "Explain any regulatory interpretation assumptions for {ids} that Legal or Compliance should validate "
-    "before sign-off.",
-    "Describe the key data, evidence, or reporting limitations affecting scoring accuracy for {ids}.",
-    "Explain resource, budget, sponsorship, or ownership constraints affecting programme maturity for {ids}.",
-    "List any scope exclusions for {ids} and the rationale, including any compensating controls in place.",
-    "Provide additional comments, evidence references, or implementation notes for reviewer consideration "
-    "on {ids}.",
+    "What are the biggest gaps that could block compliance with {ids}?",
+    "Any assumptions on {ids} that Legal or Compliance should confirm?",
+    "What data, evidence or reporting limits affect scoring for {ids}?",
+    "Any budget, sponsorship or ownership constraints for {ids}?",
+    "Any scope exclusions for {ids} — and why?",
+    "Anything else the reviewer should know about {ids}?",
 ]
 
 
@@ -1517,41 +1513,81 @@ def build_free_text_questions(
 
 def question_kind(question: Question) -> str:
     text = question.question.lower()
-    # v13 — the canonical L1 status question ("Is the ... implemented for ...")
-    # maps to "coverage" so the existing scoring/registry routing keeps working.
-    if text.startswith("is the ") and "implemented" in text:
+    # v13 — the canonical L1 status question. The plain-English rewrite
+    # uses "Is the ... in place for ..." so we accept both the legacy
+    # "implemented" wording and the new "in place" phrasing.
+    if text.startswith("is the ") and ("implemented" in text or "in place" in text):
         return "coverage"
     if "implementation coverage" in text or "current implementation" in text:
         return "coverage"
-    if "named accountable owner" in text or "accountable owner" in text or "ownership model" in text:
+    if (
+        "named accountable owner" in text
+        or "accountable owner" in text
+        or "ownership model" in text
+        or text.startswith("who owns ")
+    ):
         return "ownership"
     if (
         "substantiating evidence" in text
         or "which evidence" in text
         or "evidence artefact" in text
         or "what evidence can" in text
+        or text.startswith("what evidence")
     ):
         return "evidence"
-    if "remediation maturity" in text or ("remediation" in text and "gap" in text):
+    if (
+        "remediation maturity" in text
+        or ("remediation" in text and "gap" in text)
+        or text.startswith("how mature is the remediation")
+    ):
         return "remediation"
-    if "residual dora" in text or ("residual" in text and "risk" in text):
+    if (
+        "residual dora" in text
+        or ("residual" in text and "risk" in text)
+        or text.startswith("how much risk is still open")
+    ):
         return "risk"
     # Theme deep-dive markers — each yields a distinct kind so the dedupe
     # logic does not collapse a third-party question with a security or
     # incident question for the same area/requirement set.
-    if "incident" in text and ("classif" in text or "notification deadline" in text):
+    if "incident" in text and ("classif" in text or "notification deadline" in text
+                                or "report major incidents" in text):
         return "theme_incident"
-    if "third-party" in text or "third party" in text:
+    if (
+        "third-party" in text
+        or "third party" in text
+        or "vendor contracts" in text
+    ):
         return "theme_third_party"
-    if "resilience test" in text or "threat-led penetration" in text or "tlpt" in text:
+    if (
+        "resilience test" in text
+        or "threat-led penetration" in text
+        or "tlpt" in text
+        or "resilience tests" in text
+    ):
         return "theme_resilience"
-    if "privileged access" in text or "siem" in text or "encryption" in text:
+    if (
+        "privileged access" in text
+        or "siem" in text
+        or "encryption" in text
+        or "security controls" in text
+    ):
         return "theme_security"
-    if "management body" in text and "approv" in text:
+    if ("management body" in text and "approv" in text) or "approved the policy" in text:
         return "theme_governance"
-    if "evidence dictionary" in text or "data lineage" in text or "metadata" in text:
+    if (
+        "evidence dictionary" in text
+        or "data lineage" in text
+        or "metadata" in text
+        or "evidence trail" in text
+    ):
         return "theme_data"
-    if "management reporting" in text or "dashboard" in text or "kri" in text or "kpi" in text:
+    if (
+        "management reporting" in text
+        or "dashboard" in text
+        or "kri" in text
+        or "kpi" in text
+    ):
         return "theme_reporting"
     if question.is_free_text:
         return "free_text"

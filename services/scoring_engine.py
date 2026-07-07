@@ -714,11 +714,19 @@ def score_value(value: Any, question: Optional[Mapping[str, Any]] = None) -> Opt
 
 
 def cxo_status(score: float) -> Tuple[str, str]:
-    if score >= 85:
+    """Return the canonical severity label + executive action for a score.
+
+    Bands aligned across the app:
+        - score >= 90        -> Ready
+        - score 75 - 90     -> Watch
+        - score 50 - 75     -> At risk
+        - score <  50        -> Critical
+    """
+    if score >= 90:
         return "Ready", "Maintain evidence and periodic validation."
-    if score >= 65:
+    if score >= 75:
         return "Watch", "Resolve targeted gaps before executive sign-off."
-    if score >= 40:
+    if score >= 50:
         return "At risk", "Prioritise remediation plan, owners and evidence."
     return "Critical", "Escalate to governance and define funded remediation."
 
