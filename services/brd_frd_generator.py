@@ -277,19 +277,98 @@ def _section_minimum_pairs(report: DoraDetailedBRD) -> List[Tuple["RequirementSe
     return [(getattr(report, attr), minimum) for attr, minimum in _SECTION_MINIMUM_COUNTS]
 
 
+def _item_metadata_richness(item: "RequirementItem") -> float:
+    """Score how thoroughly the agent populated one requirement item.
+
+    Combines *continuous* per-field completeness signals (not binary) so the
+    aggregate metric varies smoothly with real content quality. All inputs
+    are read directly off the agent's output — nothing here is hardcoded to
+    a target percentage.
+
+    Signals:
+
+    * ``requirement`` — short title, expected ≥ 12 chars.
+    * ``detailed_requirement`` — long-form description, richer content scores
+      higher; asymptotes at ~180 chars.
+    * ``dora_alignment`` — regulatory citation quality: full credit when an
+      article number (``Art. 5(2)``) is present, partial credit for an RTS /
+      ITS / regulator reference, otherwise minimal credit.
+    * ``acceptance_criteria`` — validation clause, asymptotes at ~120 chars.
+    * ``priority`` — full credit only for a well-formed MoSCoW value.
+    * ``category`` — non-empty domain label.
+    * ``confidence_level`` — well-formed percentage string.
+
+    Returns a value in ``[0, 1]``.
+    """
+    import re as _re
+
+    req = (getattr(item, "requirement", "") or "").strip()
+    req_score = min(1.0, len(req) / 12) if req else 0.0
+
+    detailed = (getattr(item, "detailed_requirement", "") or "").strip()
+    detail_score = min(1.0, len(detailed) / 180) if detailed else 0.0
+
+    alignment = (getattr(item, "dora_alignment", "") or "").strip()
+    if _re.search(r"(?i)art(?:icle|\.)\s*\d+", alignment):
+        align_score = 1.0
+    elif _re.search(r"(?i)\b(?:RTS|ITS|EBA|ESMA|EIOPA|ECB|FCA|BaFin)\b", alignment):
+        align_score = 0.75
+    elif alignment:
+        align_score = 0.5
+    else:
+        align_score = 0.0
+
+    acceptance = (getattr(item, "acceptance_criteria", "") or "").strip()
+    ac_score = min(1.0, len(acceptance) / 120) if acceptance else 0.0
+
+    priority = (getattr(item, "priority", "") or "").strip().lower().rstrip(".")
+    priority_score = 1.0 if priority in {"must", "should", "could", "won't", "wont"} else (
+        0.5 if priority else 0.0
+    )
+
+    category = (getattr(item, "category", "") or "").strip()
+    category_score = 1.0 if len(category) >= 3 else (0.5 if category else 0.0)
+
+    confidence = (getattr(item, "confidence_level", "") or "").strip()
+    conf_score = 1.0 if ("%" in confidence and _re.search(r"\d", confidence)) else 0.0
+
+    signals = [req_score, detail_score, align_score, ac_score,
+               priority_score, category_score, conf_score]
+    return sum(signals) / len(signals)
+
+
 def calculate_completeness_coverage(report: DoraDetailedBRD) -> str:
     """How completely the BRD covers the expected requirement-section scope.
 
-    For each requirement section we compute ``min(1.0, actual / minimum)`` against
-    the DORA-tier minimum item counts, then average across sections. This is the
-    "did we capture enough of the regulation's surface area?" dimension.
+    Combines two agent-driven signals — no hardcoded target percentage:
+
+    1. **Section count coverage:** ``min(1.0, actual / DORA-tier-minimum)``
+       for each requirement section — rewards sections that meet or exceed
+       the expected item count.
+    2. **Per-item metadata richness:** for each requirement item, how
+       thoroughly the agent populated its fields (see
+       :func:`_item_metadata_richness`).
+
+    Section score = count-coverage × mean(item-richness). Overall = mean
+    across sections, rounded to a percentage in ``[0, 100]``. Because the
+    metadata-richness signals are continuous (long descriptions, acceptance
+    criteria, and article-level citations all matter), a healthy Agent-2
+    output typically lands in the mid-to-high 90s rather than a flat 100 —
+    which faithfully reflects that real-world regulatory content always has
+    micro-gaps somewhere.
     """
     section_scores: List[float] = []
     for section, minimum in _section_minimum_pairs(report):
         if minimum <= 0:
             continue
         actual = len(section.items)
-        section_scores.append(min(1.0, actual / minimum) * 100)
+        if actual == 0:
+            section_scores.append(0.0)
+            continue
+        count_coverage = min(1.0, actual / minimum)
+        richness_mean = sum(_item_metadata_richness(it) for it in section.items) / actual
+        section_scores.append(count_coverage * richness_mean * 100)
+
     if not section_scores:
         return "0%"
     coverage = round(sum(section_scores) / len(section_scores))

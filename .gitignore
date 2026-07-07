@@ -22,3 +22,5 @@ uploads/
 .cursor/
 *.swp
 .DS_Store
+_previews
+sample_data
