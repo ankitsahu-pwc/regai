@@ -270,6 +270,64 @@ _LLM_SYSTEM_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Structured (Pydantic-schema-enforced) LLM path
+# ---------------------------------------------------------------------------
+#
+# The legacy :func:`generate_option_followups` accepted a generic ``llm_invoker``
+# callable that returned raw string text and relied on :func:`_parse_llm_response`
+# to hand-parse the JSON. That leaves two failure modes:
+#
+# 1. The model returns prose, or code-fenced JSON, or JSON with wrong keys —
+#    the parser drops the entire response silently.
+# 2. Nothing enforces that ``options`` is a real list of strings, that the
+#    question is closed-ended, or that no meta-language leaked in.
+#
+# The structured path below asks LangChain to bind the LLM to a Pydantic
+# schema. If the model can't populate the schema, the call raises and we
+# fall back to the deterministic offline templates. On success, every text
+# field is passed through the full guardrail stack (meta-leakage, citation
+# validation, scope validation, speculation / URL / numeric detectors).
+
+try:
+    from pydantic import BaseModel, Field
+
+    class _FollowupQuestion(BaseModel):  # type: ignore[misc]
+        question: str = Field(
+            description=(
+                "One closed-ended (Single Select) follow-up question in formal "
+                "business English. Must be specific to the option the user "
+                "selected — DO NOT reuse generic evidence / ownership / risk "
+                "framing unless the selected option specifically warrants it."
+            ),
+        )
+        options: List[str] = Field(
+            description=(
+                "Two to five closed-ended answer choices. Every option must be "
+                "a short, self-contained phrase. Must NOT be free-text."
+            ),
+            default_factory=list,
+        )
+        rationale: str = Field(
+            description=(
+                "One-sentence explanation of why this follow-up is being asked "
+                "given the selected option. Grounded in the regulatory basis."
+            ),
+        )
+
+    class _FollowupPayload(BaseModel):  # type: ignore[misc]
+        followups: List[_FollowupQuestion] = Field(
+            description=(
+                "Between 1 and 3 follow-up specs. Ordered from most to least "
+                "important. Each must be distinct — do not repeat questions."
+            ),
+            default_factory=list,
+        )
+except ImportError:  # pragma: no cover - pydantic is a project-wide dep
+    _FollowupQuestion = None  # type: ignore[assignment]
+    _FollowupPayload = None  # type: ignore[assignment]
+
+
 def _build_llm_prompt(parent: Mapping[str, Any], answer: str) -> str:
     explain = parent.get("explainability") or {}
     parts = [
@@ -325,23 +383,79 @@ def _parse_llm_response(raw: str) -> List[Dict[str, Any]]:
     return cleaned
 
 
+def _followups_from_structured_payload(
+    payload: Any, parent: Mapping[str, Any], answer: str,
+) -> List[Dict[str, Any]]:
+    """Convert a :class:`_FollowupPayload` into branch-registry-shaped dicts.
+
+    Kept private because the shape is stable and only used by
+    :func:`generate_option_followups`. We also enforce the same minimum
+    invariants the legacy hand-parser enforced (non-empty question,
+    ≥ 2 options) so a malformed but schema-valid payload still degrades
+    to the deterministic offline templates.
+    """
+    if payload is None:
+        return []
+    items = getattr(payload, "followups", None) or []
+    parent_id = parent.get("question_id", "Q-0000")
+    out: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        question = str(getattr(item, "question", "") or "").strip()
+        options_raw = list(getattr(item, "options", None) or [])
+        options = [str(o).strip() for o in options_raw if str(o).strip()]
+        if not question or len(options) < 2:
+            continue
+        rationale = str(getattr(item, "rationale", "") or "").strip()
+        out.append({
+            "question_id": f"AI_{parent_id}_{idx + 1}",
+            "question": question,
+            "options": options,
+            "question_type": "Single Select",
+            "rationale": rationale,
+            "branch_rule_id": (
+                f"ai_option_followup__{_normalise(answer).replace(' ', '_')}"
+                f"__llm_{idx + 1}"
+            ),
+            "scoring_weight": 2,
+        })
+    return out
+
+
 def generate_option_followups(
     parent: Mapping[str, Any],
     selected_answer: str,
     *,
     llm_invoker: Optional[LLMInvoker] = None,
+    client: Optional[Any] = None,
     max_followups: int = 3,
 ) -> List[Dict[str, Any]]:
     """Generate option-specific follow-up specs.
+
+    Routing priority:
+
+    1. **Structured path** — when ``client`` (a
+       :class:`services.genai_service.GenAIClient`) is provided AND
+       :class:`_FollowupPayload` was importable, the follow-ups are
+       produced through :func:`services.guardrails.safe_generate`. The
+       LLM is bound to a Pydantic schema (schema-invalid responses are
+       rejected outright) and every text field passes through the full
+       anti-hallucination guardrail stack. This is the recommended path.
+    2. **Legacy unstructured path** — when only ``llm_invoker`` (a raw
+       ``prompt -> str`` callable) is provided, the pre-existing manual
+       JSON parser is used. The prompt is still hardened with the
+       shared anti-hallucination directive. Kept for backward compat
+       with any caller that already wires an ``llm_invoker``.
+    3. **Offline path** — when neither is provided (or both fail /
+       return nothing), the hand-curated offline templates are used.
+       This path is hallucination-free by construction.
 
     Args:
         parent: the parent question dict (must include ``question_id``,
             ``area``, ``function``, ``regulatory_basis`` and ideally an
             ``explainability`` bundle for richer prompting).
         selected_answer: the exact option label the user chose.
-        llm_invoker: optional callable that takes a prompt string and
-            returns the raw LLM response text. When omitted (or when it
-            raises) we use the offline template family.
+        llm_invoker: optional ``prompt -> str`` callable (legacy path).
+        client: optional :class:`GenAIClient` (structured / preferred path).
         max_followups: hard cap on the number of follow-ups returned.
 
     Returns:
@@ -354,10 +468,51 @@ def generate_option_followups(
         return []
 
     llm_results: List[Dict[str, Any]] = []
-    if llm_invoker is not None:
+
+    # ---- Preferred: structured Pydantic-schema call via safe_generate ----
+    if client is not None and _FollowupPayload is not None:
         try:
+            from .guardrails import safe_generate
+            regulation = str(
+                (parent.get("explainability") or {}).get("regulation")
+                or parent.get("regulatory_basis")
+                or ""
+            ).strip() or None
+            instruction = _LLM_SYSTEM_PROMPT
+            context = _build_llm_prompt(parent, selected_answer)
+            payload, report = safe_generate(
+                client,
+                _FollowupPayload,
+                f"AI branch follow-ups for {parent.get('question_id', 'Q-0000')}",
+                instruction,
+                context,
+                regulation=regulation,
+                # No source corpus for question generation — the LLM is
+                # bound to the parent question's context, not to a
+                # regulation snippet. Citation-ratio enforcement is
+                # accordingly disabled.
+                source_corpus="",
+                text_fields=("followups",),
+                min_citation_ratio=0.0,
+            )
+            if payload is not None and report.ok:
+                llm_results = _followups_from_structured_payload(
+                    payload, parent, selected_answer,
+                )
+        except Exception:
+            # Any error → transparent fallback to legacy / offline path.
+            llm_results = []
+
+    # ---- Legacy: unstructured invoker (kept for backward compat) ----
+    if not llm_results and llm_invoker is not None:
+        try:
+            try:
+                from .guardrails import harden_instruction
+                hardened_system = harden_instruction(_LLM_SYSTEM_PROMPT)
+            except Exception:  # pragma: no cover
+                hardened_system = _LLM_SYSTEM_PROMPT
             prompt = (
-                _LLM_SYSTEM_PROMPT
+                hardened_system
                 + "\n\nContext:\n"
                 + _build_llm_prompt(parent, selected_answer)
             )

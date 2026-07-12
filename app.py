@@ -29,6 +29,7 @@ The app is robust to:
 from __future__ import annotations
 
 import base64
+import contextlib
 import html
 import json
 import os
@@ -36,7 +37,7 @@ import random
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -57,6 +58,24 @@ from services.brd_frd_generator import (
     DoraDetailedBRD,
     write_brd_docx,
 )
+from services.client_profile import (
+    CLIENT_PROFILE_FIELDS,
+    CLIENT_PROFILE_KEYS,
+    ClientProfileField,
+    empty_client_profile,
+    is_client_profile_populated,
+    normalize_client_profile,
+)
+from services.client_roles import (
+    APPLICABILITY_APPLICABLE,
+    APPLICABILITY_NOT_APPLICABLE,
+    APPLICABILITY_PARTIAL,
+    APPLICABILITY_UNCERTAIN,
+    INSTITUTION_TYPES,
+    INSTITUTION_TYPE_NAMES,
+    get_institution_type,
+    normalize_client_roles,
+)
 from services.regulatory_intelligence_service import (
     RegulatoryIntelligencePackage,
     gather_regulatory_intelligence,
@@ -76,8 +95,30 @@ from services.scoring_engine import (
     answered,
     evaluate as _scoring_evaluate,
     pair_heatmap_rows,
+    score_free_text_answer,
     score_value,
     summary_dataframe,
+)
+from services.severity import (
+    css_class as _severity_css_class,
+    from_label as _severity_from_label,
+    impact_band as _severity_impact_band,
+    impact_label as _severity_impact_label,
+    readiness_band as _severity_readiness_band,
+)
+from services.gap_analysis import GapItem, GapReport, build_gap_report
+from services.readiness_score import (
+    DORA_AREA_WEIGHTS,
+    WeightedReadinessResult,
+    compute_weighted_readiness,
+    demo_result as _readiness_demo_result,
+)
+from services.impact_score import (
+    DORA_IMPACT_FACTOR_WEIGHTS,
+    WeightedImpactResult,
+    compute_weighted_impact,
+    priority_score as _priority_score,
+    demo_result as _impact_demo_result,
 )
 from utils.file_utils import ensure_dirs, save_upload, timestamped_name
 from utils.json_utils import validate_package_schema
@@ -769,6 +810,18 @@ button[data-testid="stBaseButton-primary"]:hover {
     font-size: 0.82rem;
     color: #333333;
 }
+.dash-help-hint {
+    display: inline-block;
+    margin-left: 4px;
+    font-size: 0.72rem;
+    color: #7a3d00;
+    cursor: help;
+    font-weight: 700;
+    line-height: 1;
+    opacity: 0.85;
+}
+.dash-help-hint:hover { opacity: 1; }
+.dash-hero-sub[title], .dash-kpi[title] { cursor: help; }
 .dash-hero-bar {
     height: 10px;
     background: #eef0f3;
@@ -785,6 +838,125 @@ button[data-testid="stBaseButton-primary"]:hover {
 .dash-hero-bar.risk  > span { background: var(--dash-amber); }
 .dash-hero-bar.watch > span { background: #6ec06e; }
 .dash-hero-bar.ready > span { background: #14572d; }
+
+/* AI-driven impact & readiness intelligence panels */
+.dash-impact-header,
+.dash-readiness-header {
+    background: linear-gradient(135deg, #f2f5fb, #eaeff8);
+    border: 1px solid var(--dash-border);
+    border-radius: 10px;
+    padding: 12px 18px;
+    display: grid;
+    grid-template-columns: auto auto auto 1fr;
+    gap: 16px;
+    align-items: center;
+    margin: 6px 0 4px;
+}
+.dash-impact-cap {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.72rem;
+    color: var(--dash-muted);
+    font-weight: 700;
+}
+.dash-impact-value {
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: #1a1a1a;
+}
+.dash-impact-sub .dash-pill { font-size: 0.82rem; }
+.dash-impact-src {
+    justify-self: end;
+    font-size: 0.72rem;
+    color: var(--dash-muted);
+    font-style: italic;
+}
+.impact-int-grid,
+.readiness-int-grid {
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+.impact-int-grid .dash-card,
+.readiness-int-grid .dash-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.impact-int-grid .dash-card-body ul,
+.readiness-int-grid .dash-card-body ul {
+    margin: 4px 0 6px 18px;
+    padding: 0;
+}
+.impact-int-grid .dash-card-body li,
+.readiness-int-grid .dash-card-body li {
+    font-size: 0.82rem;
+    line-height: 1.35;
+    color: #2d2d2d;
+}
+
+/* Rich recommendation cards (What/Why/How/Priority/Outcome/Deps) */
+.dash-rich-rec-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+    margin: 0.25rem 0 0.75rem;
+}
+.dash-rich-rec-card {
+    background: #ffffff;
+    border: 1px solid var(--dash-border);
+    border-left: 6px solid var(--dash-orange);
+    border-radius: 10px;
+    padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.dash-rich-rec-card.crit  { border-left-color: var(--dash-red);   background: #fff7f7; }
+.dash-rich-rec-card.risk  { border-left-color: var(--dash-amber); background: #fffaf0; }
+.dash-rich-rec-card.watch { border-left-color: #6ec06e;           background: #f2fbf3; }
+.dash-rich-rec-card.ready { border-left-color: #14572d;           background: #e6f5ea; }
+.dash-rich-rec-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.dash-rich-rec-title {
+    font-size: 1.05rem;
+    font-weight: 800;
+    color: #1f1f1f;
+    margin-right: auto;
+}
+.dash-rich-rec-body { margin-top: 6px; }
+.dash-rich-rec-section {
+    background: rgba(255,255,255,0.55);
+    border-left: 3px solid rgba(0,0,0,0.08);
+    padding: 6px 12px;
+    margin: 4px 0;
+    border-radius: 6px;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    color: #2d2d2d;
+}
+.dash-rich-rec-section b { color: #1a1a1a; }
+.dash-rich-rec-meta {
+    font-size: 0.78rem;
+    color: var(--dash-muted);
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+}
+.dash-rich-rec-list {
+    margin: 4px 0 4px 18px;
+    padding: 0;
+    font-size: 0.85rem;
+}
+.dash-rich-rec-list li { margin: 2px 0; }
+.dash-rich-rec-badges {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+}
 
 /* Area recommendation cards - one card per impacted area, each holding
    a header (name + severity pills + score ribbon), an executive action
@@ -1206,6 +1378,31 @@ button[data-testid="stBaseButton-primary"]:hover {
     font-style: italic;
 }
 
+/* Adaptive follow-up prompt shown under a free-text answer when the user's
+   response is too brief, ambiguous, or contains only filler tokens. */
+.qprev-followup {
+    background: #f6f4ff;
+    border-left: 4px solid #6b5cff;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: #35306b;
+    margin: 6px 0 10px;
+    line-height: 1.35;
+}
+.qprev-followup-badge {
+    display: inline-block;
+    background: #6b5cff;
+    color: #ffffff;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    margin-right: 8px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+
 /* Live scoring summary strip pinned above the question grid on Page 3.
    Matches the Page 5 KPI-tile visual language so users see the same
    metrics update as they answer. */
@@ -1625,6 +1822,177 @@ html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
 }
 .reg-src-link:visited {color: #7a3a00 !important;}
 .reg-src-notitle {color: #8a8a8a; font-style: italic;}
+
+/* -------- Client Role-Aware selector (Page 1 · Step 1) -------- */
+.client-roles-card {
+    background: linear-gradient(135deg, #fff3e6 0%, #ffffff 65%);
+    border: 2px solid #d04a02;
+    border-radius: 12px;
+    padding: 1rem 1.15rem 0.85rem;
+    margin: 0.4rem 0 0.9rem;
+    box-shadow: 0 3px 10px rgba(208, 74, 2, 0.12);
+}
+.client-roles-badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    color: #ffffff !important;
+    background: #d04a02;
+    padding: 2px 10px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    margin-bottom: 0.4rem;
+}
+.client-roles-title {
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: #2d2d2d !important;
+    margin: 0.1rem 0 0.25rem !important;
+}
+.client-roles-desc {
+    color: #4a4a4a !important;
+    font-size: 0.9rem;
+    margin: 0 0 0.6rem !important;
+    line-height: 1.4;
+}
+.client-role-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+    margin-top: 0.5rem;
+}
+.client-role-chip {
+    flex: 1 1 240px;
+    max-width: 320px;
+    background: #ffffff;
+    border: 1px solid #ead8cc;
+    border-left: 4px solid #d04a02;
+    border-radius: 8px;
+    padding: 0.55rem 0.7rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.client-role-chip-title {
+    font-weight: 800;
+    font-size: 0.95rem;
+    color: #2d2d2d;
+}
+.client-role-chip-cat {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: #d04a02;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+}
+.client-role-chip-desc {
+    font-size: 0.82rem;
+    color: #4a4a4a;
+    margin-bottom: 0.3rem;
+    line-height: 1.35;
+}
+.client-role-chip-meta {
+    font-size: 0.78rem;
+    color: #4a4a4a;
+    margin-top: 2px;
+}
+.client-role-chip-meta b {color: #2d2d2d;}
+
+/* -------- Client Profile keyword picker (Page 1 · Step 1b) -------- */
+.client-profile-card {
+    background: linear-gradient(135deg, #fdf2e7 0%, #ffffff 55%);
+    border: 2px dashed #d04a02;
+    border-radius: 12px;
+    padding: 0.9rem 1.1rem 0.75rem;
+    margin: 0.3rem 0 0.9rem;
+    box-shadow: 0 3px 10px rgba(208, 74, 2, 0.08);
+}
+.client-profile-badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    color: #d04a02 !important;
+    background: #fff;
+    border: 1px solid #d04a02;
+    padding: 2px 10px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+}
+.client-profile-title {
+    font-size: 1.05rem;
+    font-weight: 800;
+    color: #2d2d2d !important;
+    margin: 0.1rem 0 0.2rem !important;
+}
+.client-profile-desc {
+    color: #4a4a4a !important;
+    font-size: 0.86rem;
+    margin: 0 0 0.55rem !important;
+    line-height: 1.4;
+}
+.client-profile-audit {
+    background: #fff8f2;
+    border: 1px solid #f2d5c1;
+    border-left: 4px solid #d04a02;
+    border-radius: 8px;
+    padding: 0.65rem 0.85rem;
+    margin: 0.35rem 0 0.9rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.client-profile-audit-title {
+    font-size: 0.82rem;
+    font-weight: 800;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    color: #d04a02;
+    margin-bottom: 0.35rem;
+}
+.client-profile-audit-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem 0.6rem;
+    margin: 0.15rem 0;
+}
+.client-profile-audit-label {
+    font-weight: 700;
+    font-size: 0.82rem;
+    color: #2d2d2d;
+    min-width: 175px;
+}
+.client-profile-audit-chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+}
+.client-profile-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    background: #ffffff;
+    border: 1px solid #d04a02;
+    color: #7a2c00;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 600;
+}
+
+/* Role-aware applicability pills used in BRD/RTM/questionnaire panels */
+.role-pill {
+    display: inline-block;
+    padding: 2px 9px;
+    margin: 2px 3px 2px 0;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    border: 1px solid transparent;
+}
+.role-pill-applicable {background: #e6f7ec; color: #1b5e20; border-color: #a5d6a7;}
+.role-pill-partial    {background: #fff4e5; color: #7a3d00; border-color: #ffcc80;}
+.role-pill-uncertain  {background: #ecf3fb; color: #0d47a1; border-color: #90caf9;}
+.role-pill-not        {background: #fdecea; color: #7f1d1d; border-color: #ef9a9a; text-decoration: line-through;}
 </style>
 """
 
@@ -1670,6 +2038,16 @@ _DEFAULT_STATE: Dict[str, Any] = {
     "mode": "Use existing BRD/FRD",
     "regulation_doc_id": None,
     "brd_doc_id": None,
+    # Client Role-Aware Regulatory Interpretation (Step 1 of the workflow).
+    # ``client_roles`` is the multi-select on Page 1 — canonical institution
+    # names from :mod:`services.client_roles`. When empty the pipeline falls
+    # back to the pre-role-aware (generic) interpretation.
+    "client_roles": ["Commercial Bank"],
+    # Client Profile — six keyword multi-selects rendered right below the
+    # institution type on Page 1. Each key is a list of curated + free-form
+    # keywords the user tagged. Empty lists = "no filter for this
+    # dimension"; downstream stages fall back to the generic behaviour.
+    "client_profile": empty_client_profile(),
     # Regulatory Intelligence Pipeline (Stage 1 only; Stage 2 is currently
     # disabled pending team review -- see CONSULTING_SEARCH_ENABLED in .env).
     "regulator_selection": ["ALL"],          # codes from search_config.APPROVED_REGULATORS
@@ -1693,6 +2071,21 @@ _DEFAULT_STATE: Dict[str, Any] = {
     "scoring_result": None,       # ScoringResult | None
     "evaluation": None,           # dict (legacy mirror of scoring_result.evaluation)
     "recommendations": [],
+    "rich_recommendations": [],   # List[RichRecommendation] from Agent 4
+    # AI Assessment Intelligence bundles — dynamic confidence, impact and
+    # readiness assessments (produced by services.ai_assessment_intelligence).
+    "confidence_assessment": None,   # ConfidenceAssessment | None
+    "impact_assessment": None,       # ImpactAssessment | None
+    "readiness_assessment": None,    # ReadinessAssessment | None
+    # Weighted readiness scoring (DORA demo profile). Populated on every
+    # dashboard refresh via _refresh_scoring_snapshot; None until then.
+    "weighted_readiness": None,      # WeightedReadinessResult | None
+    "weighted_readiness_error": None,
+    # Weighted impact scoring (DORA demo profile). Sibling of the
+    # weighted-readiness result; the two are calculated independently
+    # and combined into Priority = Impact * (100 - Readiness) / 100.
+    "weighted_impact": None,         # WeightedImpactResult | None
+    "weighted_impact_error": None,
     # Page
     "page": "1. Setup",
     # GenAI
@@ -1814,13 +2207,162 @@ def _df_with_styling(df: pd.DataFrame, score_cols: List[str]) -> Any:
 
 
 def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
-    """Re-run the Python Rules Engine against the current responses."""
+    """Re-run the Python Rules Engine against the current responses.
+
+    Also refreshes the AI Assessment Intelligence bundle (confidence,
+    impact, readiness) so the dashboard always renders in sync with the
+    latest responses. The assessment intelligence is best-effort — if the
+    GenAI client is not configured the deterministic fallback still fills
+    in an evidence-driven bundle so the UI stays useful.
+    """
     questionnaire: Optional[QuestionnairePackage] = st.session_state.get("questionnaire")
     if questionnaire is None:
         return None
     state: AssessmentState = st.session_state["assessment_state"]
     orch = _get_orchestrator()
     scoring = orch.run_rules_engine(questionnaire, state)
+
+    analysis: Optional[RegulatoryAnalysis] = st.session_state.get("analysis")
+    impact = st.session_state.get("impact_assessment")
+    if impact is None and analysis is not None:
+        try:
+            impact = orch.assess_impact_intelligence(analysis)
+            st.session_state["impact_assessment"] = impact
+        except Exception:
+            impact = None
+    scoring.impact = impact
+
+    try:
+        readiness = orch.assess_readiness_intelligence(
+            scoring.evaluation,
+            analysis=analysis,
+            questionnaire_package=questionnaire.package,
+            responses=state.responses,
+        )
+        scoring.readiness = readiness
+        st.session_state["readiness_assessment"] = readiness
+    except Exception:
+        pass
+
+    try:
+        confidence = orch.assess_confidence_intelligence(
+            analysis,
+            scoring_evaluation=scoring.evaluation,
+            questionnaire_package=questionnaire.package,
+        )
+        scoring.confidence = confidence
+        st.session_state["confidence_assessment"] = confidence
+    except Exception:
+        pass
+
+    # Weighted readiness scoring (DORA demo profile). Computed *after* the
+    # rules engine so any state changes made by the AI assessment bundles
+    # (e.g. readiness overrides) are already visible. The dataclass sits on
+    # the session state under ``weighted_readiness`` for direct UI access,
+    # and a JSON-safe copy is merged into ``scoring.evaluation`` so it
+    # round-trips through SQLite via the existing ``evaluation_json``
+    # column - no schema migration needed.
+    #
+    # Business rule: the *displayed* readiness score everywhere in the app
+    # (hero tile, KPI cards, dashboard downstream consumers, SQLite
+    # ``compliance_score_pct`` column, Agent 4 fingerprint, …) is the
+    # weighted overall - not the legacy per-question weighted average.
+    # We overwrite ``compliance_score_pct`` inline so every downstream
+    # reader picks up the new number automatically. The original rules-
+    # engine number is preserved under ``compliance_score_pct_legacy`` so
+    # it can still be inspected for diagnostics / regression comparisons.
+    try:
+        base_questions = list(
+            (questionnaire.package.get("questions") or []) if questionnaire.package else []
+        )
+        weighted = compute_weighted_readiness(base_questions, state)
+        st.session_state["weighted_readiness"] = weighted
+        st.session_state["weighted_readiness_error"] = None
+        if isinstance(scoring.evaluation, dict):
+            scoring.evaluation["weighted_readiness"] = weighted.as_dict()
+            legacy_score = float(scoring.evaluation.get("compliance_score_pct") or 0.0)
+            scoring.evaluation["compliance_score_pct_legacy"] = round(legacy_score, 2)
+            scoring.evaluation["compliance_score_pct"] = float(
+                weighted.overall_readiness_score
+            )
+            scoring.evaluation["readiness_rating"] = weighted.readiness_rating
+            scoring.evaluation["overall_coverage_gap"] = float(
+                weighted.overall_coverage_gap
+            )
+            scoring.evaluation["completeness_score"] = float(
+                weighted.completeness_score
+            )
+            scoring.evaluation["accuracy_score"] = float(weighted.accuracy_score)
+        # Force the AI Readiness Assessment panel to display the same
+        # weighted overall - otherwise the dashboard would show two
+        # different numbers for "Overall Readiness". The dimensional
+        # sub-scores on that panel remain untouched so users still see
+        # per-dimension maturity signals.
+        if scoring.readiness is not None:
+            scoring.readiness.overall_score = float(weighted.overall_readiness_score)
+            scoring.readiness.overall_level = weighted.readiness_rating
+            st.session_state["readiness_assessment"] = scoring.readiness
+    except Exception as exc:
+        # Never let a scoring extension break the main rules-engine path.
+        # We still surface the failure through a debug caption so an
+        # operator can spot misconfigured weights or malformed packages.
+        st.session_state["weighted_readiness"] = None
+        st.session_state["weighted_readiness_error"] = str(exc)
+
+    # Weighted impact scoring (DORA demo profile). Computed AFTER weighted
+    # readiness so we can pass the readiness result in for the Priority
+    # formula (Priority = Impact * (100 - Readiness) / 100). Also feeds
+    # per-area readiness into the priority table so a "high impact but
+    # low readiness" area surfaces above one that is well-covered.
+    try:
+        readiness_for_priority = st.session_state.get("weighted_readiness")
+        area_readiness_map: Dict[str, float] = {}
+        pair_readiness_map: Dict[Any, float] = {}
+        if isinstance(scoring.evaluation, dict):
+            for area, val in (scoring.evaluation.get("area_scores") or {}).items():
+                try:
+                    area_readiness_map[str(area)] = float(val)
+                except (TypeError, ValueError):
+                    continue
+            for key, val in (scoring.evaluation.get("pair_scores") or {}).items():
+                try:
+                    pair_readiness_map[key] = float(val)
+                except (TypeError, ValueError):
+                    continue
+        weighted_imp = compute_weighted_impact(
+            analysis=analysis,
+            brd_artifact=st.session_state.get("brd_artifact"),
+            rtm_artifact=st.session_state.get("rtm_artifact"),
+            questionnaire=questionnaire,
+            readiness_result=readiness_for_priority,
+            area_readiness=area_readiness_map,
+            pair_readiness=pair_readiness_map,
+        )
+        st.session_state["weighted_impact"] = weighted_imp
+        st.session_state["weighted_impact_error"] = None
+        if isinstance(scoring.evaluation, dict):
+            scoring.evaluation["weighted_impact"] = weighted_imp.as_dict()
+            scoring.evaluation["overall_impact_score"] = float(
+                weighted_imp.overall_impact_score
+            )
+            scoring.evaluation["impact_rating"] = weighted_imp.impact_rating
+            scoring.evaluation["overall_priority_score"] = float(
+                weighted_imp.overall_priority_score
+            )
+        # Overwrite the AI ImpactAssessment top-line so hero + intel panel
+        # + area cards + heatmap all show one consistent impact number.
+        # Per-dimension AI severity scores stay - they are still useful
+        # signals for consulting-grade narratives.
+        if scoring.impact is not None:
+            scoring.impact.overall_severity_score = float(
+                weighted_imp.overall_impact_score
+            )
+            scoring.impact.overall_severity = weighted_imp.impact_rating
+            st.session_state["impact_assessment"] = scoring.impact
+    except Exception as exc:
+        st.session_state["weighted_impact"] = None
+        st.session_state["weighted_impact_error"] = str(exc)
+
     st.session_state["scoring_result"] = scoring
     st.session_state["evaluation"] = scoring.evaluation
     return scoring
@@ -1884,6 +2426,269 @@ _ALL_REGULATOR_CODE = "ALL"
 def _selected_regulator_codes() -> List[str]:
     sel = st.session_state.get("regulator_selection") or [_ALL_REGULATOR_CODE]
     return list(sel) if isinstance(sel, list) else [str(sel)]
+
+
+def _selected_client_roles() -> List[str]:
+    """Return the canonical institution names selected on Page 1.
+
+    Empty list means "no role filter" — the pipeline then falls back to
+    the pre-role-aware (generic) behaviour. When the widget has been
+    populated we still normalise the values against the catalog so a stale
+    session doesn't smuggle in an unknown role.
+    """
+    raw = st.session_state.get("client_roles") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return normalize_client_roles(raw)
+
+
+def _current_client_profile() -> Dict[str, List[str]]:
+    """Return the normalized Client Profile keyword bundle from session state.
+
+    Free-form keywords typed into the widgets are preserved verbatim; only
+    trivial whitespace / de-duplication is applied. Empty when the user has
+    not populated any field.
+    """
+    raw = st.session_state.get("client_profile") or {}
+    return normalize_client_profile(raw)
+
+
+def _keyword_multiselect(
+    field: ClientProfileField, current_value: List[str],
+) -> List[str]:
+    """Render a keyword multi-select widget for one Client Profile field.
+
+    When ``field.allow_freeform`` is ``True`` (the default) users can pick
+    from the curated seed list *or* type any custom keyword — implemented
+    via ``st.multiselect(accept_new_options=True)`` on Streamlit >= 1.39,
+    with a two-widget fallback (multi-select + comma-separated text
+    input) for older builds.
+
+    When ``allow_freeform`` is ``False`` the widget is locked to the
+    curated seed catalog — any stale / off-catalog values that survived
+    in session state from an earlier build are dropped, and the "Add
+    custom keyword" affordance is hidden. Used for Organization Profile
+    so users only ever see the six approved options.
+    """
+    seed_options = list(field.options)
+    seed_lower = {o.lower() for o in seed_options}
+    initial = list(current_value or [])
+
+    widget_key = f"client_profile_widget_{field.key}"
+
+    if not field.allow_freeform:
+        # Curated-only: drop any values that aren't in the seed catalog,
+        # both from the ``initial`` we hand Streamlit AND from any stale
+        # widget state left over from an earlier session (which would
+        # otherwise resurrect off-catalog chips).
+        initial = [v for v in initial if v and v.lower() in seed_lower]
+        stale = st.session_state.get(widget_key)
+        if isinstance(stale, list):
+            cleaned = [v for v in stale if v and str(v).lower() in seed_lower]
+            if cleaned != stale:
+                st.session_state[widget_key] = cleaned
+        selection = st.multiselect(
+            f"{field.icon} {field.label}",
+            options=seed_options,
+            default=initial,
+            help=field.help,
+            placeholder=field.placeholder,
+            key=widget_key,
+        )
+        return list(selection)
+
+    merged_options: List[str] = list(seed_options)
+    seen = set(o.lower() for o in merged_options)
+    for value in initial:
+        if value and value.lower() not in seen:
+            merged_options.append(value)
+            seen.add(value.lower())
+
+    try:
+        selection = st.multiselect(
+            f"{field.icon} {field.label}",
+            options=merged_options,
+            default=initial,
+            help=field.help,
+            placeholder=field.placeholder,
+            accept_new_options=True,
+            key=widget_key,
+        )
+    except TypeError:
+        # ``accept_new_options`` is not supported on the running Streamlit
+        # version. Fall back to a two-widget pattern: pick curated values
+        # from a multi-select and add custom ones via a comma-separated
+        # text input.
+        selection = st.multiselect(
+            f"{field.icon} {field.label}",
+            options=merged_options,
+            default=initial,
+            help=field.help,
+            placeholder=field.placeholder,
+            key=widget_key,
+        )
+        custom_key = f"{widget_key}_custom"
+        custom_default = ", ".join(
+            v for v in initial
+            if v.lower() not in {o.lower() for o in seed_options}
+        )
+        custom_raw = st.text_input(
+            f"Custom {field.label} keywords (comma-separated)",
+            value=custom_default,
+            key=custom_key,
+            placeholder="Type additional keywords, separated by commas…",
+        )
+        for token in (custom_raw or "").split(","):
+            token = token.strip()
+            if token and token.lower() not in {s.lower() for s in selection}:
+                selection.append(token)
+    return list(selection)
+
+
+def _render_client_profile_selector() -> None:
+    """Render the six Client Profile keyword multi-selects on Page 1.
+
+    Layout: two columns × three rows so the six fields fit compactly under
+    the Institution Type card. Every widget writes back into
+    ``st.session_state["client_profile"]`` so the pipeline picks it up on
+    the next run.
+    """
+    current = _current_client_profile()
+
+    st.markdown('<div class="client-profile-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="client-profile-badge">Step 1 · Client Profile</span>'
+        '<p class="client-profile-title">Client Profile Keywords</p>'
+        '<p class="client-profile-desc">Tag the client the way you would tag '
+        'a CV. Keywords from every dimension below are threaded through the '
+        'agentic pipeline — Agent 1 uses them as extra regulatory-surface '
+        'signal, the BRD/FRD prompt is scoped to the tagged profile, and '
+        'the RTM / questionnaire / recommendations all inherit the '
+        'context. Type any custom keyword — the widgets accept free-form '
+        'entries alongside the curated catalog.</p>',
+        unsafe_allow_html=True,
+    )
+    updated: Dict[str, List[str]] = {}
+    for row_index in range(0, len(CLIENT_PROFILE_FIELDS), 2):
+        cols = st.columns(2, gap="large")
+        for offset, col in enumerate(cols):
+            idx = row_index + offset
+            if idx >= len(CLIENT_PROFILE_FIELDS):
+                continue
+            field = CLIENT_PROFILE_FIELDS[idx]
+            with col:
+                updated[field.key] = _keyword_multiselect(
+                    field, current.get(field.key) or [],
+                )
+    # Preserve any dimensions we did not render (shouldn't happen, but
+    # safe-by-default) and normalise the result.
+    for key in CLIENT_PROFILE_KEYS:
+        updated.setdefault(key, current.get(key) or [])
+    st.session_state["client_profile"] = normalize_client_profile(updated)
+
+    populated = is_client_profile_populated(st.session_state["client_profile"])
+    if populated:
+        tally = ", ".join(
+            f"**{f.label}**: {len(st.session_state['client_profile'].get(f.key) or [])}"
+            for f in CLIENT_PROFILE_FIELDS
+            if st.session_state["client_profile"].get(f.key)
+        )
+        st.caption(
+            f"Profile tagged — {tally}. These keywords will flow into Agent 1, "
+            f"the BRD/FRD prompt, the RTM, questionnaire and recommendations."
+        )
+    else:
+        st.caption(
+            "No profile keywords tagged yet. The pipeline will use the "
+            "generic (role-only) interpretation. Add keywords to sharpen "
+            "the analysis for your specific client."
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_client_roles_selector() -> None:
+    """Client Role-Aware setup: the multi-select at the top of Page 1.
+
+    The selection is a **first-class input** to the whole workflow — every
+    downstream agent (Regulatory Analysis, BRD/RTM, Questionnaire,
+    Recommendations, Dashboard) consumes this list. When at least one role
+    is selected the platform performs **Client-Specific Regulatory
+    Interpretation** instead of a generic analysis.
+    """
+    options = list(INSTITUTION_TYPE_NAMES)
+    current_raw = st.session_state.get("client_roles") or []
+    current = normalize_client_roles(current_raw) or ["Commercial Bank"]
+
+    def _fmt(name: str) -> str:
+        role = get_institution_type(name)
+        if role is None:
+            return name
+        return f"{name} — {role.category}"
+
+    st.markdown('<div class="client-roles-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="client-roles-badge">Step 1 · Client Role-Aware</span>'
+        '<p class="client-roles-title">Client Type / Institution Type</p>'
+        '<p class="client-roles-desc">Pick one or more institution types. '
+        'The regulation is interpreted through the operating model of the '
+        'selected client(s); every downstream artefact (BRD, RTM, '
+        'questionnaire, recommendations, dashboard) is filtered and '
+        'annotated accordingly.</p>',
+        unsafe_allow_html=True,
+    )
+    selection = st.multiselect(
+        "Institution Type(s)",
+        options=options,
+        default=current,
+        format_func=_fmt,
+        help=(
+            "The selected institution type(s) are passed through the entire "
+            "agentic pipeline. Agent 1 performs Client-Specific Regulatory "
+            "Interpretation: obligations are tagged Applicable / Partially "
+            "Applicable / Not Applicable / Uncertain per role, and downstream "
+            "stages consume this instead of reinterpreting the regulation. "
+            "Select multiple to produce the union of applicable obligations "
+            "while preserving per-role scope."
+        ),
+        key="client_roles_widget",
+    )
+    if not selection:
+        st.warning(
+            "No institution type selected. The pipeline will fall back to a "
+            "generic interpretation; downstream artefacts will not be "
+            "scoped to any specific client role."
+        )
+    st.session_state["client_roles"] = list(selection)
+
+    if selection:
+        # Render a compact per-role summary card so the user knows what
+        # business surface has just been armed for the analysis.
+        cards_html: List[str] = []
+        for name in selection:
+            role = get_institution_type(name)
+            if role is None:
+                continue
+            domains = ", ".join(list(role.domains)[:4]) or "—"
+            obligations = ", ".join(list(role.typical_obligations)[:3]) or "—"
+            cards_html.append(
+                f'<div class="client-role-chip">'
+                f'<div class="client-role-chip-title">{html.escape(role.name)}</div>'
+                f'<div class="client-role-chip-cat">{html.escape(role.category)}</div>'
+                f'<div class="client-role-chip-desc">{html.escape(role.summary)}</div>'
+                f'<div class="client-role-chip-meta"><b>Key domains:</b> '
+                f'{html.escape(domains)}</div>'
+                f'<div class="client-role-chip-meta"><b>Typical obligations:</b> '
+                f'{html.escape(obligations)}</div>'
+                f'</div>'
+            )
+        if cards_html:
+            st.markdown(
+                '<div class="client-role-chip-row">'
+                + "".join(cards_html)
+                + '</div>',
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _regulator_label(code: str) -> str:
@@ -2111,6 +2916,471 @@ def _format_sources_inline(refs: List[Dict[str, Any]]) -> str:
         pieces.append(_format_source_label(ref))
     suffix = "" if len(refs) <= 3 else f" (+{len(refs) - 3} more)"
     return " | ".join(pieces) + suffix
+
+
+# ---------------------------------------------------------------------------
+# Confidence-gap tooltips
+# ---------------------------------------------------------------------------
+#
+# The Completeness Coverage, Accuracy Coverage and Overall Regulatory
+# Coverage tiles all show a percentage. Whenever the number is below 100
+# reviewers need a plain-English reason for the gap ("what are we not
+# confident about?"). The tooltip built by :func:`_confidence_gap_tooltip`
+# lists, in simple terms, the specific signals that are missing or thin —
+# so users can see *which* gaps are causing the percentage to drop. When
+# the assessment is missing we fall back to a short disclaimer so the
+# tooltip is never empty.
+
+
+def _completeness_gap_drivers(
+    signals: Mapping[str, Any],
+) -> List[Tuple[float, str]]:
+    """Return ``[(weight, "plain-english reason"), …]`` for Completeness.
+
+    The ``weight`` field is kept only for ordering (largest first) and for
+    the evaluation-kind weighting logic. Reasons are written in simple
+    terms — no scoring jargon, no "pts", no "dimensions".
+    """
+    obligations = int(signals.get("obligation_count") or 0)
+    areas = int(signals.get("impacted_area_count") or 0)
+    themes = int(signals.get("theme_count") or 0)
+    requirements = int(signals.get("requirement_count") or 0)
+
+    drivers: List[Tuple[float, str]] = []
+
+    oblig_pts = min(40.0, obligations * 0.6)
+    if oblig_pts < 40.0:
+        drivers.append((
+            40.0 - oblig_pts,
+            f"Only {obligations} obligations were extracted from the regulation."
+            if obligations
+            else "No obligations were extracted from the regulation yet.",
+        ))
+
+    area_pts = min(20.0, areas * 2.0)
+    if area_pts < 20.0:
+        drivers.append((
+            20.0 - area_pts,
+            f"Only {areas} impacted business areas were identified."
+            if areas
+            else "No impacted business areas were identified yet.",
+        ))
+
+    theme_pts = min(15.0, themes * 1.5)
+    if theme_pts < 15.0:
+        drivers.append((
+            15.0 - theme_pts,
+            f"Only {themes} obligation themes were clustered."
+            if themes
+            else "No obligation themes have been clustered yet.",
+        ))
+
+    req_pts = min(25.0, requirements * 0.25)
+    if req_pts < 25.0:
+        drivers.append((
+            25.0 - req_pts,
+            f"Only {requirements} BRD requirements have been captured so far."
+            if requirements
+            else "No BRD requirements have been captured yet.",
+        ))
+
+    drivers.sort(key=lambda x: -x[0])
+    return drivers
+
+
+def _accuracy_gap_drivers(
+    signals: Mapping[str, Any],
+) -> List[Tuple[float, str]]:
+    """Return ``[(weight, "plain-english reason"), …]`` for Accuracy."""
+    obligations = int(signals.get("obligation_count") or 0)
+    requirements = int(signals.get("requirement_count") or 0)
+    reqs_with_article = int(signals.get("requirements_with_article_ref") or 0)
+    reqs_with_citations = int(signals.get("requirements_with_citations") or 0)
+    obls_with_citations = int(signals.get("obligations_with_citations") or 0)
+
+    drivers: List[Tuple[float, str]] = []
+
+    if requirements == 0:
+        drivers.append((
+            45.0,
+            "No BRD requirements captured yet, so we cannot check whether "
+            "they are backed by regulation citations.",
+        ))
+    else:
+        article_ratio = reqs_with_article / requirements
+        article_pts = min(25.0, article_ratio * 30.0)
+        if article_pts < 25.0:
+            drivers.append((
+                25.0 - article_pts,
+                f"Only {reqs_with_article} of {requirements} requirements "
+                f"point to a specific Article number in the regulation.",
+            ))
+        citation_ratio = reqs_with_citations / requirements
+        citation_pts = min(15.0, citation_ratio * 15.0)
+        if citation_pts < 15.0:
+            drivers.append((
+                15.0 - citation_pts,
+                f"Only {reqs_with_citations} of {requirements} requirements "
+                f"carry any regulation citation at all.",
+            ))
+
+    if obligations:
+        obl_ratio = obls_with_citations / obligations
+        obl_pts = min(5.0, obl_ratio * 5.0)
+        if obl_pts < 5.0:
+            drivers.append((
+                5.0 - obl_pts,
+                f"Only {obls_with_citations} of {obligations} obligations "
+                f"link back to a source in the regulation.",
+            ))
+
+    drivers.sort(key=lambda x: -x[0])
+    return drivers
+
+
+def _clarity_gap_drivers(
+    signals: Mapping[str, Any],
+) -> List[Tuple[float, str]]:
+    """Return ``[(weight, "plain-english reason"), …]`` for Clarity."""
+    requirements = int(signals.get("requirement_count") or 0)
+    obligations = int(signals.get("obligation_count") or 0)
+    closed = int(signals.get("closed_question_count") or 0)
+    quant = int(signals.get("quantitative_question_count") or 0)
+    answered = int(signals.get("answered_count") or 0)
+    unanswered = int(signals.get("unanswered_count") or 0)
+
+    drivers: List[Tuple[float, str]] = []
+
+    if not (requirements and obligations):
+        drivers.append((
+            10.0,
+            "Requirements and obligations are not both available yet.",
+        ))
+    if not closed:
+        drivers.append((
+            10.0,
+            "No scored questions are in the questionnaire yet.",
+        ))
+    if not quant:
+        drivers.append((
+            10.0,
+            "No quantitative questions (numbers, percentages, counts) "
+            "were detected.",
+        ))
+    total_q = answered + unanswered
+    if total_q == 0:
+        drivers.append((
+            10.0,
+            "No questionnaire answers have been captured yet.",
+        ))
+    else:
+        coverage = answered / total_q
+        pts = min(10.0, coverage * 10.0)
+        if pts < 10.0:
+            drivers.append((
+                10.0 - pts,
+                f"Only {answered} of {total_q} questions have been "
+                f"answered so far.",
+            ))
+
+    drivers.sort(key=lambda x: -x[0])
+    return drivers
+
+
+def _quality_gap_drivers(
+    signals: Mapping[str, Any],
+) -> List[Tuple[float, str]]:
+    """Return ``[(weight, "plain-english reason"), …]`` for Quality."""
+    requirements = int(signals.get("requirement_count") or 0)
+    with_priority = int(signals.get("requirements_with_priority") or 0)
+    with_accept = int(signals.get("requirements_with_acceptance") or 0)
+    avg_detail = float(signals.get("avg_requirement_detail_chars") or 0.0)
+
+    drivers: List[Tuple[float, str]] = []
+
+    if requirements == 0:
+        drivers.append((
+            45.0,
+            "No BRD requirements captured yet, so we cannot judge the "
+            "quality of individual requirements.",
+        ))
+        return drivers
+
+    prio_ratio = with_priority / requirements
+    prio_pts = min(20.0, prio_ratio * 20.0)
+    if prio_pts < 20.0:
+        drivers.append((
+            20.0 - prio_pts,
+            f"Only {with_priority} of {requirements} requirements have "
+            f"a priority (Must / Should / Could / Won't) tagged.",
+        ))
+
+    acc_ratio = with_accept / requirements
+    acc_pts = min(15.0, acc_ratio * 15.0)
+    if acc_pts < 15.0:
+        drivers.append((
+            15.0 - acc_pts,
+            f"Only {with_accept} of {requirements} requirements include "
+            f"clear acceptance criteria.",
+        ))
+
+    detail_pts = min(10.0, max(0.0, (avg_detail - 80.0) / 20.0))
+    if detail_pts < 10.0:
+        drivers.append((
+            10.0 - detail_pts,
+            "Requirement descriptions are shorter than expected — many "
+            "requirements lack enough detail to be actionable.",
+        ))
+
+    drivers.sort(key=lambda x: -x[0])
+    return drivers
+
+
+def _confidence_gap_tooltip(
+    assessment: Optional[Any],
+    *,
+    kind: str,
+) -> str:
+    """Return the tooltip string for a coverage tile in plain English.
+
+    ``kind`` must be one of ``"completeness"``, ``"accuracy"``,
+    ``"overall"`` (clarity + completeness composite) or
+    ``"evaluation"`` (the four-sub-score composite shown as Evaluation
+    Confidence on the dashboard). The tooltip lists, in simple terms,
+    which signals are missing so the user understands why the percentage
+    is not 100%.
+    """
+    base_by_kind = {
+        "completeness": "How thoroughly the BRD covers the regulation.",
+        "accuracy": (
+            "How well requirements are backed by evidence "
+            "(citations, priorities, acceptance criteria)."
+        ),
+        "overall": (
+            "Overall coverage of the regulation — a blend of clarity "
+            "and completeness."
+        ),
+        "evaluation": (
+            "Overall confidence in the analysis — a blend of "
+            "completeness, quality, evidence and clarity."
+        ),
+    }
+    base = base_by_kind.get(kind, "")
+
+    if assessment is None:
+        return (
+            base + "\n\nDetails aren't available yet — run the analysis "
+            "to see what's missing."
+        )
+
+    if kind == "completeness":
+        score = float(getattr(assessment, "completeness_score", 0.0))
+    elif kind == "accuracy":
+        score = float(getattr(assessment, "evidence_score", 0.0))
+    elif kind == "evaluation":
+        score = float(getattr(assessment, "overall_score", 0.0))
+    else:  # "overall" (Page 3 tile) = 0.5 * clarity + 0.5 * completeness
+        clarity = float(getattr(assessment, "clarity_score", 0.0))
+        completeness = float(getattr(assessment, "completeness_score", 0.0))
+        score = 0.5 * clarity + 0.5 * completeness
+
+    gap = max(0.0, 100.0 - score)
+    if gap < 0.05:
+        return (
+            base + f"\n\nCurrent confidence: {score:.1f}%. Everything we "
+            "check is complete."
+        )
+
+    signals: Mapping[str, Any] = getattr(assessment, "signals", {}) or {}
+    if kind == "completeness":
+        drivers = _completeness_gap_drivers(signals)
+    elif kind == "accuracy":
+        drivers = _accuracy_gap_drivers(signals)
+    elif kind == "overall":
+        # Overall (Page 3) = 50% completeness + 50% clarity. Blend the two
+        # driver lists, halving each driver's contribution to reflect its
+        # actual weight on the composite.
+        raw_drivers = (
+            _completeness_gap_drivers(signals)
+            + _clarity_gap_drivers(signals)
+        )
+        drivers = [(w / 2.0, r) for (w, r) in raw_drivers]
+        drivers.sort(key=lambda x: -x[0])
+    else:  # "evaluation" — the AI Assessment overall (all four sub-scores)
+        weights = {
+            "completeness": 0.30,
+            "quality":      0.25,
+            "evidence":     0.25,
+            "clarity":      0.20,
+        }
+        raw_drivers = (
+            [(w * weights["completeness"], r) for (w, r) in _completeness_gap_drivers(signals)]
+            + [(w * weights["quality"],    r) for (w, r) in _quality_gap_drivers(signals)]
+            + [(w * weights["evidence"],   r) for (w, r) in _accuracy_gap_drivers(signals)]
+            + [(w * weights["clarity"],    r) for (w, r) in _clarity_gap_drivers(signals)]
+        )
+        drivers = list(raw_drivers)
+        drivers.sort(key=lambda x: -x[0])
+
+    lines = [
+        base,
+        "",
+        f"Current confidence: {score:.1f}% "
+        f"({gap:.1f}% missing).",
+        "We are less confident because of these gaps:",
+    ]
+    if not drivers:
+        lines.append(
+            "• Every signal we check looks good; the small remaining gap "
+            "is normal headroom in the score."
+        )
+    else:
+        seen: set = set()
+        for _weight, reason in drivers:
+            if reason in seen:
+                continue
+            seen.add(reason)
+            lines.append(f"• {reason}")
+            if len(seen) >= 6:
+                break
+    return "\n".join(lines)
+
+
+def _build_role_aware_context_from_analysis(
+    analysis: RegulatoryAnalysis,
+) -> str:
+    """Rebuild the regulation-context corpus used by the role-aware engine.
+
+    Reads the same sources Agent 1 originally used (analysis summary,
+    impacted areas, obligation themes, obligation bodies, and — when
+    present — the Client Profile keyword bag). Used by the Page 2 panel's
+    self-heal so re-running the engine on an already-persisted analysis
+    produces the same-quality signal as the original run.
+    """
+    parts: List[str] = []
+    summary = getattr(analysis, "summary", "") or ""
+    if summary:
+        parts.append(summary)
+    for area in getattr(analysis, "impacted_areas", None) or []:
+        parts.append(str(area))
+    for theme in getattr(analysis, "obligation_themes", None) or []:
+        parts.append(str(theme))
+    for ob in getattr(analysis, "obligations", None) or []:
+        parts.append(
+            " ".join([
+                str(getattr(ob, "title", "") or ""),
+                str(getattr(ob, "compliance_requirement", "") or ""),
+                str(getattr(ob, "regulatory_basis", "") or ""),
+            ])
+        )
+    profile = normalize_client_profile(
+        getattr(analysis, "client_profile", None)
+        or (analysis.metadata or {}).get("client_profile"),
+    )
+    if profile:
+        from services.client_profile import client_profile_context_text
+        text = client_profile_context_text(profile)
+        if text:
+            parts.append(text)
+    return "\n".join(p for p in parts if p)
+
+
+def _render_role_aware_interpretation_panel(analysis: RegulatoryAnalysis) -> None:
+    """Render the Client Role-Aware Regulatory Interpretation panel.
+
+    The panel is intentionally lightweight: it shows the section heading,
+    optionally the Client Profile audit strip (chips of the exact keywords
+    that flowed into the analysis), and a placeholder when no institution
+    types are selected. The per-role interpretation and per-obligation
+    applicability tables have been removed from the UI (they used to live
+    in two large expanders) — the underlying deterministic interpretation
+    is still refreshed and threaded through downstream stages and exports
+    via the SELF-HEAL block below.
+    """
+    roles = list(analysis.client_roles or [])
+    profile = normalize_client_profile(
+        getattr(analysis, "client_profile", None)
+        or (analysis.metadata or {}).get("client_profile"),
+    )
+
+    # SELF-HEAL: always re-run the deterministic role-aware engine at
+    # render time using the *current* analysis + selected roles. This
+    # guarantees that sessions carrying an ``analysis`` object generated
+    # by an older version of the engine — with the previous "one-word
+    # difference" bullet templates — immediately pick up the new
+    # diversified bullets without the user having to regenerate Agent 1.
+    # The engine is deterministic and cheap; running it on every render
+    # costs a few ms and is well worth the UX guarantee that the panel
+    # never renders stale interpretation content.
+    from services.client_roles import build_role_aware_interpretation
+    try:
+        regulation_label = getattr(analysis, "regulation", "") or ""
+        regulation_context = _build_role_aware_context_from_analysis(analysis)
+        fresh = build_role_aware_interpretation(
+            regulation=regulation_label or "the regulation",
+            client_roles=roles,
+            regulation_context=regulation_context,
+            obligations=getattr(analysis, "obligations", None) or [],
+        )
+        interpretation = fresh.to_dict()
+        # Persist so downstream stages (RTM, questionnaire filtering,
+        # recommendations, exports) also see the fresh output on this
+        # rerun instead of the stale cached version.
+        analysis.role_interpretation = interpretation
+        if isinstance(analysis.metadata, dict):
+            analysis.metadata["role_interpretation"] = interpretation
+    except Exception:
+        # Never let a rendering-side refresh crash the panel — fall back
+        # to whatever was persisted on the analysis.
+        interpretation = analysis.role_interpretation or {}
+
+    st.markdown("#### Client Role-Aware Regulatory Interpretation")
+
+    # Client Profile audit strip: show the exact keywords that flowed into
+    # this analysis so reviewers can trace *why* certain requirements were
+    # emphasised. Renders inline chips grouped by dimension; hidden when
+    # no keywords were captured (keeps the layout tight for the generic
+    # role-only case).
+    if is_client_profile_populated(profile):
+        chip_sections: List[str] = []
+        for field in CLIENT_PROFILE_FIELDS:
+            values = profile.get(field.key) or []
+            if not values:
+                continue
+            chips = "".join(
+                f'<span class="client-profile-chip">{html.escape(v)}</span>'
+                for v in values
+            )
+            chip_sections.append(
+                f'<div class="client-profile-audit-row">'
+                f'<span class="client-profile-audit-label">'
+                f'{field.icon} {html.escape(field.label)}</span>'
+                f'<span class="client-profile-audit-chips">{chips}</span>'
+                f'</div>'
+            )
+        st.markdown(
+            '<div class="client-profile-audit">'
+            '<div class="client-profile-audit-title">Client Profile tagged '
+            'for this analysis</div>'
+            + "".join(chip_sections)
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+    if not roles:
+        st.info(
+            "No institution type is selected. The pipeline produced a generic "
+            "interpretation. Select one or more institution types on Page 1 "
+            "to enable role-specific applicability, obligations, and "
+            "recommendations."
+        )
+        return
+
+    # The per-role interpretation and per-obligation applicability table
+    # panels were removed from the UI. The interpretation is still built
+    # (and threaded through the pipeline, exports and downstream stages)
+    # via the SELF-HEAL refresh above — this panel just no longer
+    # renders the two large tables in-page.
 
 
 def _render_source_references_panel(brd_artifact: BRDArtifact) -> None:
@@ -2444,6 +3714,8 @@ def _restore_assessment_from_db(assessment_id: int) -> bool:
         return False
     questionnaire = _get_orchestrator().load_questionnaire_package(
         qrec["package"], source="db", name=qrec.get("name"),
+        analysis=st.session_state.get("analysis"),
+        client_roles=_selected_client_roles(),
     )
     st.session_state["questionnaire"] = questionnaire
     st.session_state["package"] = questionnaire.package
@@ -2618,27 +3890,35 @@ def _render_optional_regulation_card() -> None:
 def render_setup_page() -> None:
     st.subheader("1. Setup")
 
+    # STEP 1 (before anything else): Client Role-Aware Regulatory
+    # Interpretation. The selection here is a first-class input for every
+    # downstream agent — the regulation is interpreted **through** the
+    # selected institution type(s), not against a generic FS baseline.
+    _render_client_roles_selector()
+
+    # STEP 1b: Client Profile keyword multi-selects (organization profile,
+    # business lines, products in scope, countries of operation, legal
+    # entities, vendor & third parties). Rendered as CV-style keyword
+    # pickers — curated seed catalogs with free-form entries. Every
+    # keyword is threaded through Agent 1, the BRD prompt, the RTM,
+    # questionnaire and recommendations so the interpretation is scoped
+    # to the actual client (not a generic FS baseline).
+    _render_client_profile_selector()
+
     left, right = st.columns([2, 1], gap="large")
 
     with left:
-        col_reg, col_tier = st.columns([2, 1])
-        with col_reg:
-            st.session_state["regulation"] = st.text_input(
-                "Regulation Code", st.session_state["regulation"],
-                help="Free-form label used in reports and exports (e.g. DORA, MiFID II).",
-            )
-        with col_tier:
-            st.session_state["tier"] = st.selectbox(
-                "Tier", ["Tier-1", "Tier-2", "Tier-3"],
-                index=["Tier-1", "Tier-2", "Tier-3"].index(st.session_state["tier"]),
-            )
+        st.session_state["regulation"] = st.text_input(
+            "Regulation Code", st.session_state["regulation"],
+            help="Free-form label used in reports and exports (e.g. DORA, MiFID II).",
+        )
 
         # NOTE: Every widget below MUST stay inside ``with left`` so the
         # left column keeps growing alongside the taller "Optional
         # regulation" card on the right. Rendering these widgets outside
         # the column block leaves a large empty gap under the
-        # Regulation Code / Tier row (the columns row balloons to match
-        # the right card's height).
+        # Regulation Code row (the row balloons to match the right
+        # card's height).
         st.session_state["mode"] = st.radio(
             "Source Of Requirements",
             ["Use existing BRD/FRD", "Generate BRD/FRD from regulation"],
@@ -2691,17 +3971,54 @@ def render_setup_page() -> None:
     with right:
         _render_optional_regulation_card()
 
-    setup_ready = bool(
-        st.session_state.get("regulation_doc_id")
-        or st.session_state.get("brd_doc_id")
-        or st.session_state.get("questionnaire")
-        or st.session_state["mode"] == "Generate BRD/FRD from regulation"
-    )
+    # Setup-ready is mode-aware. Uploading a regulation into the RIGHT-side
+    # "Optional" card is meant to boost Agent 1 with extra context; on its
+    # own it does not provide the input Page 2 needs when the user is in
+    # "Use existing BRD/FRD" mode. Enabling Next off a regulation-only
+    # upload used to trap users on Page 2 (Next enabled here, but the
+    # "Generate BRD / FRD" CTA on Page 2 stayed disabled because no BRD
+    # was present).
+    mode = st.session_state["mode"]
+    has_brd = bool(st.session_state.get("brd_doc_id"))
+    has_reg = bool(st.session_state.get("regulation_doc_id"))
+    has_quest = bool(st.session_state.get("questionnaire"))
+
+    if mode == "Generate BRD/FRD from regulation":
+        setup_ready = True
+        next_help: Optional[str] = None
+    else:
+        setup_ready = has_brd or has_quest
+        if not setup_ready:
+            if has_reg:
+                next_help = (
+                    "You uploaded a regulation document but no BRD/FRD. "
+                    "Either upload a BRD/FRD DOCX (or load the sample) on "
+                    "the left, or switch 'Source Of Requirements' to "
+                    "'Generate BRD/FRD from regulation' to build one from "
+                    "your regulation."
+                )
+            else:
+                next_help = (
+                    "Upload a BRD/FRD DOCX (or load the sample), or switch "
+                    "to 'Generate BRD/FRD from regulation'."
+                )
+        else:
+            next_help = None
+
+    if mode == "Use existing BRD/FRD" and has_reg and not has_brd:
+        st.info(
+            "You've attached a regulation document but no BRD/FRD. "
+            "To build a BRD from that regulation, switch **Source Of "
+            "Requirements** to **Generate BRD/FRD from regulation**. "
+            "Otherwise, upload a BRD/FRD DOCX on the left (or load the "
+            "bundled sample) to continue.",
+            icon="ℹ️",
+        )
+
     _render_next_button(
         "1. Setup",
         disabled=not setup_ready,
-        help_text=("Upload a regulation/BRD or choose 'Generate BRD/FRD from regulation' "
-                   "to enable the next stage." if not setup_ready else None),
+        help_text=next_help,
     )
 
 
@@ -2722,11 +4039,17 @@ def _run_agent1_and_agent2_with_status() -> None:
             except Exception as exc:
                 st.warning(f"Could not parse regulation document `{reg['name']}`: {exc}")
 
-    # The heavy Agent 1/2 pipeline used to render a live-updating status
-    # panel with per-step diagnostics. Product feedback: users don't need
-    # to see anything running - a single spinner + "Processing..." label
-    # is enough, so we swallow all intermediate log messages.
-    with st.spinner("Processing..."):
+    # Single st.status widget spans Agent 1 -> Agent 2 -> Agent 3 so the
+    # user always sees a phase label that matches what is actually running.
+    # Previously the outer spinner showed "Processing..." during Agents
+    # 1+2 and the inner Agent 3 spinner showed "Generating adaptive
+    # questionnaire..." - the latter appears on the "Generate BRD/FRD"
+    # page and confused users into thinking the button had run the wrong
+    # pipeline. A single status container with progressive labels fixes
+    # that.
+    st.session_state["_brd_flow_active"] = True
+    with st.status("Generating BRD / FRD...", expanded=False) as status:
+        status.update(label="Running Agent 1 - Regulatory Analysis...")
         try:
             analysis = orch.run_regulatory_analysis(
                 parsed_document=parsed_doc,
@@ -2737,13 +4060,32 @@ def _run_agent1_and_agent2_with_status() -> None:
                 consulting_selection=None,
                 include_consulting_guidance=False,
                 intelligence_package=_fresh_intelligence_package(),
+                client_roles=_selected_client_roles(),
+                client_profile=_current_client_profile(),
             )
         except Exception as exc:
+            status.update(label="Regulatory analysis failed", state="error")
+            st.session_state["_brd_flow_active"] = False
             st.error(f"Regulatory analysis failed: {exc}")
             return
 
         st.session_state["analysis"] = analysis
 
+        # Kick off the AI Assessment Intelligence right after Agent 1 so
+        # the impact assessment is available when Agent 3 builds the
+        # questionnaire (the enhancer uses it to weight questions).
+        try:
+            impact = orch.assess_impact_intelligence(analysis)
+            st.session_state["impact_assessment"] = impact
+        except Exception:
+            impact = None
+        try:
+            confidence = orch.assess_confidence_intelligence(analysis)
+            st.session_state["confidence_assessment"] = confidence
+        except Exception:
+            pass
+
+        status.update(label="Running Agent 2 - BRD + Resource Traceability Matrix...")
         docx_path = OUTPUT_DIR / timestamped_name(
             f"{st.session_state['regulation']}_BRD_FRD", ".docx"
         )
@@ -2752,6 +4094,8 @@ def _run_agent1_and_agent2_with_status() -> None:
                 analysis, docx_export_path=docx_path, tier=st.session_state["tier"],
             )
         except Exception as exc:
+            status.update(label="BRD / RTM generation failed", state="error")
+            st.session_state["_brd_flow_active"] = False
             st.error(f"BRD / Resource Traceability Matrix generation failed: {exc}")
             return
 
@@ -2760,10 +4104,26 @@ def _run_agent1_and_agent2_with_status() -> None:
         st.session_state["brd_artifact"] = brd_artifact
         st.session_state["rtm_artifact"] = rtm_artifact
         st.session_state["brd_source"] = brd_artifact.source
-        # Reset the Agent 3 auto-run flag so re-opening Page 3 rebuilds
-        # the questionnaire from the newly generated BRD instead of
-        # showing the stale one.
-        st.session_state["agent3_autorun_attempted"] = False
+        # Any questionnaire from a previous regulation is stale now that
+        # a fresh BRD has been generated - drop it so the chained Agent 3
+        # call below starts clean instead of merging on top of old state.
+        st.session_state["questionnaire"] = None
+        st.session_state["package"] = None
+        st.session_state["assessment_state"] = AssessmentState()
+        st.session_state["assessment_id"] = None
+        st.session_state["questionnaire_id"] = None
+
+        # Chain Agent 3 (Questionnaire Generation) inside the same status
+        # widget so the label stays coherent. Agent 3's own spinner is
+        # suppressed when ``_brd_flow_active`` is set.
+        status.update(label="Running Agent 3 - Questionnaire Generation...")
+        st.session_state["agent3_last_attempted_brd_fp"] = id(brd_artifact)
+        _run_agent3()
+        st.session_state["agent3_autorun_attempted"] = True
+
+        status.update(label="BRD / FRD ready", state="complete")
+
+    st.session_state["_brd_flow_active"] = False
 
 
 def _run_agent2_for_uploaded_brd() -> None:
@@ -2813,6 +4173,17 @@ def _run_agent2_for_uploaded_brd() -> None:
         ],
     )
     st.success(f"Parsed {len(reqs)} requirements from `{path.name}`.")
+    # Chain Agent 3 so parsing an uploaded BRD/FRD also produces the
+    # questionnaire in the same click - the user should not have to hop
+    # to Page 3 and press another button. The auto-run guard on Page 3
+    # is set so opening the page later never triggers a duplicate build.
+    st.session_state["questionnaire"] = None
+    st.session_state["package"] = None
+    st.session_state["assessment_state"] = AssessmentState()
+    st.session_state["assessment_id"] = None
+    st.session_state["questionnaire_id"] = None
+    _run_agent3()
+    st.session_state["agent3_autorun_attempted"] = True
 
 
 def _render_step2_cta(
@@ -2854,9 +4225,18 @@ def render_brd_page() -> None:
         # extracted; otherwise the button lingers below the parsed table
         # and invites accidental re-parses.
         if not reqs_existing:
+            if doc_id_existing:
+                cta_help = "Read requirement tables from the DOCX uploaded on Page 1."
+            else:
+                cta_help = (
+                    "Disabled: no BRD/FRD DOCX uploaded yet. Go back to "
+                    "Page 1 and either upload a BRD/FRD, load the bundled "
+                    "sample, or switch 'Source Of Requirements' to "
+                    "'Generate BRD/FRD from regulation'."
+                )
             if _render_step2_cta(
                 "Generate BRD / FRD",
-                on_click_help="Read requirement tables from the DOCX uploaded on Page 1.",
+                on_click_help=cta_help,
                 disabled=not doc_id_existing,
                 key="step2_generate_from_upload",
             ):
@@ -2882,7 +4262,12 @@ def render_brd_page() -> None:
             else:
                 st.info("Click **Generate BRD / FRD** to extract requirements.")
         else:
-            st.warning("No BRD uploaded yet. Use Page 1 to upload one or load the sample.")
+            st.warning(
+                "No BRD/FRD DOCX uploaded yet. Go back to **Page 1** and "
+                "either upload one, load the bundled sample, or switch "
+                "**Source Of Requirements** to **Generate BRD/FRD from "
+                "regulation** to build one from a regulation document."
+            )
         _render_next_button(
             "2. Generate BRD / FRD",
             disabled=not reqs_ready,
@@ -2938,21 +4323,43 @@ def render_brd_page() -> None:
         + section_counts.get("non_functional_requirements", 0)
     )
 
+    # Compute dynamic confidence values from the AI Assessment Intelligence
+    # service. When a confidence assessment has already been produced (via
+    # Agent 1 or the scoring refresh) we surface those sub-scores; otherwise
+    # we call the deterministic fallback so this page never renders empty.
+    confidence_assessment = st.session_state.get("confidence_assessment")
+    if confidence_assessment is None:
+        try:
+            confidence_assessment = _get_orchestrator().assess_confidence_intelligence(
+                analysis,
+                questionnaire_package=(
+                    st.session_state.get("questionnaire").package
+                    if st.session_state.get("questionnaire") is not None else None
+                ),
+            )
+            st.session_state["confidence_assessment"] = confidence_assessment
+        except Exception:
+            confidence_assessment = None
+
+    completeness_display = (
+        f"{confidence_assessment.completeness_score:.0f}%"
+        if confidence_assessment is not None else "—"
+    )
+    accuracy_display = (
+        f"{confidence_assessment.evidence_score:.0f}%"
+        if confidence_assessment is not None else "—"
+    )
+
     cols = st.columns(4)
     cols[0].metric(
         "Completeness Coverage",
-        "97%",
-        help="Combines section count coverage with per-item metadata richness. "
-             "Higher means the BRD captured more of the regulation's expected "
-             "surface area with well-populated citations, acceptance criteria "
-             "and priorities.",
+        completeness_display,
+        help=_confidence_gap_tooltip(confidence_assessment, kind="completeness"),
     )
     cols[1].metric(
         "Accuracy Coverage",
-        "95%",
-        help="Mean of per-requirement AI confidence. Measures how accurately "
-             "each captured requirement maps to the target regulation and "
-             "relevant RTS / ITS guidance.",
+        accuracy_display,
+        help=_confidence_gap_tooltip(confidence_assessment, kind="accuracy"),
     )
     cols[2].metric(
         "Total Regulatory Reqs",
@@ -2966,6 +4373,13 @@ def render_brd_page() -> None:
         help="Number of discrete obligations identified by Agent 1 "
              "(Regulatory Analysis).",
     )
+    if confidence_assessment is not None and confidence_assessment.reasoning:
+        conf_source = "AI-generated" if confidence_assessment.generated_by_ai else "evidence-driven"
+        st.caption(
+            f"**Confidence rationale** ({conf_source}, overall "
+            f"{confidence_assessment.overall_score:.1f}%): "
+            f"{confidence_assessment.reasoning}"
+        )
 
     # Surface a clear reason whenever GenAI was configured but the run still
     # fell back to the deterministic offline content. The "Used GenAI" tile
@@ -2988,6 +4402,19 @@ def render_brd_page() -> None:
     _render_regulation_source_panel(brd_artifact)
     _render_source_references_panel(brd_artifact)
 
+    # Client Role-Aware Regulatory Interpretation panel. Rendered before the
+    # obligation table so reviewers understand the scope filter that has
+    # been applied to every downstream artefact (BRD, RTM, questionnaire,
+    # recommendations, dashboard).
+    #
+    # NOTE: The anti-hallucination guardrail layer is intentionally NOT
+    # surfaced in the UI. Guardrails still run on every LLM call and
+    # every extracted obligation, and any critical finding forces the
+    # deterministic fallback so no hallucinated content ever reaches the
+    # user — but the audit trail is kept in ``analysis.metadata`` for
+    # exports / audit only.
+    _render_role_aware_interpretation_panel(analysis)
+
     # Regulatory Obligations preview - the cited source(s) are included per
     # row so reviewers can validate traceability without leaving Page 2.
     # Rows are grouped by Area then sorted by Theme + Title so obligations
@@ -3007,8 +4434,6 @@ def render_brd_page() -> None:
             "Title": (o.title[:100] + "...") if len(o.title) > 100 else o.title,
             "Area": o.impacted_area,
             "Function": o.impacted_function,
-            "Priority": o.priority,
-            "Regulatory Basis": o.regulatory_basis,
             "Sources": _format_sources_inline(refs),
             "Primary URL": primary_url,
         })
@@ -3455,16 +4880,27 @@ def render_questionnaire_page() -> None:
 
     # Auto-run Agent 3 on first arrival at this page. Users used to have to
     # click "Run Agent 3" manually; the new behaviour launches it as soon as
-    # the page renders (provided the BRD from Page 2 is available). A
-    # session-scoped flag stops the auto-run from firing again on every
-    # rerun, which would clobber a package the user just loaded from JSON.
-    if (
-        st.session_state.get("questionnaire") is None
-        and not st.session_state.get("agent3_autorun_attempted")
-        and st.session_state.get("brd_artifact") is not None
-    ):
-        st.session_state["agent3_autorun_attempted"] = True
-        _run_agent3()
+    # the page renders (provided the BRD from Page 2 is available).
+    #
+    # The previous implementation used a single boolean flag to prevent
+    # infinite loops after a failed run, but that flag also blocked the
+    # legitimate case where a BRD exists (from a prior session or an
+    # earlier Page 2 click that happened before the Agent-3-chain fix
+    # went live) but no questionnaire was ever built. Now we fingerprint
+    # the BRD artifact we last attempted with; auto-run fires whenever
+    # the current BRD differs from the last attempt. Failure still leaves
+    # the fingerprint in place so we don't loop, but any fresh BRD (or a
+    # newly-generated one via Page 2) will re-trigger.
+    _brd = st.session_state.get("brd_artifact")
+    _questionnaire = st.session_state.get("questionnaire")
+    if _brd is not None and _questionnaire is None:
+        _brd_fp = id(_brd)
+        if st.session_state.get("agent3_last_attempted_brd_fp") != _brd_fp:
+            st.session_state["agent3_last_attempted_brd_fp"] = _brd_fp
+            st.session_state["agent3_autorun_attempted"] = True
+            _run_agent3()
+            if st.session_state.get("questionnaire") is not None:
+                st.rerun()
 
     action_row = st.columns([1, 1, 4])
     with action_row[0]:
@@ -3497,6 +4933,8 @@ def render_questionnaire_page() -> None:
                 else:
                     questionnaire = _get_orchestrator().load_questionnaire_package(
                         content, source="uploaded_json", name=uploaded.name,
+                        analysis=st.session_state.get("analysis"),
+                        client_roles=_selected_client_roles(),
                     )
                     st.session_state["questionnaire"] = questionnaire
                     st.session_state["package"] = questionnaire.package
@@ -3548,12 +4986,67 @@ def render_questionnaire_page() -> None:
     analysis: Optional[RegulatoryAnalysis] = st.session_state.get("analysis")
     obligation_count = len(analysis.obligations) if analysis else 0
 
+    # Overall Regulatory Coverage is now driven off the dynamic confidence
+    # assessment (clarity + completeness) rather than a fixed string. When the
+    # assessment isn't yet available we surface the package's own coverage
+    # metric which itself is computed from BRD-to-question mapping density.
+    confidence_assessment = st.session_state.get("confidence_assessment")
+    if confidence_assessment is not None:
+        coverage_metric = (
+            confidence_assessment.clarity_score * 0.5
+            + confidence_assessment.completeness_score * 0.5
+        )
+        coverage_display = f"{coverage_metric:.0f}%"
+    else:
+        coverage_display = f"{overall_coverage_pct:.0f}%"
+
     cols = st.columns(5)
     cols[0].metric("Regulatory Requirements", len(requirements))
     cols[1].metric("Obligation Reqs", obligation_count)
     cols[2].metric("Closed Questions (Quantitative)", len(closed))
     cols[3].metric("Free Text Questions (Qualitative)", len(free_text))
-    cols[4].metric("Overall Regulatory Coverage", "94%")
+    cols[4].metric(
+        "Overall Regulatory Coverage",
+        coverage_display,
+        help=_confidence_gap_tooltip(confidence_assessment, kind="overall"),
+    )
+
+    # If (almost) every question is a manual-review placeholder we explain
+    # why - it's not that the AI decided to skip closed questions, it's
+    # that the GenAI Shared Service was offline / errored when Agent 3
+    # ran. This warning gives the user a clear next step.
+    manual_review_count = sum(
+        1 for q in questions if q.get("requires_manual_review")
+    )
+    if questions and (len(closed) == 0 or manual_review_count >= len(questions) * 0.5):
+        genai_ok = bool(st.session_state.get("genai_available"))
+        probe_msg = str(st.session_state.get("genai_probe_message") or "")
+        if not genai_ok:
+            reason = (
+                "The GenAI Shared Service is offline, so Agent 3 fell back "
+                "to SME manual-review placeholders for every impact pair. "
+                "Placeholders are always free-text; that is why the "
+                "**Closed Questions** count is 0."
+            )
+            if probe_msg:
+                reason += f" Probe result: _{probe_msg}_"
+            fix = (
+                "**How to fix**: reconnect the LLM (set `API_KEY` in `.env` "
+                "and clear `OPENAI_SKIP_API`), then click **Re-run Agent 3** "
+                "above to regenerate the questionnaire with scored, closed-"
+                "form questions."
+            )
+            st.warning(f"{reason}\n\n{fix}", icon="⚠️")
+        else:
+            st.warning(
+                "Every question in this bank is flagged as `requires_manual_"
+                "review`, which means the LLM returned no grounded output "
+                "for the impact pairs. Try **Re-run Agent 3** to retry - if "
+                "the same result comes back the model may be rate-limited "
+                "or the prompt context may be too sparse for grounded "
+                "generation.",
+                icon="⚠️",
+            )
 
     with st.expander(
         f"Answer Questions ({len(questions)} total)",
@@ -3623,6 +5116,47 @@ def _seed_target_for_area(area: str) -> float:
         return _SEED_BAND_TARGETS[2]
     idx = abs(hash(area)) % len(_SEED_BAND_TARGETS)
     return _SEED_BAND_TARGETS[idx]
+
+
+# Rotating narrative stubs for free-text seed answers so the same page
+# doesn't show 40 identical placeholders. Deterministic (indexed by the
+# area hash) so reruns of the same questionnaire produce the same text.
+_FREE_TEXT_SEED_TEMPLATES: Tuple[str, ...] = (
+    "Draft response — {function} team has an operating procedure covering "
+    "{area}; the runbook is version-controlled, but the last independent "
+    "review was over 12 months ago. Evidence pack (policy, RACI, latest "
+    "control test results) is available on request and would need to be "
+    "refreshed before formal attestation.",
+    "Working answer — {function} maintains a documented process for "
+    "{area}, with monthly reporting to the accountable committee. Known "
+    "gap: coverage across all in-scope entities is partial, and evidence "
+    "of end-to-end testing for the past 6 months is not yet consolidated "
+    "in a single pack.",
+    "Initial narrative — controls for {area} are embedded in the "
+    "{function} operating model, with quarterly self-attestation. "
+    "Independent assurance (2LOD / 3LOD) has reviewed the design but "
+    "has not yet retested the operating effectiveness under the new "
+    "regulatory scope.",
+    "Draft — the {function} team owns {area} and operates against a "
+    "policy last approved this financial year. Metrics are captured in "
+    "the operational dashboard; the primary gap is that thresholds have "
+    "not been recalibrated against the new regulatory expectations.",
+)
+
+
+def _seed_free_text_narrative(*, area: str, function: str) -> str:
+    """Return a plausible narrative stub for a free-text question.
+
+    The stub is deterministic (chosen by hashing the area+function pair),
+    reads like a real SME first-draft answer, and is short enough that
+    the reviewer can immediately overwrite it. It always mentions the
+    concrete area and accountable function so the seeded text still
+    feels connected to the question.
+    """
+    key = f"{area}|{function}".strip().lower() or "default"
+    idx = abs(hash(key)) % len(_FREE_TEXT_SEED_TEMPLATES)
+    template = _FREE_TEXT_SEED_TEMPLATES[idx]
+    return template.format(area=area, function=function)
 
 
 def _seed_default_questionnaire_answers(
@@ -3695,10 +5229,22 @@ def _seed_default_questionnaire_answers(
             area_targets[area] = _SEED_BAND_TARGETS[rng.randrange(band_count)]
 
     for q in questions:
-        if q.get("is_free_text"):
-            continue
         qid = str(q.get("question_id") or "").strip()
         if not qid or qid in state.responses:
+            continue
+
+        # Free-text (Open Ended) questions get a plausible SME narrative
+        # so nothing on Page 3 is left blank. The narrative is short and
+        # neutral - the SME can overwrite it, but the scoring engine
+        # already has enough signal to grade the question without user
+        # intervention.
+        if q.get("is_free_text"):
+            area = str(q.get("area") or "the impacted area").strip() or "the impacted area"
+            function = str(q.get("function") or "the accountable function").strip() or "the accountable function"
+            narrative = _seed_free_text_narrative(area=area, function=function)
+            state.responses[qid] = narrative
+            widget_key = f"qprev_widget_ft_{qid}"
+            st.session_state[widget_key] = narrative
             continue
 
         raw_options = q.get("options") or []
@@ -3842,6 +5388,7 @@ def _render_questionnaire_answer_cards(
             state,
             show_all=show_all,
             bucket_label="quantitative",
+            start_index=1,
         ) or dirty
 
     if free_qs:
@@ -3858,11 +5405,15 @@ def _render_questionnaire_answer_cards(
             "score - they exist to enrich audit trails and executive "
             "narratives."
         )
+        # Qualitative questions continue the sequence from the quantitative
+        # bucket so users see one continuous Q1, Q2, … numbering across
+        # both sections, independent of pagination / show-all state.
         dirty = _render_questionnaire_answer_bucket(
             free_qs,
             state,
             show_all=show_all,
             bucket_label="qualitative",
+            start_index=len(closed_qs) + 1,
         ) or dirty
 
     if dirty:
@@ -3877,6 +5428,7 @@ def _render_questionnaire_answer_bucket(
     *,
     show_all: bool,
     bucket_label: str,
+    start_index: int = 1,
 ) -> bool:
     """Render one ordered bucket of question cards (either quantitative or
     qualitative) and return ``True`` if at least one recorded answer
@@ -3886,6 +5438,11 @@ def _render_questionnaire_answer_bucket(
     its Quantitative / Qualitative section header (no per-area sub-grouping)
     so reviewers see one continuous set of questions per section.
 
+    ``start_index`` is the 1-based ordinal used for the first card in
+    this bucket — the caller passes a monotonically increasing value so
+    the visible Q.no numbering runs 1, 2, 3, … across every bucket on
+    the page.
+
     The bucket_label is threaded into the "showing first N of M" hint so
     the caption stays specific to what the user just scrolled past.
     """
@@ -3893,8 +5450,10 @@ def _render_questionnaire_answer_bucket(
     visible = bucket_questions[:limit]
 
     dirty = False
-    for q in visible:
-        if _render_single_question_answer_card(q, state):
+    for offset, q in enumerate(visible):
+        if _render_single_question_answer_card(
+            q, state, seq_no=start_index + offset,
+        ):
             dirty = True
 
     if len(bucket_questions) > limit:
@@ -3910,18 +5469,22 @@ def _render_questionnaire_answer_bucket(
 
 
 def _render_single_question_answer_card(
-    q: Dict[str, Any], state: AssessmentState
+    q: Dict[str, Any], state: AssessmentState, *, seq_no: Optional[int] = None,
 ) -> bool:
     """Render one interactive question card and return ``True`` if the
     user changed the recorded answer on this render (so the caller knows
     to re-score / persist).
+
+    ``seq_no`` is the 1-based ordinal shown as the visible "Q.no" tag on
+    the card header. The underlying persistence key (``question_id``) is
+    unchanged — it stays authoritative for ``state.responses`` — we only
+    display a stable sequential number so users see 1, 2, 3, ….
 
     The card wrapper is emitted as raw HTML because we mix custom-styled
     header rows with real Streamlit widgets — the widgets themselves
     render inline underneath the tag row and above the score badge.
     """
     is_free_text = bool(q.get("is_free_text"))
-    qid = str(q.get("question_id") or "")
     area = str(q.get("area") or "—")
     function = str(q.get("function") or "")
     qtype = str(q.get("question_type") or ("Free Text" if is_free_text else "—"))
@@ -3936,13 +5499,21 @@ def _render_single_question_answer_card(
     else:
         type_class = ""
 
+    # Header tag row: only Q.no, Area, Function, Single/Multi-select, Impact.
+    qno_display = f"Q{int(seq_no)}" if seq_no else str(q.get("question_id") or "")
     tags = [
-        f'<span class="qprev-tag">{html.escape(qid)}</span>',
+        f'<span class="qprev-tag">{html.escape(qno_display)}</span>',
         f'<span class="qprev-tag">Area: {html.escape(area)}</span>',
     ]
     if function:
         tags.append(f'<span class="qprev-tag">Function: {html.escape(function)}</span>')
     tags.append(f'<span class="qprev-tag {type_class}">{html.escape(qtype)}</span>')
+
+    impact_level = str(q.get("impact_level") or q.get("impact_severity") or "").strip()
+    if impact_level:
+        tags.append(
+            f'<span class="qprev-tag">Impact: {html.escape(impact_level)}</span>'
+        )
 
     card_class = "qprev-card free-text" if is_free_text else "qprev-card"
     st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
@@ -3991,6 +5562,11 @@ def _render_question_input_widget(
             label_visibility="collapsed",
             placeholder="Enter your answer or evidence notes...",
         )
+        # Adaptive follow-up detection — surface a conversational prompt
+        # when the user's answer is too brief, ambiguous, or contains only
+        # short filler tokens like "yes" / "n/a". The prompt is
+        # deterministic (no AI required) but context-aware.
+        _render_brief_answer_followup(q, new_value)
         if new_value != current_text:
             if new_value:
                 state.responses[qid] = new_value
@@ -4075,23 +5651,88 @@ def _render_question_input_widget(
     return False
 
 
+def _render_brief_answer_followup(q: Dict[str, Any], answer: str) -> None:
+    """Show a conversational follow-up prompt when the user's free-text
+    answer is too brief, ambiguous, or made of filler tokens.
+
+    Detection is powered by
+    :func:`services.ai_assessment_intelligence.detect_brief_answer` and is
+    deterministic (no GenAI dependency). The follow-up prompt is context-
+    aware — it references the current question and asks the user for more
+    detail in a polite, professional voice.
+    """
+    if not answer or not str(answer).strip():
+        return
+    try:
+        from services.ai_assessment_intelligence import detect_brief_answer
+
+        needs_followup, prompt = detect_brief_answer(
+            answer,
+            question_context=str(q.get("question") or ""),
+        )
+    except Exception:
+        return
+    if not needs_followup:
+        return
+    st.markdown(
+        '<div class="qprev-followup">'
+        '<span class="qprev-followup-badge">Follow-up needed</span> '
+        f'{html.escape(prompt)}'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_question_score_badge(q: Dict[str, Any], state: AssessmentState) -> None:
-    """Emit a coloured score pill underneath the widget when the question
-    is answered. Uses ``services.scoring_engine.score_value`` so the pill
-    matches the compliance / readiness score the dashboard shows.
+    """Emit a coloured CRITICAL / HIGH / MEDIUM / LOW pill under the widget.
+
+    Every answered question (closed AND free-text) now shows an impact-
+    ladder pill so users see how each answer lands on the readiness /
+    impact axes. Free-text answers are scored via
+    :func:`services.scoring_engine.score_free_text_answer` — a
+    deterministic quality scorer that rewards length, concrete signals
+    (policies, owners, evidence, cadences, metrics) and penalises
+    vagueness ("tbd", "no owner", "not sure", …).
     """
     qid = str(q.get("question_id") or "")
-    if bool(q.get("is_free_text")):
-        text = str(state.responses.get(qid) or "")
-        if text:
-            char_count = len(text)
+    is_free_text = bool(q.get("is_free_text"))
+
+    if is_free_text:
+        text = str(state.responses.get(qid) or "").strip()
+        if not text:
             st.markdown(
-                '<div class="qprev-score">'
-                f'<span class="dash-pill ready">Recorded</span> '
-                f'<b>{char_count}</b> characters captured'
+                '<div class="qprev-score unanswered">'
+                'No answer entered yet — type your response to score this question.'
                 '</div>',
                 unsafe_allow_html=True,
             )
+            return
+        try:
+            score = score_free_text_answer(
+                text, question_text=str(q.get("question") or ""),
+            )
+        except Exception:
+            score = None
+        if score is None:
+            st.markdown(
+                '<div class="qprev-score unanswered">'
+                'This answer is not applicable and is excluded from scoring.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            return
+        css = _severity_class(score)
+        band = _severity_readiness_band(score)
+        impact_word = _severity_impact_label(band) or "—"
+        label = impact_word.upper()
+        st.markdown(
+            '<div class="qprev-score">'
+            f'<span class="dash-pill {css}">{label}</span> '
+            f'<b>{score:.0f}%</b> answer quality &nbsp;·&nbsp; '
+            f'{len(text)} characters captured'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     if not answered(q, state.responses):
@@ -4108,22 +5749,28 @@ def _render_question_score_badge(q: Dict[str, Any], state: AssessmentState) -> N
     except Exception:
         score = None
     if score is None:
+        # ``score_value`` only returns None when the answer is genuinely
+        # "Not applicable" — either the label is an N/A phrase or every
+        # picked option carries explicit ``score_value=None`` metadata.
+        raw_answer = state.responses.get(qid)
+        answer_txt = ", ".join(
+            str(v) for v in (raw_answer if isinstance(raw_answer, list) else [raw_answer])
+            if v not in (None, "")
+        )
         st.markdown(
             '<div class="qprev-score unanswered">'
-            'This answer is not applicable and is excluded from scoring.'
+            "This question doesn't apply to you, so it's not counted in your readiness score."
             '</div>',
             unsafe_allow_html=True,
         )
         return
 
+    # Impact ladder (CRITICAL / HIGH / MEDIUM / LOW): worse readiness =
+    # higher impact. A 0% readiness answer is CRITICAL, a 100% one is LOW.
     css = _severity_class(score)
-    label = {
-        "crit": "Critical",
-        "risk": "At risk",
-        "watch": "Watch",
-        "ready": "Ready",
-        "none": "—",
-    }.get(css, "—")
+    band = _severity_readiness_band(score)
+    impact_word = _severity_impact_label(band) or "—"
+    label = impact_word.upper()
     st.markdown(
         '<div class="qprev-score">'
         f'<span class="dash-pill {css}">{label}</span> '
@@ -4134,9 +5781,13 @@ def _render_question_score_badge(q: Dict[str, Any], state: AssessmentState) -> N
 
 
 def _render_question_footer(q: Dict[str, Any]) -> None:
-    """Render the compact metadata footer (confidence, mapped requirement
-    IDs, theme) at the bottom of an answer card. Skipped silently when
-    no metadata is present so cards without richer metadata stay tight.
+    """Render the compact metadata footer at the bottom of an answer card.
+
+    Only three signals are surfaced here — Confidence, Mapped BRD and
+    Obligations. Team / Impact / Parent / Follow-up / Manual review /
+    Theme / plain-English explainer / evidence-to-prepare have all been
+    removed to keep the card tight; the "Why this question?" popover
+    remains available for reviewers who want the full context.
     """
     footer_bits: List[str] = []
     conf = q.get("confidence")
@@ -4149,10 +5800,12 @@ def _render_question_footer(q: Dict[str, Any]) -> None:
     if mapped:
         preview_ids = ", ".join(html.escape(str(m)) for m in mapped[:3])
         extra = f" (+{len(mapped) - 3})" if len(mapped) > 3 else ""
-        footer_bits.append(f"<b>Mapped:</b> {preview_ids}{extra}")
-    theme = q.get("theme")
-    if theme:
-        footer_bits.append(f"<b>Theme:</b> {html.escape(str(theme))}")
+        footer_bits.append(f"<b>Mapped BRD:</b> {preview_ids}{extra}")
+    mapped_obl = q.get("mapped_obligation_ids") or []
+    if mapped_obl:
+        preview_obl = ", ".join(html.escape(str(m)) for m in mapped_obl[:2])
+        extra = f" (+{len(mapped_obl) - 2})" if len(mapped_obl) > 2 else ""
+        footer_bits.append(f"<b>Obligations:</b> {preview_obl}{extra}")
     if footer_bits:
         st.markdown(
             f'<div class="qprev-footer">{" &nbsp;·&nbsp; ".join(footer_bits)}</div>',
@@ -4170,8 +5823,10 @@ def _render_question_explainer(q: Dict[str, Any]) -> None:
     falls back to an `st.expander` on older builds. Content is driven
     by the ``explainability`` bundle attached to every question by the
     v13 questionnaire generator: regulation & article, obligation ID,
-    control objective, why the question exists, expected evidence,
-    risk-if-negative narrative, and the underlying source references.
+    control objective, why the question exists, risk-if-negative
+    narrative, and the underlying source references. Plain-English and
+    evidence-expectation content are intentionally not rendered here so
+    the popover matches the streamlined question card.
     """
     explain = q.get("explainability") or {}
 
@@ -4198,12 +5853,33 @@ def _render_question_explainer(q: Dict[str, Any]) -> None:
             st.markdown(" \u00b7 ".join(summary_parts))
             st.markdown("---")
 
+        purpose_raw = str(
+            explain.get("question_purpose") or q.get("question_purpose") or ""
+        ).lower()
+        purpose_pretty = {
+            "impact": "Impact probe (what would be affected / at risk)",
+            "readiness": "Readiness probe (current state, controls, evidence)",
+            "impact+readiness": "Impact + Readiness (both tested at once)",
+        }.get(purpose_raw, purpose_raw.title() if purpose_raw else "")
+        targets_impact = (
+            explain.get("targets_impact_dimension") or q.get("targets_impact_dimension")
+        )
+        targets_readiness = (
+            explain.get("targets_readiness_dimension") or q.get("targets_readiness_dimension")
+        )
         two_col_rows = [
             ("Regulator", explain.get("regulator")),
             ("Article / clause", explain.get("article")),
             ("Obligation ID", explain.get("obligation_id")),
             ("Business function", explain.get("business_function")),
             ("Business area", explain.get("business_area")),
+            ("Owning team",
+             explain.get("owning_team") or q.get("owning_team")),
+            ("Impact level",
+             explain.get("impact_level") or q.get("impact_level")),
+            ("Question purpose", purpose_pretty),
+            ("Impact dimension tested", targets_impact),
+            ("Readiness dimension tested", targets_readiness),
             ("Control objective", explain.get("control_objective")),
         ]
         col_a, col_b = st.columns(2)
@@ -4214,6 +5890,13 @@ def _render_question_explainer(q: Dict[str, Any]) -> None:
             with target:
                     st.markdown(f"**{key}**  \n{value}")
 
+        team_rationale = explain.get("team_rationale") or q.get("team_rationale")
+        if team_rationale:
+            st.markdown(f"**Why this team?** {team_rationale}")
+        impact_reason = explain.get("impact_reason") or q.get("impact_reason")
+        if impact_reason:
+            st.markdown(f"**Why this impact level?** {impact_reason}")
+
         for key, items in [
             ("BRD requirement IDs", explain.get("brd_requirement_ids") or []),
             ("Resource Traceability Matrix trace IDs", explain.get("rtm_trace_ids") or []),
@@ -4222,13 +5905,30 @@ def _render_question_explainer(q: Dict[str, Any]) -> None:
                 st.markdown(f"**{key}:** {', '.join(str(i) for i in items)}")
 
         for key, value in [
-            ("Why this question exists", explain.get("reason")),
-            ("Expected evidence", explain.get("expected_evidence")),
+            ("Why this question exists", explain.get("reason") or q.get("rationale")),
             ("Risk if answered negatively", explain.get("risk_if_negative")),
         ]:
             if value:
                 st.markdown(f"**{key}**")
                 st.write(value)
+
+        if q.get("is_parent") and (q.get("child_question_ids") or []):
+            child_ids = q.get("child_question_ids") or []
+            st.info(
+                f"This is a **parent question**. Depending on your answer, "
+                f"up to {len(child_ids)} adaptive follow-up question(s) may be "
+                f"surfaced next."
+            )
+        if q.get("is_child") or q.get("dynamic"):
+            parent_id = q.get("funnel_parent_id") or q.get("source_parent_id")
+            triggers = q.get("trigger_answers") or []
+            if parent_id:
+                trigger_str = ", ".join(str(t) for t in triggers) or "the previous response"
+                st.info(
+                    f"This is an **adaptive follow-up** to question "
+                    f"**{parent_id}**, triggered because you answered "
+                    f"'{trigger_str}'."
+                )
 
         source_refs = explain.get("source_references") or []
         if source_refs:
@@ -4263,8 +5963,22 @@ def _run_agent3() -> None:
     mode = st.session_state["mode"]
     regulation = st.session_state["regulation"]
     orch = _get_orchestrator()
-    with st.spinner("Processing..."):
+    # When Agent 3 is chained inside the BRD/FRD status widget its own
+    # spinner would confuse users into thinking a second unrelated
+    # pipeline was running - we suppress it in that case and rely on the
+    # outer widget's phase label instead.
+    if st.session_state.get("_brd_flow_active"):
+        spinner_ctx = contextlib.nullcontext()
+    else:
+        spinner_ctx = st.spinner("Generating adaptive questionnaire with the AI agent...")
+    with spinner_ctx:
         try:
+            impact = st.session_state.get("impact_assessment")
+            readiness = st.session_state.get("readiness_assessment")
+            rtm = st.session_state.get("rtm_artifact")
+            client_profile = st.session_state.get("client_profile") or None
+            analysis = st.session_state.get("analysis")
+            roles = _selected_client_roles()
             if mode == "Generate BRD/FRD from regulation":
                 brd_artifact: Optional[BRDArtifact] = st.session_state.get("brd_artifact")
                 if brd_artifact is None or brd_artifact.report is None:
@@ -4272,6 +5986,11 @@ def _run_agent3() -> None:
                     return
                 questionnaire = orch.run_questionnaire_from_report(
                     brd_artifact, regulation=regulation,
+                    impact=impact, readiness=readiness,
+                    analysis=analysis,
+                    rtm=rtm,
+                    client_roles=roles,
+                    client_profile=client_profile,
                 )
                 source = "generated_brd"
                 name = questionnaire.name
@@ -4287,6 +6006,11 @@ def _run_agent3() -> None:
                 questionnaire = orch.run_questionnaire_from_docx(
                     Path(rec["path"]), regulation=regulation,
                     name=f"{regulation} — from {Path(rec['name']).stem}",
+                    impact=impact, readiness=readiness,
+                    analysis=analysis,
+                    rtm=rtm,
+                    client_roles=roles,
+                    client_profile=client_profile,
                 )
                 source = "uploaded_brd"
                 name = questionnaire.name
@@ -4353,7 +6077,13 @@ def render_dashboard_page() -> None:
 
     result = scoring.evaluation
     score = float(result.get("compliance_score_pct") or 0.0)
-    eval_conf = float(result.get("evaluation_confidence_pct") or 0.0)
+    # Prefer the AI Assessment Intelligence overall confidence (with reasoning)
+    # over the legacy evaluation_confidence_pct clamp.
+    confidence_assessment = getattr(scoring, "confidence", None) or st.session_state.get("confidence_assessment")
+    if confidence_assessment is not None:
+        eval_conf = float(confidence_assessment.overall_score)
+    else:
+        eval_conf = float(result.get("evaluation_confidence_pct") or 0.0)
     answered = int(result.get("answered_count") or 0)
     unanswered = int(result.get("unanswered_count") or 0)
     total = answered + unanswered
@@ -4361,16 +6091,29 @@ def render_dashboard_page() -> None:
     area_summary: Dict[str, Dict[str, Any]] = result.get("area_summary") or {}
     function_summary: Dict[str, Dict[str, Any]] = result.get("function_summary") or {}
 
-    _render_dashboard_hero(readiness_pct=score, confidence_pct=eval_conf)
-
-    _render_dashboard_kpis(
+    # The weighted impact model (if available) is the single source of truth
+    # for the "Overall Impact Score" tile - fall back to `100 - readiness`
+    # only when the model has not yet been computed (e.g. before any
+    # scoring refresh has run).
+    weighted_impact: Optional[WeightedImpactResult] = st.session_state.get(
+        "weighted_impact"
+    )
+    impact_hero_pct: Optional[float] = (
+        float(weighted_impact.overall_impact_score) if weighted_impact is not None else None
+    )
+    _render_dashboard_hero(
         readiness_pct=score,
         confidence_pct=eval_conf,
-        answered=answered,
-        total=total,
-        pairs=len(pair_scores),
-        high_impact_area_count=_dashboard_high_impact_area_count(area_summary),
+        impact_pct=impact_hero_pct,
     )
+
+    # Streamlined dashboard: only the hero + severity banner + area cards
+    # + heatmap + area-detailed recommendations + three expanders below.
+    # The KPI row, AI intelligence panels and weighted-readiness /
+    # weighted-impact detail panels have been intentionally removed - the
+    # weighted calculations still run behind the scenes and drive the
+    # numbers in the hero + area cards, but their detail views are no
+    # longer rendered here.
     _render_dashboard_legend(
         area_summary=area_summary,
         function_summary=function_summary,
@@ -4418,7 +6161,13 @@ def render_dashboard_page() -> None:
     )
     _autorun_recommendations_if_needed(questionnaire, scoring)
     recs = st.session_state.get("recommendations") or []
-    _render_dashboard_area_recommendations(recs, area_summary)
+    rich_recs = st.session_state.get("rich_recommendations") or []
+    # Prefer rich (consulting-grade) recommendations when available; fall
+    # back to the legacy compact recommendations otherwise.
+    if rich_recs:
+        _render_rich_recommendations(rich_recs)
+    else:
+        _render_dashboard_area_recommendations(recs, area_summary)
 
     with st.expander("Advanced controls (regenerate recommendations)", expanded=False):
         rcol_a, rcol_b, rcol_c = st.columns([1, 1, 2])
@@ -4446,10 +6195,13 @@ def render_dashboard_page() -> None:
                 top_n_requirements=int(top_n),
                 enrich_with_genai=bool(run_genai),
                 branch_log=list(rec_state.branch_log),
+                analysis=st.session_state.get("analysis"),
+                client_roles=_selected_client_roles(),
             )
             if recommendation_result.used_genai:
                 st.toast("Recommendations enriched via GenAI.")
             st.session_state["recommendations"] = recommendation_result.recommendations
+            st.session_state["rich_recommendations"] = recommendation_result.rich_recommendations
             _persist_assessment_snapshot()
             st.rerun()
 
@@ -4492,8 +6244,11 @@ def _autorun_recommendations_if_needed(
             top_n_requirements=10,
             enrich_with_genai=False,
             branch_log=list(rec_state.branch_log),
+            analysis=st.session_state.get("analysis"),
+            client_roles=_selected_client_roles(),
         )
         st.session_state["recommendations"] = recommendation_result.recommendations
+        st.session_state["rich_recommendations"] = recommendation_result.rich_recommendations
         st.session_state["dashboard_recs_fingerprint"] = fingerprint
         _persist_assessment_snapshot()
     except Exception:
@@ -4508,76 +6263,26 @@ def _autorun_recommendations_if_needed(
 
 def _severity_class(score: Optional[float]) -> str:
     """Map a **readiness / compliance** score to one of the four canonical
-    severity CSS classes used on Page 5. Mirrors ``cxo_status`` in
-    ``services.scoring_engine`` so colour coding stays consistent with the
-    text labels users see elsewhere in the app.
-
-    Readiness bands (higher readiness = better, aligned across the app):
-        - score >= 75        -> Ready    (dark green)
-        - score 50  - 75    -> Watch    (light green)
-        - score 25  - 50    -> At risk  (amber)
-        - score <  25        -> Critical (red)
-
-    Use :func:`_impact_class` for scores expressed as **impact %**
-    (higher impact = worse).
+    severity CSS classes. Thin wrapper over
+    :mod:`services.severity` so all bands / thresholds / class names stay
+    in a single module.
     """
-    if score is None:
-        return "none"
-    try:
-        val = float(score)
-    except (TypeError, ValueError):
-        return "none"
-    if val >= 75:
-        return "ready"
-    if val >= 50:
-        return "watch"
-    if val >= 25:
-        return "risk"
-    return "crit"
+    return _severity_css_class(_severity_readiness_band(score))
 
 
 def _impact_class(impact: Optional[float]) -> str:
     """Map an **impact %** (higher impact = worse) to a severity CSS class.
 
-    Impact bands (mirror of the readiness ladder, so impact and
-    readiness always agree once you flip the axis):
-        - impact >= 75       -> Critical (red)
-        - impact 50 - 75     -> At risk  (amber)
-        - impact 25 - 50     -> Watch    (light green)
-        - impact <  25       -> Ready    (dark green)
+    Thin wrapper over :func:`services.severity.impact_band`.
     """
-    if impact is None:
-        return "none"
-    try:
-        val = float(impact)
-    except (TypeError, ValueError):
-        return "none"
-    if val >= 75:
-        return "crit"
-    if val >= 50:
-        return "risk"
-    if val >= 25:
-        return "watch"
-    return "ready"
+    return _severity_css_class(_severity_impact_band(impact))
 
 
 def _severity_label_from_status(status: Optional[str]) -> str:
-    """Return the CSS class for a CXO-status string ('Critical' / 'At risk'
-    / 'Watch' / 'Ready'). Used when a card already carries a status label
-    and we want to avoid recomputing from the raw score.
+    """Return the CSS class for a CXO-status label (``Critical`` / ``At risk``
+    / ``Watch`` / ``Ready``). Thin wrapper over :mod:`services.severity`.
     """
-    if not status:
-        return "none"
-    s = str(status).strip().lower()
-    if s == "critical":
-        return "crit"
-    if s == "at risk":
-        return "risk"
-    if s == "watch":
-        return "watch"
-    if s == "ready":
-        return "ready"
-    return "none"
+    return _severity_css_class(_severity_from_label(status))
 
 
 def _dashboard_high_impact_area_count(area_summary: Dict[str, Dict[str, Any]]) -> int:
@@ -4656,19 +6361,792 @@ def _impact_severity_from_score(impact: Optional[float]) -> Tuple[str, str]:
     return ("Ready", "ready")
 
 
-def _render_dashboard_hero(*, readiness_pct: float, confidence_pct: float) -> None:
+def _render_rich_recommendations(recs: List[Any]) -> None:
+    """Render the consulting-grade rich recommendations as tall stacked cards.
+
+    Each card carries what / why / how / priority / expected outcome /
+    dependencies plus implementation steps, success metrics, mapped
+    requirements and obligations, and the accountable owner. The
+    short-term / long-term / quick-wins timelines are computed on the
+    dataclass but intentionally not rendered in the card - product
+    feedback preferred the shorter surface.
+    """
+    if not recs:
+        st.caption("No consulting-grade recommendations yet.")
+        return
+
+    def _get(r: Any, key: str, default: Any = None) -> Any:
+        if isinstance(r, dict):
+            return r.get(key, default)
+        return getattr(r, key, default)
+
+    # Sort High > Medium > Low
+    def _rank(pr: str) -> int:
+        return {"high": 0, "medium": 1, "low": 2}.get((pr or "").strip().lower(), 3)
+
+    recs_sorted = sorted(
+        recs, key=lambda r: _rank(str(_get(r, "priority", "Medium"))),
+    )
+
+    st.markdown('<div class="dash-rich-rec-grid">', unsafe_allow_html=True)
+    for r in recs_sorted:
+        area = str(_get(r, "area", "") or "Unmapped")
+        title = str(_get(r, "title", "") or f"Recommendation for {area}")
+        priority = str(_get(r, "priority", "Medium") or "Medium")
+        severity = str(_get(r, "severity", "Watch") or "Watch")
+        horizon = str(_get(r, "horizon", "") or "")
+        function = str(_get(r, "function", "") or "")
+        owner = str(_get(r, "owner", "") or "")
+        what = str(_get(r, "what", "") or "")
+        why = str(_get(r, "why", "") or "")
+        how = str(_get(r, "how", "") or "")
+        expected = str(_get(r, "expected_outcome", "") or "")
+        deps = list(_get(r, "dependencies", []) or [])
+        steps = list(_get(r, "implementation_steps", []) or [])
+        metrics = list(_get(r, "success_metrics", []) or [])
+        req_ids = list(_get(r, "mapped_requirement_ids", []) or [])
+        obl_ids = list(_get(r, "mapped_obligation_ids", []) or [])
+        by_ai = bool(_get(r, "generated_by_ai", False))
+        identified_gap = str(_get(r, "identified_gap", "") or "")
+
+        pill_css = _severity_pill_for_severity(severity) if severity else "watch"
+        priority_css = {"high": "crit", "medium": "watch", "low": "ready"}.get(
+            priority.lower(), "watch"
+        )
+
+        badges = (
+            f'<span class="dash-pill {priority_css}">Priority: {html.escape(priority)}</span>'
+            f'<span class="dash-pill {pill_css}">{html.escape(severity)}</span>'
+        )
+        if horizon:
+            badges += f'<span class="dash-pill">{html.escape(horizon)}</span>'
+        if by_ai:
+            badges += '<span class="dash-pill">AI-refined</span>'
+
+        area_line = html.escape(area) + (
+            f" &nbsp;·&nbsp; {html.escape(function)}" if function else ""
+        )
+        if owner:
+            area_line += f" &nbsp;·&nbsp; Owner: {html.escape(owner)}"
+
+        def _list_block(label: str, items: List[str]) -> str:
+            if not items:
+                return ""
+            li = "".join(f"<li>{html.escape(str(i))}</li>" for i in items[:8])
+            return (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>{label}</b>'
+                f'<ul class="dash-rich-rec-list">{li}</ul>'
+                f'</div>'
+            )
+
+        card_html = (
+            f'<div class="dash-rich-rec-card {priority_css}">'
+            f'<div class="dash-rich-rec-header">'
+            f'<div class="dash-rich-rec-title">{html.escape(title)}</div>'
+            f'<div class="dash-rich-rec-badges">{badges}</div>'
+            f'</div>'
+            f'<div class="dash-rich-rec-meta">'
+            f'<div>{area_line}</div>'
+            f'</div>'
+        )
+        if identified_gap:
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>Identified gap.</b> {html.escape(identified_gap)}'
+                f'</div>'
+            )
+        if what:
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>What needs to be done.</b> {html.escape(what)}'
+                f'</div>'
+            )
+        if why:
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>Why it is important.</b> {html.escape(why)}'
+                f'</div>'
+            )
+        if how:
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>How to implement it.</b> {html.escape(how)}'
+                f'</div>'
+            )
+        if expected:
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'<b>Expected outcome.</b> {html.escape(expected)}'
+                f'</div>'
+            )
+        card_html += _list_block("Dependencies / prerequisites", deps)
+        card_html += _list_block("Implementation steps", steps)
+        card_html += _list_block("Success metrics", metrics)
+        if req_ids or obl_ids:
+            ref_parts = []
+            if req_ids:
+                ref_parts.append(
+                    f"<b>Requirements:</b> {html.escape(', '.join(req_ids[:8]))}"
+                )
+            if obl_ids:
+                ref_parts.append(
+                    f"<b>Obligations:</b> {html.escape(', '.join(obl_ids[:8]))}"
+                )
+            card_html += (
+                f'<div class="dash-rich-rec-section">'
+                f'{" &nbsp;·&nbsp; ".join(ref_parts)}'
+                f'</div>'
+            )
+        card_html += "</div>"
+        st.markdown(card_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_impact_intelligence_panel(impact: Any) -> None:
+    """Render the AI-driven impact assessment as a structured panel.
+
+    Shows the executive summary + one card per impact dimension
+    (business functions, processes, systems, data, controls, stakeholders)
+    with severity, item list, rationale and evidence.
+    """
+    st.markdown(
+        '<h4 class="rap-dash-hdr">Regulatory Impact Assessment</h4>',
+        unsafe_allow_html=True,
+    )
+    source = "AI-generated" if getattr(impact, "generated_by_ai", False) else "evidence-driven"
+    header_bits = [
+        f'<div class="dash-impact-header">'
+        f'<div class="dash-impact-cap">Overall Impact</div>'
+        f'<div class="dash-impact-value">{impact.overall_severity_score:.0f}/100</div>'
+        f'<div class="dash-impact-sub"><span class="dash-pill {_severity_pill_for_severity(impact.overall_severity)}">'
+        f'{html.escape(str(impact.overall_severity))}</span></div>'
+        f'<div class="dash-impact-src">Source: {source}</div>'
+        f'</div>'
+    ]
+    st.markdown("".join(header_bits), unsafe_allow_html=True)
+    if impact.executive_summary:
+        st.caption(impact.executive_summary)
+
+    cards: List[str] = ['<div class="dash-cards impact-int-grid">']
+    dim_labels = {
+        "business_functions": "Business Functions",
+        "processes": "Processes",
+        "systems": "Systems & Applications",
+        "data": "Data",
+        "controls": "Controls",
+        "stakeholders": "Stakeholders",
+    }
+    for dim in impact.dimensions():
+        label = dim_labels.get(dim.dimension, dim.dimension.replace("_", " ").title())
+        css = _severity_pill_for_severity(dim.severity)
+        items_html = "".join(f"<li>{html.escape(str(i))}</li>" for i in (dim.items or [])[:8])
+        evidence_html = (
+            "".join(f"<li>{html.escape(str(e))}</li>" for e in (dim.evidence or [])[:3])
+        )
+        evidence_block = (
+            f'<div class="dash-card-body"><b>Evidence:</b><ul>{evidence_html}</ul></div>'
+            if evidence_html else ""
+        )
+        cards.append(
+            f'<div class="dash-card {css}">'
+            f'<div class="dash-card-title">{html.escape(label)}</div>'
+            f'<div class="dash-card-meta">'
+            f'<span class="dash-pill {css}">{html.escape(str(dim.severity))}</span> '
+            f'&nbsp;<b>{dim.severity_score:.0f}/100</b> impact severity'
+            f'</div>'
+            f'<div class="dash-card-body">'
+            f'<b>Affected items:</b><ul>{items_html or "<li>—</li>"}</ul>'
+            f'<b>Why this area is impacted:</b><br>{html.escape(dim.rationale)}'
+            f'</div>'
+            f'{evidence_block}'
+            f'</div>'
+        )
+    cards.append("</div>")
+    st.markdown("".join(cards), unsafe_allow_html=True)
+
+
+def _render_readiness_intelligence_panel(readiness: Any) -> None:
+    """Render the AI-driven readiness assessment across seven consulting
+    dimensions: existing controls, process maturity, policy coverage,
+    technology readiness, documentation completeness, implementation gaps,
+    and organizational preparedness.
+    """
+    st.markdown(
+        '<h4 class="rap-dash-hdr">Regulatory Readiness Assessment</h4>',
+        unsafe_allow_html=True,
+    )
+    source = "AI-generated" if getattr(readiness, "generated_by_ai", False) else "evidence-driven"
+    css = _severity_class(readiness.overall_score)
+    st.markdown(
+        f'<div class="dash-readiness-header">'
+        f'<div class="dash-impact-cap">Overall Readiness</div>'
+        f'<div class="dash-impact-value">{readiness.overall_score:.1f}%</div>'
+        f'<div class="dash-impact-sub"><span class="dash-pill {css}">'
+        f'{html.escape(str(readiness.overall_level))}</span></div>'
+        f'<div class="dash-impact-src">Source: {source}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    if readiness.executive_summary:
+        st.caption(readiness.executive_summary)
+
+    dim_labels = {
+        "existing_controls": "Existing Controls",
+        "process_maturity": "Process Maturity",
+        "policy_coverage": "Policy Coverage",
+        "technology_readiness": "Technology Readiness",
+        "documentation_completeness": "Documentation Completeness",
+        "implementation_gaps": "Implementation Gaps",
+        "organizational_preparedness": "Organizational Preparedness",
+    }
+    cards: List[str] = ['<div class="dash-cards readiness-int-grid">']
+    for dim in readiness.dimensions():
+        label = dim_labels.get(dim.dimension, dim.dimension.replace("_", " ").title())
+        css_d = _severity_class(dim.score)
+        strengths_html = (
+            "".join(f"<li>{html.escape(str(s))}</li>" for s in (dim.strengths or [])[:4])
+        )
+        gaps_html = (
+            "".join(f"<li>{html.escape(str(g))}</li>" for g in (dim.gaps or [])[:4])
+        )
+        strengths_block = (
+            f'<div class="dash-card-body"><b>Strengths:</b><ul>{strengths_html}</ul></div>'
+            if strengths_html else ""
+        )
+        gaps_block = (
+            f'<div class="dash-card-body"><b>Gaps:</b><ul>{gaps_html}</ul></div>'
+            if gaps_html else ""
+        )
+        cards.append(
+            f'<div class="dash-card {css_d}">'
+            f'<div class="dash-card-title">{html.escape(label)}</div>'
+            f'<div class="dash-card-meta">'
+            f'<span class="dash-pill {css_d}">{html.escape(str(dim.maturity_level))}</span> '
+            f'&nbsp;<b>{dim.score:.0f}/100</b> maturity'
+            f'</div>'
+            f'<div class="dash-card-bar {css_d}"><span style="width:{max(0.0, min(100.0, dim.score)):.1f}%"></span></div>'
+            f'<div class="dash-card-body">{html.escape(dim.rationale)}</div>'
+            f'{strengths_block}'
+            f'{gaps_block}'
+            f'</div>'
+        )
+    cards.append("</div>")
+    st.markdown("".join(cards), unsafe_allow_html=True)
+
+
+def _severity_pill_for_severity(severity: str) -> str:
+    s = (severity or "").strip().lower()
+    return {
+        "critical": "crit",
+        "high": "risk",
+        "at risk": "risk",
+        "medium": "watch",
+        "low": "ready",
+    }.get(s, "watch")
+
+
+# ---------------------------------------------------------------------------
+# Weighted readiness panel (DORA demo profile)
+# ---------------------------------------------------------------------------
+#
+# All rendering for the new weighted scoring model lives in this section.
+# The panel is populated from ``st.session_state["weighted_readiness"]``
+# which is a :class:`services.readiness_score.WeightedReadinessResult`
+# instance refreshed by :func:`_refresh_scoring_snapshot` on every
+# dashboard paint. Nothing in here talks to the scoring engine directly,
+# so this section can be swapped out or hidden without touching the core
+# rules-engine pipeline.
+
+
+def _severity_class_for_gap(severity_label: str) -> str:
+    """Map the gap severity vocabulary to the existing severity CSS classes.
+
+    ``Low`` → ready, ``Medium`` → watch, ``High`` → risk,
+    ``Critical`` → crit. The CSS palette is shared with the impact /
+    readiness cards so all gap indicators use the same colour ladder.
+    """
+    return {
+        "low": "ready",
+        "medium": "watch",
+        "high": "risk",
+        "critical": "crit",
+    }.get(str(severity_label).lower(), "watch")
+
+
+def _render_weighted_readiness_panel(result: WeightedReadinessResult) -> None:
+    """Render the full weighted readiness section for the Dashboard page.
+
+    Layout:
+
+    1. Section header + rating pill.
+    2. Five KPI cards (Overall Readiness, Rating, Accuracy, Completeness,
+       Overall Coverage Gap).
+    3. Weighted scoring table (Area, Weight, #Q, Score, Weighted, Gap,
+       Severity) - a plain ``st.dataframe`` so users can sort/copy.
+    4. Top 5 gap areas as colour-coded chips.
+    5. Nine gap-category rollup as compact cards.
+    6. Accuracy breakdown expander showing the three sub-scores that
+       feed the composite accuracy metric.
+    7. Missing-evidence / low-mapping status caption.
+
+    Every card uses the existing ``dash-*`` CSS palette so the styling
+    matches the rest of the dashboard.
+    """
+    st.markdown(
+        '<h4 class="rap-dash-hdr">Weighted Readiness (DORA)</h4>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Overall Readiness Index is the weighted average of the seven "
+        "DORA assessment areas. Weights sum to 100 and are validated at "
+        "startup - swap the profile via `services.readiness_score.DORA_AREA_WEIGHTS`."
+    )
+
+    overall = float(result.overall_readiness_score)
+    overall_css = _severity_class(overall)
+    rating = result.readiness_rating
+    accuracy = float(result.accuracy_score)
+    completeness = float(result.completeness_score)
+    overall_gap = float(result.overall_coverage_gap)
+
+    # --- KPI cards ---------------------------------------------------------
+    kpi_html = (
+        '<div class="dash-kpis">'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Overall Readiness Index</div>'
+        f'<div class="dash-kpi-value">{overall:.1f} / 100</div>'
+        f'<div class="dash-kpi-bar {overall_css}"><span style="width:{overall:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Readiness Rating</div>'
+        f'<div class="dash-kpi-value" style="font-size:1.05rem;">{html.escape(rating)}</div>'
+        f'<div class="dash-kpi-bar {overall_css}"><span style="width:{overall:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Accuracy Score</div>'
+        f'<div class="dash-kpi-value">{accuracy:.1f}%</div>'
+        f'<div class="dash-kpi-bar {_severity_class(accuracy)}"><span style="width:{accuracy:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Completeness Score</div>'
+        f'<div class="dash-kpi-value">{completeness:.1f}%</div>'
+        f'<div class="dash-kpi-bar {_severity_class(completeness)}"><span style="width:{completeness:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Overall Coverage Gap</div>'
+        f'<div class="dash-kpi-value">{overall_gap:.1f}%</div>'
+        f'<div class="dash-kpi-bar {_severity_class(100 - overall_gap)}"><span style="width:{overall_gap:.1f}%"></span></div>'
+        f'</div>'
+        '</div>'
+    )
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # --- Weighted scoring table ------------------------------------------
+    st.markdown("**Weighted Scoring Table**")
+    table_rows: List[Dict[str, Any]] = []
+    for row in result.area_details:
+        table_rows.append({
+            "Area": row.area,
+            "Weight (%)": row.weight,
+            "# Questions": row.num_questions,
+            "Total Mapped": row.total_questions,
+            "Area Score": row.area_score,
+            "Weighted Score": row.weighted_score,
+            "Coverage Gap": row.coverage_gap,
+            "Gap Severity": row.gap_severity,
+        })
+    if table_rows:
+        df = pd.DataFrame(table_rows)
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Weight (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "Area Score": st.column_config.ProgressColumn(
+                    "Area Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Weighted Score": st.column_config.NumberColumn(format="%.2f"),
+                "Coverage Gap": st.column_config.ProgressColumn(
+                    "Coverage Gap", min_value=0, max_value=100, format="%.1f",
+                ),
+            },
+        )
+
+    # --- Top gap areas (chips) ------------------------------------------
+    st.markdown("**Highest Gap Areas**")
+    if not result.top_gap_areas:
+        st.caption("No gaps detected - every weighted area scored at 100.")
+    else:
+        chips: List[str] = []
+        for row in result.top_gap_areas:
+            css = _severity_class_for_gap(row.get("gap_severity", "Medium"))
+            chips.append(
+                f'<span class="dash-pill {css}" style="margin:2px 6px 2px 0;'
+                f'padding:4px 10px;border-radius:12px;font-size:0.85rem;">'
+                f'{html.escape(str(row["area"]))} - Gap {row["coverage_gap"]:.1f}% '
+                f'({html.escape(str(row["gap_severity"]))})</span>'
+            )
+        st.markdown("<div>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+
+    # --- Gap categories -------------------------------------------------
+    st.markdown("**Gap Categories**")
+    st.caption(
+        "Cross-cutting categories rolled up from every mapped question. "
+        "The top 3 highest-coverage areas per category are surfaced so "
+        "you can trace a category gap back to the underlying operational "
+        "areas."
+    )
+    cat_rows: List[Dict[str, Any]] = []
+    for cat, breakdown in result.gap_categories.items():
+        cat_rows.append({
+            "Category": cat,
+            "Score": breakdown.score,
+            "Coverage Gap": breakdown.coverage_gap,
+            "Severity": _readiness_gap_severity_from_score(breakdown.score),
+            "Matched Questions": breakdown.matched_questions,
+            "Top Areas": ", ".join(breakdown.top_areas) if breakdown.top_areas else "-",
+        })
+    if cat_rows:
+        cat_df = pd.DataFrame(cat_rows)
+        st.dataframe(
+            cat_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Coverage Gap": st.column_config.ProgressColumn(
+                    "Coverage Gap", min_value=0, max_value=100, format="%.1f",
+                ),
+            },
+        )
+
+    # --- Accuracy breakdown ---------------------------------------------
+    with st.expander("Accuracy breakdown", expanded=False):
+        breakdown = result.accuracy_breakdown or {}
+        ev = float(breakdown.get("evidence_coverage") or 0.0)
+        cons = float(breakdown.get("answer_consistency") or 0.0)
+        mapping = float(breakdown.get("requirement_mapping_coverage") or 0.0)
+        st.write(
+            "**Formula:** `Accuracy = 40% Evidence Coverage + 30% Answer "
+            "Consistency + 30% Requirement Mapping Coverage`."
+        )
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Evidence Coverage", f"{ev:.1f}%")
+        with col_b:
+            st.metric("Answer Consistency", f"{cons:.1f}%")
+        with col_c:
+            st.metric("Requirement Mapping", f"{mapping:.1f}%")
+        st.caption(
+            "Evidence coverage counts answers that reference an artefact, "
+            "URL, policy or attachment. Answer consistency penalises "
+            "'Fully Implemented' claims without matching evidence. "
+            "Requirement mapping counts questions linked to at least one "
+            "BRD or regulatory obligation."
+        )
+
+    # --- Missing evidence / mapping status ------------------------------
+    if result.accuracy_breakdown:
+        ev = float(result.accuracy_breakdown.get("evidence_coverage") or 0.0)
+        mapping = float(result.accuracy_breakdown.get("requirement_mapping_coverage") or 0.0)
+        if ev < 60.0:
+            st.warning(
+                f"Evidence Coverage is only {ev:.1f}%. Attach or reference "
+                "policy documents, audit trails or artefacts in your "
+                "answers to raise the Accuracy Score."
+            )
+        if mapping < 60.0:
+            st.warning(
+                f"Requirement Mapping Coverage is only {mapping:.1f}%. "
+                "Re-run Agent 3 or edit the questionnaire so every question "
+                "maps to at least one BRD requirement or obligation."
+            )
+
+
+def _readiness_gap_severity_from_score(score: float) -> str:
+    """Convert a 0-100 score into the gap-severity vocabulary.
+
+    Mirrors :func:`services.readiness_score.gap_severity` but reads from
+    the score (not the gap) so the helper works when the caller only has
+    the readiness value handy.
+    """
+    from services.readiness_score import gap_severity as _gs
+    return _gs(max(0.0, 100.0 - float(score or 0.0)))
+
+
+# ---------------------------------------------------------------------------
+# Weighted impact panel (DORA demo profile)
+# ---------------------------------------------------------------------------
+
+
+def _impact_rating_css(rating: str) -> str:
+    """Map an impact rating label to the shared CSS severity vocabulary.
+
+    ``Very High Impact`` and ``High Impact`` land on ``crit`` / ``risk`` -
+    the two most attention-grabbing colours in the palette so the tiles
+    stand out on the dashboard.
+    """
+    r = str(rating or "").lower()
+    if "very high" in r or "critical" in r:
+        return "crit"
+    if "high" in r:
+        return "risk"
+    if "medium" in r:
+        return "watch"
+    return "ready"
+
+
+def _render_weighted_impact_panel(
+    result: WeightedImpactResult,
+    readiness_result: Optional[WeightedReadinessResult] = None,
+) -> None:
+    """Render the full weighted Impact section for the Dashboard page.
+
+    Layout:
+
+    1. Section header + rating pill.
+    2. Four KPI cards (Overall Impact, Rating, Overall Priority, Coverage).
+    3. Weighted Impact Factor Table (Factor, Weight, Score, Weighted, Rating).
+    4. Top impacted business capabilities / processes / systems / controls /
+       third parties - each as a compact list.
+    5. Priority Areas table (High-Impact / Low-Readiness).
+    6. Area x Function impact heatmap (top 25 rows).
+
+    Impact and Readiness are calculated separately here - only the
+    Priority column combines the two.
+    """
+    st.markdown(
+        '<h4 class="rap-dash-hdr">Weighted Impact (DORA)</h4>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Overall Impact Score is the weighted average of the seven DORA "
+        "impact factors. Weights sum to 100 and are validated at startup. "
+        "Impact answers *how much the regulation affects the organisation* - "
+        "it is calculated independently of Readiness."
+    )
+
+    overall = float(result.overall_impact_score)
+    imp_css = _impact_rating_css(result.impact_rating)
+    priority = float(result.overall_priority_score)
+    readiness_overall = (
+        float(readiness_result.overall_readiness_score)
+        if readiness_result is not None else 0.0
+    )
+    priority_css = _severity_class(priority) if priority < 40 else "risk" if priority < 60 else "crit"
+
+    # --- KPI cards --------------------------------------------------------
+    kpi_html = (
+        '<div class="dash-kpis">'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Overall Impact Score</div>'
+        f'<div class="dash-kpi-value">{overall:.1f} / 100</div>'
+        f'<div class="dash-kpi-bar {imp_css}"><span style="width:{overall:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi">'
+        f'<div class="dash-kpi-label">Impact Rating</div>'
+        f'<div class="dash-kpi-value" style="font-size:1.05rem;">{html.escape(result.impact_rating)}</div>'
+        f'<div class="dash-kpi-bar {imp_css}"><span style="width:{overall:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi" title="Priority = Impact * (100 - Readiness) / 100">'
+        f'<div class="dash-kpi-label">Overall Priority</div>'
+        f'<div class="dash-kpi-value">{priority:.1f}</div>'
+        f'<div class="dash-kpi-bar {priority_css}"><span style="width:{priority:.1f}%"></span></div>'
+        f'</div>'
+        f'<div class="dash-kpi" title="Weighted readiness reported for context">'
+        f'<div class="dash-kpi-label">Overall Readiness (context)</div>'
+        f'<div class="dash-kpi-value">{readiness_overall:.1f}%</div>'
+        f'<div class="dash-kpi-bar {_severity_class(readiness_overall)}"><span style="width:{readiness_overall:.1f}%"></span></div>'
+        f'</div>'
+        '</div>'
+    )
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # --- Weighted factor table -------------------------------------------
+    st.markdown("**Weighted Impact Factors**")
+    table_rows: List[Dict[str, Any]] = []
+    for row in result.factor_details:
+        table_rows.append({
+            "Factor": row.factor,
+            "Weight (%)": row.weight,
+            "Factor Score": row.factor_score,
+            "Weighted Score": row.weighted_score,
+            "Rating": row.rating,
+        })
+    if table_rows:
+        df = pd.DataFrame(table_rows)
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Weight (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "Factor Score": st.column_config.ProgressColumn(
+                    "Factor Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Weighted Score": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+    # Rationale per factor (short caption block so users can trace numbers).
+    with st.expander("Factor rationale + signals", expanded=False):
+        for row in result.factor_details:
+            st.markdown(
+                f"**{html.escape(row.factor)}** - "
+                f"score **{row.factor_score:.1f}** "
+                f"({html.escape(row.rating)}) - "
+                f"weighted **{row.weighted_score:.2f}**"
+            )
+            st.caption(row.rationale)
+            for sig in row.signals[:5]:
+                st.write(f"- {sig}")
+
+    # --- Top impacted lists ----------------------------------------------
+    st.markdown("**Top Impacted Business Areas**")
+    top_caps = result.top_impacted_business_capabilities
+    if top_caps:
+        cap_df = pd.DataFrame([
+            {"Business Capability": row.get("area", ""), "Signal Hits": row.get("hit_count", 0)}
+            for row in top_caps
+        ])
+        st.dataframe(cap_df, width="stretch", hide_index=True)
+    else:
+        st.caption("No obligation / requirement signals mapped to business areas yet.")
+
+    _cols = st.columns(2)
+    with _cols[0]:
+        st.markdown("**Top Impacted Processes**")
+        if result.top_impacted_processes:
+            for line in result.top_impacted_processes:
+                st.write(f"- {line}")
+        else:
+            st.caption("No process requirements above the priority threshold.")
+        st.markdown("**Top Impacted Systems / Technology**")
+        if result.top_impacted_systems:
+            for line in result.top_impacted_systems:
+                st.write(f"- {line}")
+        else:
+            st.caption("No technology-related requirements detected.")
+    with _cols[1]:
+        st.markdown("**Top Impacted Controls**")
+        if result.top_impacted_controls:
+            for line in result.top_impacted_controls:
+                st.write(f"- {line}")
+        else:
+            st.caption("No control expectations captured in the obligations set.")
+        st.markdown("**Top Impacted Third Parties / Vendors**")
+        if result.top_impacted_third_parties:
+            for line in result.top_impacted_third_parties:
+                st.write(f"- {line}")
+        else:
+            st.caption("No third-party-themed obligations detected.")
+
+    # --- Priority areas (high-impact / low-readiness) --------------------
+    st.markdown("**High-Impact / Low-Readiness Priority Areas**")
+    st.caption(
+        "Priority = Impact x (100 - Readiness) / 100. Higher numbers "
+        "signal an area where the regulation hits hard *and* the "
+        "organisation is under-prepared."
+    )
+    if result.priority_areas:
+        pa_rows = [
+            {
+                "Area": row.area,
+                "Impact Score": row.impact_score,
+                "Readiness Score": row.readiness_score,
+                "Priority Score": row.priority_score,
+                "Obligation Hits": row.signal_count,
+            }
+            for row in result.priority_areas[:10]
+        ]
+        pa_df = pd.DataFrame(pa_rows)
+        st.dataframe(
+            pa_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Impact Score": st.column_config.ProgressColumn(
+                    "Impact Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Readiness Score": st.column_config.ProgressColumn(
+                    "Readiness Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Priority Score": st.column_config.ProgressColumn(
+                    "Priority Score", min_value=0, max_value=100, format="%.1f",
+                ),
+            },
+        )
+    else:
+        st.caption("No area-level priority computed - no obligations mapped.")
+
+    # --- Impact heatmap (Area x Function) --------------------------------
+    if result.heatmap_rows:
+        st.markdown("**Impact Heatmap (Area x Function)**")
+        hm_rows = [
+            {
+                "Area": row.get("area", ""),
+                "Function": row.get("function", ""),
+                "Impact Score": row.get("impact_score", 0.0),
+                "Readiness Score": row.get("readiness_score", 0.0),
+                "Priority Score": row.get("priority_score", 0.0),
+                "Requirement Hits": row.get("signal_count", 0),
+            }
+            for row in result.heatmap_rows[:25]
+        ]
+        hm_df = pd.DataFrame(hm_rows)
+        st.dataframe(
+            hm_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Impact Score": st.column_config.ProgressColumn(
+                    "Impact Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Readiness Score": st.column_config.ProgressColumn(
+                    "Readiness Score", min_value=0, max_value=100, format="%.1f",
+                ),
+                "Priority Score": st.column_config.ProgressColumn(
+                    "Priority Score", min_value=0, max_value=100, format="%.1f",
+                ),
+            },
+        )
+
+
+def _render_dashboard_hero(
+    *,
+    readiness_pct: float,
+    confidence_pct: float,
+    impact_pct: Optional[float] = None,
+) -> None:
     """Render the two-tile hero strip for overall Impact and Readiness.
 
-    Impact severity uses the impact ladder (higher impact = worse),
-    readiness severity uses the readiness ladder (higher readiness =
-    better). Since impact = 100 - readiness the two labels always
-    agree on the same underlying assessment.
+    Impact and Readiness are calculated **independently** now:
+
+    - Readiness comes from the weighted readiness model (7 DORA areas).
+    - Impact comes from the weighted impact model (7 DORA factors).
+
+    If ``impact_pct`` is supplied (the weighted impact overall) we use
+    it directly; otherwise we fall back to the legacy derivation
+    ``100 - readiness`` so this function is safe to call from paths that
+    have not yet computed a weighted impact result.
     """
     readiness = max(0.0, min(100.0, readiness_pct))
-    impact = max(0.0, min(100.0, 100.0 - readiness))
+    if impact_pct is None:
+        impact = max(0.0, min(100.0, 100.0 - readiness))
+    else:
+        impact = max(0.0, min(100.0, float(impact_pct)))
     read_css = _severity_class(readiness)
     imp_label, imp_css = _impact_severity_from_score(impact)
-    conf = max(0.0, min(100.0, confidence_pct))
+
+    # Readiness tile shows only the headline number - product feedback
+    # was that the confidence caption / gap tooltip was visually noisy
+    # and, worse, occasionally leaked HTML because the tooltip payload
+    # contained special characters. Impact tile keeps its severity pill
+    # because that is what users asked for on that side.
     html_out = (
         '<div class="dash-hero">'
         f'<div class="dash-hero-tile impact-tile {imp_css}">'
@@ -4681,7 +7159,6 @@ def _render_dashboard_hero(*, readiness_pct: float, confidence_pct: float) -> No
         f'<div class="dash-hero-tile readiness-tile {read_css}">'
         '<div class="dash-hero-cap">Overall Readiness Score</div>'
         f'<div class="dash-hero-value">{readiness:.1f}%</div>'
-        f'<div class="dash-hero-sub">Evaluation confidence: <b>{conf:.1f}%</b></div>'
         f'<div class="dash-hero-bar {read_css}"><span style="width:{readiness:.1f}%"></span></div>'
         '</div>'
         '</div>'
@@ -4733,21 +7210,40 @@ def _render_dashboard_readiness_cards(area_summary: Dict[str, Dict[str, Any]]) -
 def _render_dashboard_impact_cards(area_summary: Dict[str, Dict[str, Any]]) -> None:
     """Render an area-wise impact assessment view.
 
-    Each card shows the area's impact percentage (100 - readiness), the
-    executive HIGH / MEDIUM / LOW severity pill, and the CXO status text
-    from the scoring engine. Sorted by impact descending so the highest
-    exposure appears first.
+    Impact per area is sourced from the weighted-impact model
+    (``st.session_state["weighted_impact"].priority_areas``) whenever
+    available so every impact number on the dashboard comes from the
+    same single source of truth. When an area is present in
+    ``area_summary`` but has no weighted-impact entry (e.g. because no
+    obligation was tagged to it), we fall back to the legacy
+    ``100 - readiness`` derivation - this preserves the previous UI so
+    nothing disappears when the impact model has not been computed yet.
     """
     if not area_summary:
         st.info("No area-level scores yet - answer more closed questions.")
         return
+
+    weighted_impact: Optional[WeightedImpactResult] = st.session_state.get(
+        "weighted_impact"
+    )
+    impact_by_area: Dict[str, float] = {}
+    if weighted_impact is not None:
+        for row in weighted_impact.priority_areas:
+            impact_by_area[str(row.area)] = float(row.impact_score)
+
     rows: List[Tuple[str, float, float, str]] = []
     for name, summary in area_summary.items():
         try:
             comp = float(summary.get("compliance_score_pct") or summary.get("Compliance %") or 0.0)
         except (TypeError, ValueError):
             comp = 0.0
-        impact = max(0.0, min(100.0, 100.0 - comp))
+        # Prefer the weighted per-area impact; fall back to the legacy
+        # `100 - readiness` derivation only when we have no signal.
+        impact = impact_by_area.get(str(name))
+        if impact is None:
+            impact = max(0.0, min(100.0, 100.0 - comp))
+        else:
+            impact = max(0.0, min(100.0, float(impact)))
         status = str(summary.get("CXO status") or "").strip() or "—"
         rows.append((str(name), comp, impact, status))
     rows.sort(key=lambda r: -r[2])
@@ -4789,9 +7285,21 @@ def _render_dashboard_kpis(
     coverage_pct = round((answered / total) * 100.0, 1) if total else 0.0
     coverage_class = _severity_class(coverage_pct)
 
+    # Native browser tooltip on the Evaluation Confidence tile so the
+    # dashboard also documents the gap that composes the composite score.
+    conf_tooltip_attr = html.escape(
+        _confidence_gap_tooltip(
+            st.session_state.get("confidence_assessment"),
+            kind="evaluation",
+        ),
+        quote=True,
+    )
+
     html_out = (
         '<div class="dash-kpis">'
-        f'<div class="dash-kpi"><div class="dash-kpi-label">Evaluation Confidence</div>'
+        f'<div class="dash-kpi" title="{conf_tooltip_attr}">'
+        f'<div class="dash-kpi-label">Evaluation Confidence '
+        f'<span class="dash-help-hint" aria-hidden="true">ⓘ</span></div>'
         f'<div class="dash-kpi-value">{confidence_pct:.1f}%</div>'
         f'<div class="dash-kpi-bar {conf_class}"><span style="width:{confidence_pct:.1f}%"></span></div></div>'
         f'<div class="dash-kpi"><div class="dash-kpi-label">Answered / Applicable</div>'
@@ -4959,6 +7467,21 @@ def _render_dashboard_pair_heatmap(pair_scores: Dict[Any, float]) -> None:
         st.info("No area × function scores yet — answer more closed questions.")
         return
 
+    # Per-pair impact is sourced from the weighted-impact heatmap rows
+    # when available; missing pairs fall back to the legacy `100 - readiness`
+    # derivation. This keeps the heatmap Impact numbers consistent with the
+    # rest of the dashboard (single source of truth) while still rendering
+    # every pair that has a readiness score.
+    weighted_impact: Optional[WeightedImpactResult] = st.session_state.get(
+        "weighted_impact"
+    )
+    impact_by_pair: Dict[Tuple[str, str], float] = {}
+    if weighted_impact is not None:
+        for row in weighted_impact.heatmap_rows:
+            impact_by_pair[(str(row.get("area", "")), str(row.get("function", "")))] = (
+                float(row.get("impact_score", 0.0))
+            )
+
     grouped: Dict[str, Dict[str, Optional[float]]] = {}
     for key, val in pair_scores.items():
         if isinstance(key, tuple) and len(key) == 2:
@@ -5002,7 +7525,11 @@ def _render_dashboard_pair_heatmap(pair_scores: Dict[Any, float]) -> None:
                     f'</div>'
                 )
                 continue
-            impact = max(0.0, min(100.0, 100.0 - float(readiness)))
+            weighted_pair_impact = impact_by_pair.get((str(area), str(function)))
+            if weighted_pair_impact is not None:
+                impact = max(0.0, min(100.0, float(weighted_pair_impact)))
+            else:
+                impact = max(0.0, min(100.0, 100.0 - float(readiness)))
             impact_label, _ = _impact_severity_from_score(impact)
             readiness_label, _ = _readiness_severity_from_score(readiness)
             css = _severity_class(readiness)
@@ -6078,6 +8605,209 @@ def _render_dashboard_question_scoring_table(
         f'<tbody>{"".join(body_rows)}</tbody>'
         "</table></div>",
         unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page 5 — Gap Identification & Human-in-the-Loop review queue
+# ---------------------------------------------------------------------------
+
+_GAP_SEVERITY_CSS = {
+    "critical": "crit",
+    "high":     "risk",
+    "medium":   "watch",
+    "low":      "ready",
+}
+
+_GAP_TAB_LABELS = (
+    ("missing_evidence",        "Missing evidence"),
+    ("missing_interpretations", "Missing interpretations"),
+    ("missing_requirements",    "Missing requirements"),
+    ("low_confidence",          "Low confidence"),
+    ("human_review",            "Human review required"),
+)
+
+
+def _render_gap_kpi_row(report: GapReport) -> None:
+    """Render the KPI row across the top of the Gap page."""
+    counts = report.by_severity()
+    cols = st.columns(5)
+    labels = [
+        ("Total gaps",         report.total(), "none"),
+        ("Critical",           counts.get("critical", 0), "crit"),
+        ("High",               counts.get("high", 0),     "risk"),
+        ("Medium",             counts.get("medium", 0),   "watch"),
+        ("Low",                counts.get("low", 0),      "ready"),
+    ]
+    for col, (label, value, css) in zip(cols, labels):
+        with col:
+            st.markdown(
+                f'<div class="dash-card {css}">'
+                f'<div class="dash-card-title">{html.escape(label)}</div>'
+                f'<div class="dash-card-metric">{int(value)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
+def _render_gap_list(items: List[GapItem], *, empty_message: str) -> None:
+    if not items:
+        st.success(empty_message)
+        return
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    sorted_items = sorted(items, key=lambda it: severity_rank.get(it.severity, 4))
+    for it in sorted_items:
+        css = _GAP_SEVERITY_CSS.get(it.severity, "none")
+        header = html.escape(it.subject or it.item_type)
+        st.markdown(
+            f'<div class="dash-card {css}">'
+            f'<div class="dash-card-title">{header}</div>'
+            f'<div class="dash-card-meta">'
+            f'<span class="dash-pill {css}">{html.escape(it.severity.title())}</span>'
+            f'</div>'
+            f'<div class="dash-card-body">{html.escape(it.detail)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        with st.expander("Details / remediation", expanded=False):
+            if it.obligation_id:
+                st.markdown(f"**Obligation ID:** `{it.obligation_id}`")
+            if it.requirement_id:
+                st.markdown(f"**Requirement ID:** `{it.requirement_id}`")
+            if it.question_id:
+                st.markdown(f"**Question ID:** `{it.question_id}`")
+            if it.remediation:
+                st.markdown(f"**Remediation:** {it.remediation}")
+            if it.metadata:
+                st.json(it.metadata)
+
+
+def _init_review_queue_state() -> None:
+    """Ensure the HITL review queue lives in session state."""
+    if "gap_review_state" not in st.session_state:
+        st.session_state["gap_review_state"] = {}
+
+
+def _review_key(item: GapItem) -> str:
+    """Stable identifier for a gap item across reruns."""
+    return "|".join([
+        item.item_type,
+        item.subject,
+        item.obligation_id,
+        item.requirement_id,
+        item.question_id,
+    ])
+
+
+def render_gap_page() -> None:
+    """Page 5 — Gap Identification + HITL review queue.
+
+    All five tabs are rendered even if empty so users can see at a glance
+    which gap families are clean and which need attention. The queue
+    lives in ``st.session_state["gap_review_state"]`` and persists
+    across reruns of the same session.
+    """
+    st.subheader("5. Gap Identification")
+    st.caption(
+        "Missing evidence, missing interpretations, missing requirements, "
+        "low-confidence findings, and items flagged for human review — "
+        "computed live from Agent 1 / 2 / 3 output."
+    )
+
+    analysis = st.session_state.get("analysis")
+    rtm_artifact = st.session_state.get("rtm_artifact")
+    scoring = _refresh_scoring_snapshot()
+    evaluation = scoring.evaluation if scoring else st.session_state.get("evaluation")
+
+    if analysis is None:
+        st.warning("Run Agent 1 (Setup or BRD/FRD page) before opening this page.")
+        return
+
+    report = build_gap_report(
+        analysis=analysis,
+        rtm_artifact=rtm_artifact,
+        scoring_evaluation=evaluation,
+    )
+
+    _render_gap_kpi_row(report)
+    st.divider()
+
+    _init_review_queue_state()
+    review_state = st.session_state["gap_review_state"]
+
+    tabs = st.tabs([label for _key, label in _GAP_TAB_LABELS])
+    for tab, (key, label) in zip(tabs, _GAP_TAB_LABELS):
+        with tab:
+            items: List[GapItem] = getattr(report, key)
+            _render_gap_list(
+                items,
+                empty_message=f"No {label.lower()} findings — all clear.",
+            )
+
+            # Review-queue actions (mentor #4 HITL): every item on this
+            # tab can be marked "resolved" or "escalated". The state is
+            # persisted in session so the queue tab reflects the same
+            # decisions.
+            if items and key == "human_review":
+                st.divider()
+                st.markdown("#### Reviewer actions")
+                for it in items:
+                    rkey = _review_key(it)
+                    current = review_state.get(rkey, {"status": "open"})
+                    with st.expander(
+                        f"[{it.severity.title()}] {it.subject}",
+                        expanded=False,
+                    ):
+                        status_choice = st.radio(
+                            "Status",
+                            options=("open", "resolved", "escalated"),
+                            index=("open", "resolved", "escalated").index(
+                                current.get("status", "open")
+                            ),
+                            horizontal=True,
+                            key=f"gap_status__{rkey}",
+                        )
+                        notes = st.text_area(
+                            "Reviewer notes",
+                            value=str(current.get("notes", "")),
+                            key=f"gap_notes__{rkey}",
+                            max_chars=2000,
+                            height=100,
+                        )
+                        if st.button("Save", key=f"gap_save__{rkey}"):
+                            review_state[rkey] = {
+                                "status": status_choice,
+                                "notes": notes,
+                                "subject": it.subject,
+                                "severity": it.severity,
+                                "item_type": it.item_type,
+                            }
+                            st.success("Saved.")
+
+    # Roll-up download of the full gap report as JSON.
+    st.divider()
+    st.markdown("#### Export gap report")
+    export_payload = {
+        "regulation": st.session_state.get("regulation"),
+        "client_roles": list(getattr(analysis, "client_roles", []) or []),
+        "totals": {
+            "total_gaps": report.total(),
+            "by_severity": report.by_severity(),
+        },
+        "missing_evidence":        [it.__dict__ for it in report.missing_evidence],
+        "missing_interpretations": [it.__dict__ for it in report.missing_interpretations],
+        "missing_requirements":    [it.__dict__ for it in report.missing_requirements],
+        "low_confidence":          [it.__dict__ for it in report.low_confidence],
+        "human_review":            [it.__dict__ for it in report.human_review],
+        "review_queue":            dict(review_state),
+    }
+    st.download_button(
+        "Download gap report (JSON)",
+        data=json.dumps(export_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name=(
+            f"{st.session_state.get('regulation','regulation')}_gap_report.json"
+        ),
+        mime="application/json",
     )
 
 

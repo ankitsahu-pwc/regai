@@ -31,6 +31,7 @@ from .questionnaire_generator import (
     option_metadata,
     question_kind as _qg_question_kind,
 )
+from .severity import action_for_readiness, readiness_band, readiness_label
 
 # ---------------------------------------------------------------------------
 # Signal sets (lifted verbatim from dora_readiness_streamlit_app_v11.py)
@@ -686,55 +687,248 @@ def choose_next_question(
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_value(value: Any, question: Optional[Mapping[str, Any]] = None) -> Optional[float]:
-    """Score a single answer, preferring per-option ``score_value`` metadata.
+_NA_LABEL_TOKENS = frozenset({
+    "n/a", "na", "not applicable", "not available",
+})
 
-    When the option list on the question contains dict-shaped options with a
-    numeric ``score_value`` (0-100), that value wins. Otherwise we fall back
-    to the legacy ``ANSWER_SCORES`` mapping. Missing answers return ``None``
-    (excluded from scoring); known-but-unscorable answers default to 25.
+_ENUMERATION_NEGATIVE_KEYWORDS: Tuple[str, ...] = (
+    "not audited", "not tested", "not implemented", "not covered",
+    "not in place", "not documented", "not compliant", "not monitored",
+    "not reviewed", "not owned", "not defined", "not established",
+    "not started", "not addressed", "without", "missing", "outstanding",
+    " gap", " gaps ", "unaudited", "untested", "unmonitored",
+    "no evidence", "no owner", "no policy", "no procedure",
+    "un-audited", "un-tested",
+)
+
+
+def _enumeration_directionality(question_text: str) -> int:
+    """Return ``+1`` when picking = coverage (good) and ``-1`` when picking = gap (bad).
+
+    Direction is inferred from question wording:
+
+    * ``-1`` when the question asks about things that are *missing / not
+      done / outstanding* (each pick is a gap; more picks → worse score).
+    * ``+1`` otherwise (default treats picks as coverage / capability).
+    """
+    text = (question_text or "").lower()
+    if any(kw in text for kw in _ENUMERATION_NEGATIVE_KEYWORDS):
+        return -1
+    return 1
+
+
+def score_value(value: Any, question: Optional[Mapping[str, Any]] = None) -> Optional[float]:
+    """Score a single answer.
+
+    Resolution order:
+
+    1. **Per-option ``score_value`` metadata** — the AI questionnaire
+       generator's authoritative signal. Explicit ``score_value=None``
+       on an option means "this is a real N/A" and the answer is
+       excluded from scoring.
+    2. **Legacy answer table** — for plain-string option labels that
+       appear in :data:`ANSWER_SCORES` (``Yes`` / ``Complete`` /
+       ``Not started`` / …).
+    3. **Enumeration fallback** — when the answer is a plain-string
+       pick that carries no score metadata (e.g. picking ``"Software"``
+       from a ``["Software", "Hardware", "Data", …]`` checklist), the
+       scorer no longer silently discards it. Instead the answer is
+       scored by pick-ratio, with directionality inferred from the
+       question wording: "Which X are NOT audited" → each pick is a
+       gap (fewer picks = higher readiness), "Which X are in place" →
+       each pick is coverage (more picks = higher readiness).
+    4. **Explicit N/A** — when the answer text itself is an N/A phrase
+       (``"N/A"``, ``"Not applicable"``, …) the answer is excluded.
+
+    Steps 1-3 combine so that questions where the AI didn't attach
+    numeric per-option scores are still counted — the previous
+    behaviour silently dropped these answers as "not applicable" which
+    surprised reviewers.
     """
     vals = response_values(value)
     if not vals:
         return None
+
+    # Step 4 first: an answer that is literally "N/A" / "Not applicable"
+    # is always excluded, regardless of what the option metadata says.
+    lower_vals = [str(v).strip().lower() for v in vals]
+    if lower_vals and all(v in _NA_LABEL_TOKENS for v in lower_vals):
+        return None
+
+    # Step 1: per-option ``score_value`` metadata.
     if question is not None:
         opts = question.get("options") or []
         per_option_scores: List[float] = []
+        na_metadata_hits = 0
         for v in vals:
             meta = option_metadata(opts, v)
-            if "score_value" in meta and meta["score_value"] is not None:
+            if not meta:
+                continue
+            if "score_value" in meta:
+                raw = meta["score_value"]
+                if raw is None:
+                    na_metadata_hits += 1
+                    continue  # explicit "N/A" on this option — skip
                 try:
-                    per_option_scores.append(float(meta["score_value"]))
+                    per_option_scores.append(float(raw))
                 except (TypeError, ValueError):
                     pass
         if per_option_scores:
             return sum(per_option_scores) / len(per_option_scores)
+        # If every picked option was explicitly N/A via metadata, exclude.
+        if na_metadata_hits and na_metadata_hits == len(vals):
+            return None
+
+    # Step 2: legacy string-label table.
     scores = [ANSWER_SCORES[v] for v in vals if v in ANSWER_SCORES and ANSWER_SCORES[v] is not None]
-    return sum(scores) / len(scores) if scores else 25.0
+    if scores:
+        return sum(scores) / len(scores)
+
+    # Step 3: enumeration fallback for real picks that neither the AI
+    # metadata nor the legacy table can score. Direction is inferred from
+    # the question wording so "Which X are NOT audited?" penalises picks
+    # and "Which controls are in place?" rewards them.
+    if question is not None:
+        opts = question.get("options") or []
+        total = len(opts)
+        if total > 0:
+            direction = _enumeration_directionality(
+                str(question.get("question") or "")
+            )
+            picked_ratio = min(1.0, len(vals) / float(total))
+            if direction < 0:
+                return round(max(0.0, 100.0 * (1.0 - picked_ratio)), 1)
+            return round(min(100.0, 100.0 * picked_ratio), 1)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Free-text quality scoring
+# ---------------------------------------------------------------------------
+
+# Filler tokens shared with ``services.ai_assessment_intelligence`` — kept
+# inline here so this module has no runtime dependency on the AI package.
+_FT_FILLER_TOKENS = frozenset({
+    "yes", "no", "maybe", "ok", "okay", "sure", "n/a", "na", "none",
+    "tbd", "unknown", "not sure", "not applicable", "not started",
+    "in progress", "partial", "some", "few", "many", "several",
+    "nothing", "everything", "all", "any", "idk", "n a", "not yet",
+})
+
+# Simple positive / negative signal lexicons. A well-formed SME narrative
+# tends to mention concrete artefacts, owners, dates or metrics — the
+# scorer rewards that signal density and penalises pure vagueness.
+_FT_POSITIVE_TOKENS = (
+    "policy", "policies", "control", "controls", "framework", "process",
+    "processes", "procedure", "procedures", "runbook", "playbook",
+    "documented", "documentation", "evidence", "artefact", "artifact",
+    "raci", "owner", "accountable", "responsible", "committee", "board",
+    "governance", "signed", "approved", "audit", "audited", "reviewed",
+    "monitored", "monitoring", "tested", "testing", "tracked", "sla",
+    "kpi", "kri", "metric", "metrics", "target", "threshold", "deadline",
+    "quarterly", "monthly", "annually", "weekly", "reported", "report",
+    "escalation", "budget", "funded", "invested", "trained", "training",
+)
+_FT_NEGATIVE_TOKENS = (
+    "not sure", "unknown", "no idea", "unclear", "tbd", "to be defined",
+    "not started", "not yet", "no evidence", "no owner", "ad hoc",
+    "ad-hoc", "informal", "manual only", "no policy", "no process",
+    "no documentation", "no funding", "no budget",
+)
+
+
+def score_free_text_answer(
+    answer: Any,
+    *,
+    question_text: Optional[str] = None,
+) -> Optional[float]:
+    """Score a free-text SME answer for quality, returning 0-100 or ``None``.
+
+    Signals:
+
+    * length (words / characters) — very short answers score low;
+    * signal density — mentions of policies, owners, evidence, cadences,
+      metrics etc. push the score up;
+    * negative-vagueness density — "not sure", "no owner", "tbd" etc.
+      push the score down;
+    * pure filler answers ("yes", "no", "n/a", "unknown") are scored 0
+      unless the token is a valid explicit N/A (which returns ``None`` so
+      the answer is *excluded* from scoring, matching the closed-question
+      behaviour).
+
+    Returns ``None`` when the answer is empty / N/A so the caller can skip
+    it in the numerator/denominator.
+    """
+    if answer is None:
+        return None
+    raw = str(answer).strip()
+    if not raw:
+        return None
+
+    normalised = raw.lower().strip(" .!?,;:'\"()[]-")
+    if normalised in {"n/a", "na", "not applicable"}:
+        return None
+    if normalised in _FT_FILLER_TOKENS:
+        return 5.0  # very low but not None, so this counts as "answered poorly"
+
+    words = [w for w in normalised.split() if w]
+    word_count = len(words)
+    char_count = len(raw)
+
+    length_score = 0.0
+    if word_count >= 60 or char_count >= 400:
+        length_score = 55.0
+    elif word_count >= 30 or char_count >= 200:
+        length_score = 45.0
+    elif word_count >= 18 or char_count >= 120:
+        length_score = 32.0
+    elif word_count >= 10 or char_count >= 60:
+        length_score = 20.0
+    elif word_count >= 5 or char_count >= 30:
+        length_score = 10.0
+
+    text_lower = normalised
+    positive_hits = sum(1 for tok in _FT_POSITIVE_TOKENS if tok in text_lower)
+    negative_hits = sum(1 for tok in _FT_NEGATIVE_TOKENS if tok in text_lower)
+
+    signal_bonus = min(35.0, positive_hits * 6.0)
+    negative_penalty = min(25.0, negative_hits * 8.0)
+
+    # Small extra credit when the answer references the question context
+    # (a keyword from the question re-appears in the answer). This catches
+    # focused, on-topic answers versus generic boilerplate.
+    context_bonus = 0.0
+    if question_text:
+        q_words = {
+            w.strip(".,;:!?()[]'\"").lower()
+            for w in question_text.split()
+            if len(w) > 4
+        }
+        answer_words = {w.strip(".,;:!?()[]'\"") for w in words}
+        overlap = len(q_words & answer_words)
+        context_bonus = min(10.0, overlap * 1.5)
+
+    raw_score = length_score + signal_bonus + context_bonus - negative_penalty
+    return max(0.0, min(100.0, round(raw_score, 1)))
 
 
 def cxo_status(score: float) -> Tuple[str, str]:
     """Return the canonical severity label + executive action for a
     readiness / compliance score.
 
-    Readiness bands aligned across the app (higher readiness = better):
-        - score >= 75        -> Ready
-        - score 50 - 75      -> Watch
-        - score 25 - 50      -> At risk
-        - score <  25        -> Critical
+    Thin wrapper around :mod:`services.severity` — kept as a module-level
+    function for backward compatibility with the many callers across the
+    app that import ``cxo_status`` directly.
 
-    Impact = 100 - readiness. The impact-facing ladder is symmetric
-    (>=75 impact -> Critical, 50-75 -> At risk, 25-50 -> Watch,
-    <25 -> Ready), so a readiness score of 71.5% (impact 28.5%) reads
-    as "Watch" on both axes.
+    Readiness bands (higher readiness = better):
+        - score >= 75  -> Ready
+        - score >= 50  -> Watch
+        - score >= 25  -> At risk
+        - score <  25  -> Critical
     """
-    if score >= 75:
-        return "Ready", "Maintain evidence and periodic validation."
-    if score >= 50:
-        return "Watch", "Resolve targeted gaps before executive sign-off."
-    if score >= 25:
-        return "At risk", "Prioritise remediation plan, owners and evidence."
-    return "Critical", "Escalate to governance and define funded remediation."
+    band = readiness_band(score)
+    return readiness_label(band), action_for_readiness(band)
 
 
 def evaluate(
@@ -776,10 +970,36 @@ def evaluate(
         all_questions.append(q)
 
     for q in all_questions:
-        if q.get("is_free_text") or q.get("question_id") in state.skipped_ids:
+        if q.get("question_id") in state.skipped_ids:
             continue
-        weight = float(q.get("scoring_weight", 1)) * float(q.get("confidence", 90)) / 100
-        score = score_value(state.responses.get(q.get("question_id")), q)
+        # Composite weight = base scoring weight × impact weight (from the
+        # AI-driven ``impact_severity``) × confidence.
+        #   base   ∈ [1..5]  (AI-set + enhancer-bumped)
+        #   impact ∈ [1..5]  (severity ladder; defaults to base when missing)
+        #   conf   ∈ [0..1]  (per-question grounding confidence)
+        # This makes questions in Critical/High-severity areas contribute
+        # proportionally more to the overall readiness score, matching the
+        # "high-impact areas score more heavily" requirement.
+        base_w = float(q.get("scoring_weight", 1))
+        impact_w = float(q.get("impact_weight", base_w))
+        conf = float(q.get("confidence", 90)) / 100
+        weight = base_w * max(1.0, impact_w) * conf
+
+        is_free_text = bool(q.get("is_free_text"))
+        raw_answer = state.responses.get(q.get("question_id"))
+        if is_free_text:
+            # Free-text answers now contribute to readiness / impact using
+            # a deterministic quality scorer (length + signal density +
+            # negative-vagueness penalty). The narrative bucket carries
+            # ~30% of a closed question's weight so a well-written answer
+            # nudges the score without letting SME essays dominate.
+            score = score_free_text_answer(
+                raw_answer, question_text=str(q.get("question") or ""),
+            )
+            weight = weight * 0.3
+        else:
+            score = score_value(raw_answer, q)
+
         if score is None:
             unanswered_count += 1
             continue
@@ -802,9 +1022,29 @@ def evaluate(
 
     compliance = round(total_num / total_den * 100, 1) if total_den else 0.0
     scored_questions = [q for q in all_questions if not q.get("is_free_text") and q.get("question_id") not in state.skipped_ids]
+    # Dynamic, evidence-driven confidence. Historic behaviour clamped the value
+    # to the 90-99 band which meant a thin questionnaire and a rich one looked
+    # identical. The value is now driven by three real signals:
+    #
+    # 1) mean per-question confidence (already carried on each question)
+    # 2) response coverage (answered / applicable)
+    # 3) quantitative depth (proportion of quantitative options actually scored)
+    #
+    # Downstream consumers can further refine this via the AI Assessment
+    # Intelligence service (which produces the full ConfidenceAssessment with
+    # sub-scores and a reasoning paragraph).
     avg_conf = sum(float(q.get("confidence", 90)) for q in scored_questions) / max(1, len(scored_questions))
-    coverage_penalty = min(8.0, unanswered_count * 0.10)
-    eval_conf = round(max(90.0, min(99.0, avg_conf - coverage_penalty + min(3.0, answered_count * 0.05))), 1)
+    total_applicable = max(1, answered_count + unanswered_count)
+    coverage_ratio = answered_count / total_applicable
+    coverage_bonus = coverage_ratio * 10.0
+    coverage_penalty = (1.0 - coverage_ratio) * 12.0
+    quant_scored = sum(
+        1 for q in scored_questions
+        if q.get("quantitative_type") and q.get("question_id") in state.responses
+    )
+    quant_bonus = min(4.0, quant_scored * 0.4)
+    raw = avg_conf + coverage_bonus - coverage_penalty + quant_bonus
+    eval_conf = round(max(40.0, min(99.0, raw)), 1)
 
     area_scores = {k: round(area_num[k] / area_den[k] * 100, 1) for k in area_den if area_den[k]}
     func_scores = {k: round(func_num[k] / func_den[k] * 100, 1) for k in func_den if func_den[k]}

@@ -57,6 +57,7 @@ from models.workflow_models import (
     BRDArtifact,
     ParsedDocument,
     QuestionnairePackage,
+    ReadinessAssessment,
     RecommendationResult,
     RegulatoryAnalysis,
     RTMArtifact,
@@ -121,6 +122,8 @@ class RegulatoryWorkflowOrchestrator:
         consulting_selection: Optional[Sequence[str]] = None,
         include_consulting_guidance: bool = True,
         intelligence_package: Optional[RegulatoryIntelligencePackage] = None,
+        client_roles: Optional[Sequence[str]] = None,
+        client_profile: Optional[Mapping[str, Any]] = None,
     ) -> RegulatoryAnalysis:
         return self.regulatory_analysis_agent.analyze(
             parsed_document=parsed_document,
@@ -131,6 +134,8 @@ class RegulatoryWorkflowOrchestrator:
             consulting_selection=consulting_selection,
             include_consulting_guidance=include_consulting_guidance,
             intelligence_package=intelligence_package,
+            client_roles=client_roles,
+            client_profile=dict(client_profile) if client_profile else None,
         )
 
     # ------------------------------------------------------------------
@@ -184,20 +189,73 @@ class RegulatoryWorkflowOrchestrator:
     def run_questionnaire_from_report(
         self, brd: BRDArtifact, *, regulation: str = "DORA",
         name: Optional[str] = None,
+        impact: Optional[Any] = None,
+        readiness: Optional[ReadinessAssessment] = None,
+        analysis: Optional[RegulatoryAnalysis] = None,
+        rtm: Optional[RTMArtifact] = None,
+        client_roles: Optional[Sequence[str]] = None,
+        client_profile: Optional[Mapping[str, Any]] = None,
     ) -> QuestionnairePackage:
-        return self.questionnaire_agent.from_report(brd, regulation=regulation, name=name)
+        """Generate the AI-driven questionnaire from a generated BRD.
+
+        Passes the full regulatory-analysis context (obligations), RTM
+        control mappings, impact + readiness assessments, selected client
+        roles and client profile through to the AI questionnaire agent so
+        the questions:
+
+        * ask the most-required info to assess **impact** — grounded in
+          the specific affected items from the ImpactAssessment;
+        * ask the most-required info to assess **readiness** — targeted
+          at the client's weakest dimensions from the ReadinessAssessment;
+        * are scoped to the selected institution type(s).
+
+        The shared :class:`GenAIClient` held on the orchestrator is also
+        forwarded — when ``None``, the AI agent falls back to
+        manual-review placeholders (no hardcoded templates).
+        """
+        return self.questionnaire_agent.from_report(
+            brd, regulation=regulation, name=name,
+            impact=impact, readiness=readiness,
+            analysis=analysis, rtm=rtm,
+            client_roles=client_roles,
+            client_profile=dict(client_profile) if client_profile else None,
+            client=self.client,
+        )
 
     def run_questionnaire_from_docx(
         self, path: Path, *, regulation: str = "DORA",
         name: Optional[str] = None,
+        impact: Optional[Any] = None,
+        readiness: Optional[ReadinessAssessment] = None,
+        analysis: Optional[RegulatoryAnalysis] = None,
+        rtm: Optional[RTMArtifact] = None,
+        client_roles: Optional[Sequence[str]] = None,
+        client_profile: Optional[Mapping[str, Any]] = None,
     ) -> QuestionnairePackage:
-        return self.questionnaire_agent.from_docx(path, regulation=regulation, name=name)
+        """Generate the AI-driven questionnaire from an uploaded BRD DOCX.
+
+        See :meth:`run_questionnaire_from_report` for how the ``impact``
+        and ``readiness`` assessments shape the AI generator's output.
+        """
+        return self.questionnaire_agent.from_docx(
+            path, regulation=regulation, name=name,
+            impact=impact, readiness=readiness,
+            analysis=analysis, rtm=rtm,
+            client_roles=client_roles,
+            client_profile=dict(client_profile) if client_profile else None,
+            client=self.client,
+        )
 
     def load_questionnaire_package(
         self, package: Mapping[str, Any], *, source: str = "uploaded_json",
         name: Optional[str] = None,
+        analysis: Optional[RegulatoryAnalysis] = None,
+        client_roles: Optional[Sequence[str]] = None,
     ) -> QuestionnairePackage:
-        return self.questionnaire_agent.from_package(package, source=source, name=name)
+        return self.questionnaire_agent.from_package(
+            package, source=source, name=name,
+            analysis=analysis, client_roles=client_roles,
+        )
 
     # ------------------------------------------------------------------
     # Stage: Python Rules Engine
@@ -234,6 +292,8 @@ class RegulatoryWorkflowOrchestrator:
         top_n_requirements: int = 10,
         enrich_with_genai: bool = False,
         branch_log: Optional[Any] = None,
+        analysis: Optional[RegulatoryAnalysis] = None,
+        client_roles: Optional[Sequence[str]] = None,
     ) -> RecommendationResult:
         return self.recommendation_agent.recommend(
             questionnaire,
@@ -242,6 +302,54 @@ class RegulatoryWorkflowOrchestrator:
             top_n_requirements=top_n_requirements,
             enrich_with_genai=enrich_with_genai,
             branch_log=branch_log,
+            analysis=analysis,
+            client_roles=client_roles,
+        )
+
+    # ------------------------------------------------------------------
+    # Stage: AI Assessment Intelligence
+    # ------------------------------------------------------------------
+
+    def assess_confidence_intelligence(
+        self,
+        analysis: Optional[RegulatoryAnalysis],
+        *,
+        scoring_evaluation: Optional[Any] = None,
+        questionnaire_package: Optional[Any] = None,
+    ) -> Any:
+        from services.ai_assessment_intelligence import assess_confidence
+
+        return assess_confidence(
+            analysis,
+            scoring_evaluation=scoring_evaluation,
+            questionnaire_package=questionnaire_package,
+            client=self.client,
+        )
+
+    def assess_impact_intelligence(
+        self,
+        analysis: Optional[RegulatoryAnalysis],
+    ) -> Any:
+        from services.ai_assessment_intelligence import assess_impact
+
+        return assess_impact(analysis, client=self.client)
+
+    def assess_readiness_intelligence(
+        self,
+        scoring_evaluation: Any,
+        *,
+        analysis: Optional[RegulatoryAnalysis] = None,
+        questionnaire_package: Optional[Any] = None,
+        responses: Optional[Any] = None,
+    ) -> Any:
+        from services.ai_assessment_intelligence import assess_readiness
+
+        return assess_readiness(
+            scoring_evaluation,
+            analysis=analysis,
+            questionnaire_package=questionnaire_package,
+            responses=responses,
+            client=self.client,
         )
 
     # ------------------------------------------------------------------
@@ -260,6 +368,8 @@ class RegulatoryWorkflowOrchestrator:
         consulting_selection: Optional[Sequence[str]] = None,
         include_consulting_guidance: bool = True,
         intelligence_package: Optional[RegulatoryIntelligencePackage] = None,
+        client_roles: Optional[Sequence[str]] = None,
+        client_profile: Optional[Mapping[str, Any]] = None,
     ) -> dict:
         """Run Agents 1, 2 and 3 in sequence.
 
@@ -276,6 +386,8 @@ class RegulatoryWorkflowOrchestrator:
             consulting_selection=consulting_selection,
             include_consulting_guidance=include_consulting_guidance,
             intelligence_package=intelligence_package,
+            client_roles=client_roles,
+            client_profile=client_profile,
         )
         bundle = self.run_brd_rtm(
             analysis,
@@ -284,6 +396,10 @@ class RegulatoryWorkflowOrchestrator:
         )
         questionnaire = self.run_questionnaire_from_report(
             bundle["brd"], regulation=regulation,
+            analysis=analysis,
+            rtm=bundle.get("rtm"),
+            client_roles=client_roles,
+            client_profile=client_profile,
         )
         return {
             "analysis": analysis,

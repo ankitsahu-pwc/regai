@@ -491,7 +491,7 @@ def attach_source_references(
         for item in getattr(section, "items", []) or []:
             matches = catalogue.match(
                 item.category, item.requirement, item.detailed_requirement,
-                item.dora_alignment, item.acceptance_criteria,
+                item.regulation_alignment, item.acceptance_criteria,
                 max_results=max_per_item,
             )
             refs[requirement_key(item.id)] = matches

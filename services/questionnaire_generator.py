@@ -1,23 +1,43 @@
 """BRD/FRD to regulatory readiness questionnaire generator.
 
-Refactored from ``generate_brd_questionnaire_streamlit_v11.py``. The dataclasses,
-keyword taxonomies, deterministic question synthesis, deduplication, scoring
-package and Excel writer are lifted verbatim. The DOCX-reading helper is
-rewired to use :mod:`utils.docx_parser`, removing the duplicated body-iteration
-trick from the original file.
+Historical role
+---------------
+This module used to be a fully-deterministic template pipeline: it derived
+impact pairs from a BRD, then synthesised a bank of questions from
+hardcoded option families, theme dictionaries and generic prompts. The
+questions were scored via a fixed answer-to-score lookup table.
 
-Two new top-level entry points are added:
+Current role (AI-agent enhancement)
+-----------------------------------
+All hardcoded questionnaire values, static option sets, fixed scoring values
+and generic question templates have been removed. Question generation is now
+produced by :mod:`services.ai_questionnaire_generator`, which prompts the
+GenAI Shared Service with the full regulatory context (obligations, BRD
+requirements, RTM entries, impact assessment, selected client roles) and
+returns adaptive, per-question option sets with option-specific follow-ups
+and per-option scoring.
 
-- :func:`build_questionnaire_package` accepts a DOCX path/bytes and returns the
-  questionnaire package dict.
-- :func:`build_package_from_report` accepts a Phase 4
-  :class:`~services.brd_frd_generator.DoraDetailedBRD` in-memory model and
-  builds the package without a DOCX round-trip. This is the closed loop that
-  enables Page 1's "Generate BRD/FRD from regulation" path.
+What remains in this module:
 
-The package dict's shape is unchanged from the original v11 output, so
-``utils.json_utils.validate_package_schema`` and the existing
-``sample_data/dora_questionnaire_package_v10.json`` remain valid contracts.
+* :class:`Requirement`, :class:`ImpactPair`, :class:`Question` dataclasses
+  (contract for the rest of the pipeline).
+* BRD parsing helpers (:func:`read_docx_requirements`,
+  :func:`requirements_from_report`).
+* Impact-pair derivation helpers (:func:`derive_impact_pairs` and the
+  supporting ``AREA_KEYWORDS`` / ``FUNCTION_KEYWORDS`` taxonomies — these
+  are analytical utilities used by Agent 1 and 3 to bucket requirements,
+  NOT question templates).
+* Validation, scoring metadata, package assembly, dedup and the Excel
+  writer.
+* Backwards-compatible entry points (:func:`build_package_from_report`,
+  :func:`build_questionnaire_package`) that now call the AI generator
+  with any additional context the caller supplies.
+
+When the caller passes a live :class:`~services.genai_service.GenAIClient`
+via the new context-aware entry points the questionnaire is fully AI
+generated. When no client is available the AI generator emits a small set
+of "Manual Review Required" placeholders per impact pair — it never
+fabricates hardcoded questions.
 """
 
 from __future__ import annotations
@@ -148,116 +168,20 @@ FUNCTION_KEYWORDS = {
     "Human Resources / Training": ["hr", "training", "people", "resource", "sme"],
 }
 
-DEFAULT_OPTIONS = {
-    "maturity": ["Not started", "Ad hoc", "Defined", "Implemented", "Measured / Optimised", "Not applicable", "Unknown"],
-    "yes_no_partial": ["Yes", "Partially", "No", "Not applicable", "Unknown"],
-    "coverage": ["Complete", "Mostly complete", "Partially complete", "Not started", "Not applicable", "Unknown"],
-    # v13 — canonical implementation-status family used as the L1 root for
-    # every impact pair so the funnel matches the product brief's example:
-    #   "Is the <theme> process implemented?"
-    #   - Fully Implemented      -> evidence/validation branch (skips detail)
-    #   - Partially Implemented  -> partial-implementation branch
-    #   - Not Implemented        -> blocker/ownership branch
-    #   - Not Applicable         -> scoped-out (excluded from scoring)
-    "implementation_status": [
-        "Fully Implemented",
-        "Partially Implemented",
-        "Not Implemented",
-        "Not Applicable",
-        "Unknown",
-    ],
-    "risk_level": ["Low", "Medium", "High", "Critical", "Unknown"],
-    "ownership": ["Named accountable owner", "Shared ownership", "Informal owner", "No owner assigned", "Unknown"],
-    "evidence": ["Policy / procedure", "Workflow record", "System report", "Dashboard", "Attestation", "Audit trail", "Contract evidence", "No evidence available"],
-    "support": ["No external support required", "Education only", "Assessment support", "Implementation support", "Managed service support", "Budgeted opportunity", "Unknown"],
-}
-
-# Canonical answer labels for the implementation-status family. Used as
-# branch_registry keys and as the trigger_answers for L2 questions.
-IMPLEMENTATION_STATUS_LABELS = (
-    "Fully Implemented",
-    "Partially Implemented",
-    "Not Implemented",
-    "Not Applicable",
-    "Unknown",
-)
-
-# Theme-specific option families used by the deep-dive questions injected into
-# each impact pair's funnel. They intentionally include positive and negative
-# signals already recognised by services.scoring_engine so the live cockpit can
-# route follow-ups consistently.
-THEME_OPTIONS = {
-    "incident_reporting": [
-        "Documented, tested, and meets the regulatory deadline",
-        "Documented but not yet tested end-to-end",
-        "Partial — manual workaround within deadline",
-        "Partial — risk of missing the deadline",
-        "Not implemented",
-        "Not applicable",
-        "Unknown",
-    ],
-    "third_party": [
-        "All required clauses present and Legal-validated",
-        "Most clauses present, awaiting Legal sign-off",
-        "Some clauses missing or under negotiation",
-        "Clauses not yet reviewed by Legal",
-        "No contract evidence available",
-        "Not applicable",
-        "Unknown",
-    ],
-    "resilience_testing": [
-        "Tested within the regulatory window with successful results",
-        "Tested but with open findings being remediated",
-        "Scheduled but not yet executed",
-        "Not scheduled",
-        "Not applicable",
-        "Unknown",
-    ],
-    "security_access": [
-        "Implemented with periodic review and SIEM coverage",
-        "Implemented but reviews are ad hoc",
-        "Partially implemented for in-scope systems",
-        "Designed but not yet implemented",
-        "Not implemented",
-        "Not applicable",
-        "Unknown",
-    ],
-    "governance": [
-        "Approved by the management body with traceable evidence",
-        "Approved at executive level, awaiting board ratification",
-        "Drafted but not formally approved",
-        "Not yet drafted",
-        "Not applicable",
-        "Unknown",
-    ],
-    "data_evidence": [
-        "Evidence dictionary complete with owners and retention",
-        "Evidence captured but no formal dictionary",
-        "Evidence partial or manually compiled",
-        "Evidence missing or inconsistent",
-        "Not applicable",
-        "Unknown",
-    ],
-    "reporting": [
-        "Automated dashboard with KRIs/KPIs reviewed periodically",
-        "Manual report produced on schedule",
-        "Ad hoc reporting only",
-        "No reporting in place",
-        "Not applicable",
-        "Unknown",
-    ],
-}
-
-# Maps the `theme` field (output of :func:`infer_themes`) to its question key.
-_THEME_TO_KEY = {
-    "Incident reporting": "incident_reporting",
-    "Third-party risk": "third_party",
-    "Resilience testing": "resilience_testing",
-    "Security and access": "security_access",
-    "Governance": "governance",
-    "Data and evidence": "data_evidence",
-    "Reporting": "reporting",
-}
+# -----------------------------------------------------------------------------
+# NOTE: All hardcoded option families, theme option dictionaries and
+# implementation-status label tuples have been removed.
+#
+# Answer options and their scoring metadata are now generated per-question by
+# the AI questionnaire agent (see services.ai_questionnaire_generator). Every
+# option carries its own ``score_value``, ``readiness_interpretation``,
+# ``triggers_followup`` flag and (optionally) an option-specific follow-up
+# question that is directly tied to what the option reveals.
+#
+# Downstream code that used to read from ``DEFAULT_OPTIONS`` /
+# ``THEME_OPTIONS`` / ``IMPLEMENTATION_STATUS_LABELS`` has been rewired to
+# read from the per-option metadata attached to each question instead.
+# -----------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Option helpers — options may now be plain strings OR dicts of the shape:
@@ -287,19 +211,27 @@ def option_metadata(options: Sequence[Any], label: str) -> Dict[str, Any]:
     return {}
 
 
-ANSWER_SCORES = {
+# Legacy answer-to-score mapping. Kept as a *last-resort* fallback so that
+# historical questionnaire packages (saved before the AI generator existed)
+# can still be scored when they load from disk. New AI-generated packages
+# carry the score on each option (``option.score_value``) — the scoring
+# engine consults that first and only falls back to this table for legacy
+# string-only option labels.
+_LEGACY_ANSWER_SCORES = {
     "Yes": 100, "Complete": 100, "Measured / Optimised": 100, "Implemented": 90, "Mostly complete": 85,
     "Defined": 75, "Partially": 55, "Partially complete": 55, "Ad hoc": 35, "Not started": 0,
     "No": 0, "No owner assigned": 0, "No evidence available": 0, "Critical": 15, "High": 35,
     "Medium": 65, "Low": 90, "Named accountable owner": 95, "Shared ownership": 70,
     "Informal owner": 40, "Not applicable": None, "Unknown": 25,
-    # v13 — canonical implementation-status family (mirrors coverage scoring
-    # so the readiness % stays comparable to historical assessments).
     "Fully Implemented": 100,
     "Partially Implemented": 55,
     "Not Implemented": 0,
     "Not Applicable": None,
 }
+
+# Public alias retained so any legacy import (`from services.questionnaire_generator
+# import ANSWER_SCORES`) keeps working; new code should not rely on this dict.
+ANSWER_SCORES = _LEGACY_ANSWER_SCORES
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +308,56 @@ class Question:
     #   reason                  str   (why this question exists)
     #   expected_evidence       str   (artefacts that would substantiate a positive answer)
     #   risk_if_negative        str   (consequence of a negative answer)
+    #   owning_team             str   (Front Office / Compliance / Risk / ...)
+    #   team_rationale          str   (why that team owns this question)
+    #   impact_level            str   (Critical / High / Medium / Low)
+    #   impact_reason           str   (why this impact level)
+    #   plain_language_explainer str  (plain-English explanation of any reg jargon)
+    #   evidence_expectations   [str] (concrete artefacts the client should produce)
     explainability: Dict[str, Any] = field(default_factory=dict)
+    # --- AI-agent enhancement fields (per-question routing + impact) ---------
+    # These are duplicated at the top level of the question dict for cheap
+    # UI access (avoids reaching into ``explainability`` for every render).
+    # Everything is optional / default-safe so legacy packages still load.
+    owning_team: str = ""            # Front Office / Middle / Back / Risk / ...
+    team_rationale: str = ""
+    impact_level: str = ""           # Critical / High / Medium / Low
+    impact_reason: str = ""
+    impact_severity: str = ""        # kept in sync with impact_level for legacy readers
+    impact_weight: int = 0           # numeric weight derived from impact severity
+    plain_language_explainer: str = ""
+    evidence_expectations: List[str] = field(default_factory=list)
+    # Regulatory obligation IDs (Agent 1 OBL-XXX) the AI questionnaire
+    # generator mapped this question to. Distinct from
+    # ``mapped_requirement_ids`` which are BRD IDs.
+    mapped_obligation_ids: List[str] = field(default_factory=list)
+    # Parent / child relationships in the funnel tree. ``funnel_parent_id``
+    # already captures the child->parent edge; ``child_question_ids`` is the
+    # reverse edge, kept so the UI can walk the tree without a second pass.
+    child_question_ids: List[str] = field(default_factory=list)
+    is_parent: bool = False
+    is_child: bool = False
+    # True when the AI generator lacked enough context to produce a
+    # grounded question and emitted an SME placeholder instead of
+    # fabricating content.
+    requires_manual_review: bool = False
+    generated_by_ai: bool = False
+    # Numeric priority derived from impact severity; used by the enhancer
+    # to sort questions on the UI (higher = more urgent).
+    priority_rank: int = 2
+    # AI-agent question intent tagging: 'impact' / 'readiness' /
+    # 'impact+readiness'. Populated by the AI questionnaire generator so
+    # the UI + analytics can prove balanced impact-vs-readiness coverage
+    # per impacted area.
+    question_purpose: str = ""
+    targets_impact_dimension: str = ""
+    targets_readiness_dimension: str = ""
+    # Populated by :mod:`services.question_style_enhancer` when the
+    # question wording is intrinsically quantitative (Budget, Timeline,
+    # Coverage %, Frequency, Team size, SLA). The scoring engine uses
+    # this tag to award a small "quantitative depth" bonus in the
+    # composite Evaluation Confidence score.
+    quantitative_type: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +493,7 @@ def requirements_from_report(
             counters[prefix] += 1
             combined = " ".join([
                 section_label, item.id, item.category, item.requirement,
-                item.detailed_requirement, item.dora_alignment, item.acceptance_criteria,
+                item.detailed_requirement, item.regulation_alignment, item.acceptance_criteria,
             ])
             req_refs = list(refs_map.get(f"REQ:{item.id}", []))
             requirements.append(Requirement(
@@ -522,7 +503,7 @@ def requirements_from_report(
                 category=item.category,
                 requirement=item.requirement,
                 detail=item.detailed_requirement,
-                alignment=item.dora_alignment,
+                alignment=item.regulation_alignment,
                 priority=item.priority,
                 acceptance=item.acceptance_criteria,
                 confidence=clamp_confidence(item.confidence_level),
@@ -587,29 +568,11 @@ def derive_impact_pairs(requirements: Sequence[Requirement], regulation: str) ->
 # Question synthesis
 # ---------------------------------------------------------------------------
 
-def select_option_family(reqs: Sequence[Requirement], area: str, function: str) -> Tuple[str, List[str]]:
-    text = " ".join([area, function] + [r.category + " " + r.requirement + " " + r.detail for r in reqs]).lower()
-    if any(k in text for k in ["owner", "role", "responsibil", "attestation", "approval"]):
-        return "Single Select", DEFAULT_OPTIONS["ownership"]
-    if any(k in text for k in ["evidence", "audit", "traceability", "metadata"]):
-        return "Multi Select", DEFAULT_OPTIONS["evidence"]
-    if any(k in text for k in ["risk", "severity", "critical", "vulnerability", "incident"]):
-        return "Single Select", DEFAULT_OPTIONS["risk_level"]
-    if any(k in text for k in ["programme", "maturity", "readiness", "framework"]):
-        return "Single Select", DEFAULT_OPTIONS["maturity"]
-    if any(k in text for k in ["support", "budget", "sponsor"]):
-        return "Single Select", DEFAULT_OPTIONS["support"]
-    return "Single Select", DEFAULT_OPTIONS["coverage"]
-
-
-def _short_requirement_focus(reqs: Sequence[Requirement]) -> str:
-    if not reqs:
-        return "the mapped regulatory requirement set"
-    primary = reqs[0]
-    title = clean_text(primary.requirement)
-    if len(title) > 72:
-        title = title[:69].rstrip() + "..."
-    return f"{title} ({primary.normalized_id})"
+# NOTE: ``select_option_family`` and ``_short_requirement_focus`` used to
+# route hardcoded option families for a given requirement set. They have
+# been removed. Option families are now generated per-question by the AI
+# agent based on the specific question being asked (see
+# services.ai_questionnaire_generator).
 
 
 # ---------------------------------------------------------------------------
@@ -618,893 +581,23 @@ def _short_requirement_focus(reqs: Sequence[Requirement]) -> str:
 # expectation and regulatory article instead of generic placeholders.
 # ---------------------------------------------------------------------------
 
+# Regex kept for the content-correctness validator (see
+# ``_cited_article_matches_requirement`` below), which cross-checks that an
+# AI-generated question cites an article that actually appears in the
+# mapped BRD row(s). This is a validation-only regex, not a template.
 _ARTICLE_RE = _re.compile(
     r"\b(?:Article|Art\.?)\s*([0-9]{1,3}(?:\s*\([a-z0-9]+\))?(?:\s*\.\s*[0-9]+)?)\b",
     _re.IGNORECASE,
 )
-_REGULATION_RE = _re.compile(
-    r"\b(DORA|MiFID(?:\s*II)?|GDPR|EMIR|SFTR|MAR|PSD2|EU\s*2022\s*/\s*2554|NIS\s*2)\b",
-    _re.IGNORECASE,
-)
-_METRIC_RE = _re.compile(
-    r"(\b\d+(?:\.\d+)?\s*(?:%|percent|hours?|hrs?|minutes?|mins?|days?|seconds?|secs?|years?|months?|business\s+days?)\b"
-    r"|\b(?:RTO|RPO|SLA|MTTR|MTBF|TLPT|KRI|KPI)\b)",
-    _re.IGNORECASE,
-)
-_VERB_HINTS = (
-    "establish", "implement", "maintain", "monitor", "report", "classify",
-    "notify", "escalate", "test", "review", "approve", "document",
-    "encrypt", "backup", "restore", "recover", "validate", "attest",
-    "log", "track", "remediate", "assess", "evidence", "ensure",
-)
-
-# Best-effort regulator lookup for the explainability bundle. Maps regulation
-# codes to the supervisory authority that typically enforces it. Used only as
-# a default — the field can be overridden by anything more specific picked up
-# from the requirement text (Article reference, RTS reference, etc.).
-_REGULATION_TO_REGULATOR = {
-    "DORA": "European Supervisory Authorities (ESMA / EBA / EIOPA)",
-    "MIFID II": "ESMA + National Competent Authorities",
-    "MIFID": "ESMA + National Competent Authorities",
-    "GDPR": "European Data Protection Board / National DPAs",
-    "EMIR": "ESMA + National Competent Authorities",
-    "SFTR": "ESMA",
-    "MAR": "ESMA + National Competent Authorities",
-    "PSD2": "EBA + National Competent Authorities",
-    "NIS2": "ENISA + National CSIRTs",
-}
-
-
-def _resolve_regulator(regulation: str, requirement_text: str = "") -> str:
-    reg = (regulation or "").strip().upper()
-    if reg in _REGULATION_TO_REGULATOR:
-        return _REGULATION_TO_REGULATOR[reg]
-    haystack = (requirement_text or "").upper()
-    for key, regulator in _REGULATION_TO_REGULATOR.items():
-        if key in haystack:
-            return regulator
-    return f"{regulation} competent authority" if regulation else "Competent authority"
 
 # Subject-verb stems that we strip from a behaviour clause so that what remains
 # reads as a verb phrase (e.g. "monitor risks" rather than "The organization
 # must monitor risks"). Order matters — longer phrases must come first.
-_SUBJECT_STEMS = (
-    "the organization must",
-    "the organisation must",
-    "the firm must",
-    "the institution must",
-    "the entity must",
-    "the system must",
-    "the system shall",
-    "the firm shall",
-    "the organization shall",
-    "the organisation shall",
-    "the firm should",
-    "the organization should",
-    "the institution shall",
-    "the institution should",
-    "management must",
-    "the bank must",
-    "the bank shall",
-    "the company must",
-    "the company shall",
-)
-
-
-def _strip_id_prefix(text: str) -> str:
-    """Drop a leading 'BR-PRO-001 — ' / 'FR-002:' style identifier from a sentence."""
-    return _re.sub(r"^\s*(?:BR-[A-Z]+-\d+|FR-\d+|NFR-\d+|REQ-\d+|R\d+)\s*[—\-:.\u2014\u2013]\s*", "", text or "")
-
-
-def _strip_subject_stem(text: str) -> str:
-    """Drop a leading subject-verb stem ("The organization must ...") so the
-    remainder reads as an imperative verb phrase."""
-    if not text:
-        return text
-    lower = text.lower().lstrip()
-    for stem in _SUBJECT_STEMS:
-        if lower.startswith(stem):
-            trimmed = text.lstrip()[len(stem):].lstrip()
-            if trimmed:
-                return trimmed[0].lower() + trimmed[1:] if trimmed[0].isupper() else trimmed
-    return text
-
-
-def _short_clause(text: str, max_words: int = 18, strip_subject: bool = True) -> str:
-    """Return the first sentence-ish fragment of ``text`` capped at ``max_words``."""
-    if not text:
-        return ""
-    cleaned = _re.sub(r"\s+", " ", clean_text(text)).strip()
-    cleaned = _strip_id_prefix(cleaned)
-    if strip_subject:
-        cleaned = _strip_subject_stem(cleaned)
-    parts = _re.split(r"(?<=[.;\n])\s+", cleaned)
-    first = (parts[0] if parts else cleaned).strip().rstrip(".,;:")
-    words = first.split()
-    if len(words) <= max_words:
-        return first
-    return " ".join(words[:max_words]).rstrip(".,;:") + "..."
-
-
-def _extract_article(req: "Requirement") -> str:
-    """Pull a regulatory article reference from the requirement, if available."""
-    for source in (req.alignment, req.detail, req.requirement, req.acceptance):
-        if not source:
-            continue
-        article = _ARTICLE_RE.search(source)
-        if not article:
-            continue
-        regulation = _REGULATION_RE.search(source)
-        prefix = "DORA" if not regulation else regulation.group(1).upper().replace("  ", " ")
-        return f"{prefix} Article {article.group(1).strip()}"
-    return ""
-
-
-def _extract_metric(req: "Requirement") -> str:
-    """Pull the most informative metric/threshold (e.g. ``4 hours``, ``RTO``)."""
-    for source in (req.detail, req.acceptance, req.requirement):
-        if not source:
-            continue
-        match = _METRIC_RE.search(source)
-        if match:
-            value = match.group(0).strip()
-            return _re.sub(r"\s+", " ", value)
-    return ""
-
-
-def _behavioural_anchor(req: "Requirement") -> str:
-    """Return a verb-led phrase describing the concrete behaviour the requirement demands."""
-    sources = [req.detail, req.requirement, req.acceptance]
-    for source in sources:
-        clause = _short_clause(source, max_words=22)
-        if not clause:
-            continue
-        lower = clause.lower()
-        if any(verb in lower for verb in _VERB_HINTS):
-            return clause
-    for source in sources:
-        clause = _short_clause(source, max_words=18)
-        if clause:
-            return clause
-    return "deliver the control behaviour required by the regulation"
-
-
-def _evidence_anchor(req: "Requirement") -> str:
-    """Return a phrase describing the evidence/acceptance expectation."""
-    if req.acceptance:
-        clause = _short_clause(req.acceptance, max_words=20)
-        if clause:
-            return clause
-    if req.detail:
-        return _short_clause(req.detail, max_words=18)
-    return "the documented control outcome"
-
-
-def _format_req_label(req: "Requirement") -> str:
-    """Compact, citation-style label used at the start of each question."""
-    title = clean_text(req.requirement) or "Mapped regulatory requirement"
-    if len(title) > 60:
-        title = title[:57].rstrip() + "..."
-    article = _extract_article(req)
-    suffix = f", {article}" if article else ""
-    return f"{req.normalized_id} — {title}{suffix}"
-
-
-def _select_anchor_requirement(reqs: Sequence["Requirement"]) -> Optional["Requirement"]:
-    """Pick the most informative mapped requirement to anchor the question on."""
-    if not reqs:
-        return None
-
-    def score(r: "Requirement") -> int:
-        s = 0
-        if _extract_article(r):
-            s += 5
-        if _extract_metric(r):
-            s += 3
-        if r.priority and any(tag in r.priority.lower() for tag in ("must", "high", "critical")):
-            s += 3
-        if r.acceptance:
-            s += 1
-        s += min(3, len(r.detail or "") // 120)
-        return s
-
-    return max(reqs, key=score)
-
-
-def _dominant_theme_key(reqs: Sequence["Requirement"]) -> Optional[str]:
-    """Return the most frequent theme key across the mapped requirements."""
-    if not reqs:
-        return None
-    counts: Counter = Counter()
-    for r in reqs:
-        for theme in r.themes:
-            key = _THEME_TO_KEY.get(theme)
-            if key:
-                counts[key] += 1
-    if not counts:
-        return None
-    return counts.most_common(1)[0][0]
-
-
 # ---------------------------------------------------------------------------
-# v13 — Explainability bundle + canonical implementation-status root question
+# Hardcoded content removed: theme/option dictionaries, template question
+# synthesisers, and free-text prompt families. Question generation is now
+# 100% AI-driven (see services.ai_questionnaire_generator).
 # ---------------------------------------------------------------------------
-
-# Maps the canonical theme label (output of :func:`infer_themes`) to a
-# concise control-objective phrase used in explainability metadata and as the
-# subject of the L1 implementation-status root question.
-_THEME_TO_CONTROL_OBJECTIVE = {
-    "Governance": "Documented and approved governance/control framework",
-    "ICT risk management": "Implemented ICT risk-management framework",
-    "Incident reporting": "Operational major-ICT-incident classification and notification process",
-    "Resilience testing": "Periodic resilience / recovery testing programme",
-    "Third-party risk": "Critical ICT third-party contracts and exit planning",
-    "Data and evidence": "Evidence dictionary with lineage, ownership and retention",
-    "Security and access": "Privileged access, encryption, vulnerability and SIEM coverage",
-    "Reporting": "Management reporting with KRIs/KPIs to the management body",
-    "General regulatory coverage": "Regulatory control coverage for the mapped requirement",
-}
-
-
-_THEME_TO_RISK_IF_NEGATIVE = {
-    "Governance": "No traceable management-body approval; assessment cannot be evidenced or audited.",
-    "ICT risk management": "Risks are not identified, assessed or treated within the regulatory framework.",
-    "Incident reporting": "Risk of missing the regulatory notification deadline and incurring sanction.",
-    "Resilience testing": "Recovery objectives unproven; operational disruption may extend beyond regulatory tolerances.",
-    "Third-party risk": "Critical contracts lack DORA clauses; the firm cannot demonstrate oversight or exit ability.",
-    "Data and evidence": "Audit trail is incomplete; supervisory inspections cannot be substantiated.",
-    "Security and access": "Material control gaps in privileged access / encryption increase breach exposure.",
-    "Reporting": "Management body lacks situational awareness; weak governance attestation.",
-    "General regulatory coverage": "Underlying regulatory obligation may not be demonstrably met at the next inspection.",
-}
-
-
-def _theme_label_from_requirements(reqs: Sequence[Requirement]) -> str:
-    """Return the canonical theme label (not the registry key) for the anchor requirement set."""
-    if not reqs:
-        return "General regulatory coverage"
-    counts: Counter = Counter()
-    for r in reqs:
-        for theme in r.themes:
-            counts[theme] += 1
-    if not counts:
-        return "General regulatory coverage"
-    return counts.most_common(1)[0][0]
-
-
-def _build_explainability(
-    *,
-    regulation: str,
-    pair: ImpactPair,
-    anchor: Requirement,
-    mapped_requirement_ids: Sequence[str],
-    theme_label: str,
-    article: str,
-    reason: str,
-    expected_evidence: str,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Assemble the structured explainability dict attached to every Question.
-
-    Every field is best-effort: when the underlying BRD/RTM does not surface
-    a value we emit a sensible default rather than ``""`` so the UI never
-    shows blank rows. ``extra`` lets callers override individual fields
-    (e.g. branch questions can override ``reason`` and ``risk_if_negative``).
-    """
-    requirement_text = " ".join([
-        anchor.alignment or "",
-        anchor.detail or "",
-        anchor.requirement or "",
-    ])
-    obligation_id = ""
-    if anchor.source_id:
-        obligation_id = anchor.source_id
-    elif mapped_requirement_ids:
-        obligation_id = mapped_requirement_ids[0]
-    # Carry the anchor requirement's source citations into the question so the
-    # assessment UI's "Why am I being asked this?" panel can render the
-    # underlying regulatory publications. We use the anchor requirement's
-    # references rather than aggregating across all mapped IDs to keep the
-    # citation focused on the dominant obligation the question is testing.
-    source_references = list(getattr(anchor, "source_references", []) or [])
-    bundle: Dict[str, Any] = {
-        "regulation": regulation,
-        "regulator": _resolve_regulator(regulation, requirement_text),
-        "article": article or pair.regulatory_basis or f"{regulation} mapped clause",
-        "obligation_id": obligation_id,
-        "brd_requirement_ids": list(mapped_requirement_ids),
-        "rtm_trace_ids": [f"TR-{rid}" for rid in mapped_requirement_ids[:5]],
-        "business_function": pair.function,
-        "business_area": pair.area,
-        "control_objective": _THEME_TO_CONTROL_OBJECTIVE.get(
-            theme_label, _THEME_TO_CONTROL_OBJECTIVE["General regulatory coverage"],
-        ),
-        "theme": theme_label,
-        "reason": reason,
-        "expected_evidence": expected_evidence,
-        "risk_if_negative": _THEME_TO_RISK_IF_NEGATIVE.get(
-            theme_label, _THEME_TO_RISK_IF_NEGATIVE["General regulatory coverage"],
-        ),
-        "source_references": source_references,
-    }
-    if extra:
-        bundle.update({k: v for k, v in extra.items() if v not in (None, "", [], {})})
-    return bundle
-
-
-# Per-option metadata for the canonical implementation-status family. Each
-# entry becomes a dict-shaped option carrying:
-#   - label          : the user-facing answer
-#   - score_value    : numeric score consumed by services.scoring_engine
-#   - branch_rule_id : namespaced rule key looked up in branch_registry
-#   - reason         : short explanation surfaced in the audit trail
-def _implementation_status_options(theme_label: str) -> List[Dict[str, Any]]:
-    theme_key = theme_label.replace(" ", "_").replace("-", "_").lower() or "general"
-    base = [
-        {
-            "label": "Fully Implemented",
-            "score_value": 100,
-            "branch_rule_id": f"{theme_key}__status__fully_implemented",
-            "reason": (
-                "Trigger the validation/evidence branch — implementation is claimed complete; "
-                "the next questions confirm evidence and last-test cadence rather than asking "
-                "for implementation detail."
-            ),
-        },
-        {
-            "label": "Partially Implemented",
-            "score_value": 55,
-            "branch_rule_id": f"{theme_key}__status__partially_implemented",
-            "reason": (
-                "Trigger the partial-implementation branch — the next questions isolate which "
-                "stage is incomplete, which teams are affected, and what evidence already exists."
-            ),
-        },
-        {
-            "label": "Not Implemented",
-            "score_value": 0,
-            "branch_rule_id": f"{theme_key}__status__not_implemented",
-            "reason": (
-                "Trigger the not-started branch — the next questions investigate blockers, "
-                "ownership, planned start, and required funding/support."
-            ),
-        },
-        {
-            "label": "Not Applicable",
-            "score_value": None,
-            "branch_rule_id": f"{theme_key}__status__not_applicable",
-            "reason": (
-                "Mark scope-out — exclude from scoring and request a single justification "
-                "follow-up so the N/A claim is auditable."
-            ),
-        },
-        {
-            "label": "Unknown",
-            "score_value": 25,
-            "branch_rule_id": f"{theme_key}__status__unknown",
-            "reason": (
-                "Trigger the discovery branch — identify who can authoritatively answer this "
-                "before any deeper readiness questions are asked."
-            ),
-        },
-    ]
-    return base
-
-
-def _theme_question_text(theme_key: str, anchor: Requirement, pair: ImpactPair) -> Tuple[str, str]:
-    """Return ``(question_text, rationale)`` for the theme-specific deep dive.
-
-    Questions are intentionally written in **plain, business-friendly
-    English** so an SME can answer without decoding jargon or having to
-    look up an article number. The technical anchors (article, metric,
-    behaviour) are still surfaced in the rationale for auditability.
-    """
-    label = _format_req_label(anchor)
-    article = _extract_article(anchor) or pair.regulatory_basis
-    metric = _extract_metric(anchor)
-    behaviour = _behavioural_anchor(anchor)
-    if theme_key == "incident_reporting":
-        text = (
-            f"For {label}, does {pair.function} report major incidents to the "
-            "regulator on time?"
-        )
-        rationale = (
-            f"Tests classification, severity and notification-window "
-            f"execution for {article}. Behaviour anchor: '{behaviour}'."
-            + (f" Metric expected: {metric}." if metric else "")
-        )
-        return text, rationale
-    if theme_key == "third_party":
-        text = (
-            f"For {label}, do {pair.area} vendor contracts cover the "
-            "required audit, exit and data terms?"
-        )
-        rationale = (
-            f"Probes contractual readiness against {article} for {pair.function}. "
-            "Missing clauses are the biggest DORA third-party gap."
-        )
-        return text, rationale
-    if theme_key == "resilience_testing":
-        text = (
-            f"For {label}, has {pair.function} run its resilience tests "
-            "on schedule?"
-        )
-        rationale = (
-            f"Validates that testing required by {article} is executed on time and "
-            f"linked to '{behaviour}'."
-            + (f" Metric expected: {metric}." if metric else "")
-        )
-        return text, rationale
-    if theme_key == "security_access":
-        text = (
-            f"For {label}, are the security controls in {pair.area} "
-            "working and reviewed regularly?"
-        )
-        rationale = (
-            f"Tests design and operating effectiveness of the controls behind "
-            f"{article}, including review cadence."
-        )
-        return text, rationale
-    if theme_key == "governance":
-        text = (
-            f"For {label}, has the management body approved the policy "
-            "with documented evidence?"
-        )
-        rationale = (
-            f"Confirms governance approval is documented and traceable for "
-            f"{article} in {pair.area} / {pair.function}."
-        )
-        return text, rationale
-    if theme_key == "data_evidence":
-        text = (
-            f"For {label}, do we have an evidence trail linking each "
-            f"{pair.function} control output to an owner and source?"
-        )
-        rationale = (
-            f"Tests evidence-dictionary maturity so {article} outcomes can be "
-            "audited and substantiated."
-        )
-        return text, rationale
-    if theme_key == "reporting":
-        text = (
-            f"For {label}, is the {pair.area} management dashboard "
-            "current and traceable?"
-        )
-        rationale = (
-            f"Validates that reporting for {pair.function} carries live KRI/KPI values "
-            f"traceable to '{behaviour}' as expected by {article}."
-        )
-        return text, rationale
-    return "", ""
-
-
-def build_closed_questions_for_pair(
-    pair: ImpactPair,
-    requirements: Sequence[Requirement],
-    start_idx: int,
-    regulation: str = "DORA",
-) -> List[Question]:
-    """Synthesise a requirement-specific, fully-funneled question set for one impact pair.
-
-    v13 funnel tree (per pair)::
-
-        L1  Implementation status  (root, asks "Is the <theme> process implemented?")
-              |
-              +-- Per-option branches:
-              |     - Fully Implemented      -> validation/evidence branch (registry+AI)
-              |     - Partially Implemented  -> partial-implementation branch
-              |     - Not Implemented        -> blocker/ownership/planning branch
-              |     - Not Applicable         -> single N/A justification follow-up
-              |     - Unknown                -> discovery branch ("who can answer this?")
-              |
-              +-- L2  Ownership   (parent=L1, triggers=Partially/Not/Unknown)
-              |       |
-              |       +-- L3  Risk (shared)
-              |
-              +-- L2  Evidence    (parent=L1, triggers=Partially/Not/Unknown)
-              |
-              +-- L2  Risk        (parent=L1, triggers=Partially/Not/Unknown + weak ownership)
-                       |
-                       +-- L3  Remediation  (parent=Risk, triggers=Medium/High/Critical/Unknown)
-
-        L2  Theme deep-dive       (parent=L1, triggers=Partially/Not/Unknown when a
-                                   dominant theme is detected for the pair)
-
-    Every non-root question carries a ``funnel_parent_id`` and a non-empty
-    ``trigger_answers`` list, so the live cockpit can short-circuit branches when
-    the parent answer is positive.
-
-    The L1 root uses dict-shaped options carrying ``score_value`` and
-    ``branch_rule_id`` so the scoring engine can route per-option to the
-    branch registry / GenAI fallback without needing to re-classify the answer.
-    Every question carries a structured :py:attr:`Question.explainability`
-    bundle for traceability.
-    """
-    req_by_id = {r.normalized_id: r for r in requirements}
-    mapped_reqs = [req_by_id[i] for i in pair.requirement_ids if i in req_by_id]
-    anchor = _select_anchor_requirement(mapped_reqs) or (requirements[0] if requirements else None)
-    if anchor is None:
-        return []
-
-    req_ids = pair.requirement_ids[:5]
-    base_conf = clamp_confidence(min(pair.confidence + 1, 98))
-    label = _format_req_label(anchor)
-    behaviour = _behavioural_anchor(anchor)
-    behaviour_short = _short_clause(behaviour, max_words=12) or behaviour
-    evidence = _evidence_anchor(anchor)
-    article = _extract_article(anchor) or pair.regulatory_basis
-    metric = _extract_metric(anchor)
-    metric_clause = f" (target: {metric})" if metric else ""
-
-    theme_label = _theme_label_from_requirements(mapped_reqs)
-    theme_key_local = _THEME_TO_KEY.get(theme_label)
-    branch_theme_label = theme_label if theme_label != "General regulatory coverage" else ""
-    control_objective = _THEME_TO_CONTROL_OBJECTIVE.get(
-        theme_label, _THEME_TO_CONTROL_OBJECTIVE["General regulatory coverage"],
-    )
-
-    qid_status = f"Q-{start_idx:04d}"
-    qid_ownership = f"Q-{start_idx + 1:04d}"
-    qid_evidence = f"Q-{start_idx + 2:04d}"
-    qid_risk = f"Q-{start_idx + 3:04d}"
-    qid_remediation = f"Q-{start_idx + 4:04d}"
-
-    negative_status_triggers = ["Partially Implemented", "Not Implemented", "Unknown"]
-    weak_ownership_triggers = [
-        "Shared ownership", "Informal owner", "No owner assigned", "Unknown",
-    ]
-    high_risk_triggers = ["Medium", "High", "Critical", "Unknown"]
-
-    status_options = _implementation_status_options(theme_label)
-
-    def explain(reason: str, expected_evidence: str, **extra: Any) -> Dict[str, Any]:
-        return _build_explainability(
-            regulation=regulation,
-            pair=pair,
-            anchor=anchor,
-            mapped_requirement_ids=req_ids,
-            theme_label=theme_label,
-            article=article,
-            reason=reason,
-            expected_evidence=expected_evidence,
-            extra=extra or None,
-        )
-
-    questions: List[Question] = [
-        Question(
-            question_id=qid_status,
-            area=pair.area,
-            function=pair.function,
-            question_type="Single Select",
-            question=(
-                f"Is the {control_objective.lower()} in place for "
-                f"{pair.area} / {pair.function}?"
-            ),
-            options=status_options,
-            mapped_requirement_ids=req_ids,
-            regulatory_basis=pair.regulatory_basis,
-            confidence=base_conf,
-            scoring_weight=3,
-            funnel_parent_id="",
-            trigger_answers=[],
-            rationale=(
-                f"Root screening question for the funnel. Establishes implementation status against "
-                f"{article} and routes per-option to the matching adaptive branch. Mapped to "
-                f"{', '.join(req_ids)}."
-            ),
-            branch_theme=branch_theme_label,
-            explainability=explain(
-                reason=(
-                    f"Establishes the implementation baseline so the engine can route the user to the "
-                    f"correct branch — Fully Implemented unlocks evidence/validation questions, "
-                    f"Partially Implemented isolates which stage is incomplete, Not Implemented "
-                    f"investigates blockers and ownership, Not Applicable is recorded with a single "
-                    f"justification."
-                ),
-                expected_evidence=(
-                    "Process documentation, control register entry, last test report, and a named "
-                    "accountable owner for the control."
-                ),
-            ),
-        ),
-        Question(
-            question_id=qid_ownership,
-            area=pair.area,
-            function=pair.function,
-            question_type="Single Select",
-            question=(
-                f"Who owns the {control_objective.lower()} in "
-                f"{pair.area} / {pair.function}?"
-            ),
-            options=DEFAULT_OPTIONS["ownership"],
-            mapped_requirement_ids=req_ids,
-            regulatory_basis=pair.regulatory_basis,
-            confidence=base_conf,
-            scoring_weight=3,
-            funnel_parent_id=qid_status,
-            trigger_answers=negative_status_triggers,
-            rationale=(
-                "Triggered when implementation status is below 'Fully Implemented'. Tests whether "
-                "accountability is clear enough to support regulatory evidence and remediation."
-            ),
-            branch_theme=branch_theme_label,
-            explainability=explain(
-                reason=(
-                    "Without a named accountable owner the control cannot be operated, audited or "
-                    "remediated — this is the second-highest predictor of regulatory readiness."
-                ),
-                expected_evidence=(
-                    "RACI entry, role assignment in the policy, signed attestation or governance "
-                    "minute referencing the owner."
-                ),
-            ),
-        ),
-        Question(
-            question_id=qid_evidence,
-            area=pair.area,
-            function=pair.function,
-            question_type="Multi Select",
-            question=(
-                f"What evidence can {pair.function} show today for "
-                f"{pair.area}?"
-            ),
-            options=DEFAULT_OPTIONS["evidence"],
-            mapped_requirement_ids=req_ids,
-            regulatory_basis=pair.regulatory_basis,
-            confidence=clamp_confidence(base_conf - 2),
-            scoring_weight=2,
-            funnel_parent_id=qid_status,
-            trigger_answers=negative_status_triggers,
-            rationale=(
-                "Triggered when implementation status is below 'Fully Implemented'. Validates that "
-                "the answer can be evidenced through policies, workflow records, dashboards, audit "
-                "trails or contractual artefacts referenced in the acceptance criteria."
-            ),
-            branch_theme=branch_theme_label,
-            explainability=explain(
-                reason=(
-                    "Evidence is the bridge between a control claim and a regulator's inspection — "
-                    "any partial answer must be backed by at least one auditable artefact."
-                ),
-                expected_evidence=evidence,
-            ),
-        ),
-        Question(
-            question_id=qid_risk,
-            area=pair.area,
-            function=pair.function,
-            question_type="Single Select",
-            question=(
-                f"How much risk is still open for "
-                f"{pair.area} / {pair.function}?"
-            ),
-            options=DEFAULT_OPTIONS["risk_level"],
-            mapped_requirement_ids=req_ids,
-            regulatory_basis=pair.regulatory_basis,
-            confidence=clamp_confidence(base_conf - 2),
-            scoring_weight=3,
-            funnel_parent_id=qid_status,
-            trigger_answers=negative_status_triggers + weak_ownership_triggers,
-            rationale=(
-                f"Triggered by Partially / Not Implemented / Unknown status, or by weak ownership. "
-                f"Identifies whether the requirement is still exposed after current controls and "
-                f"evidence. Mapped to {article}."
-            ),
-            branch_theme=branch_theme_label,
-            explainability=explain(
-                reason=(
-                    "Converts an implementation-status gap into a quantified risk signal that feeds "
-                    "the heatmap, Agent 4 prioritisation and the recommendations engine."
-                ),
-                expected_evidence=(
-                    "Risk register entry, risk acceptance memo, scenario analysis or treatment plan."
-                ),
-            ),
-        ),
-        Question(
-            question_id=qid_remediation,
-            area=pair.area,
-            function=pair.function,
-            question_type="Single Select",
-            question=(
-                f"How mature is the remediation plan for "
-                f"{pair.area} / {pair.function}?"
-            ),
-            options=DEFAULT_OPTIONS["maturity"],
-            mapped_requirement_ids=req_ids,
-            regulatory_basis=pair.regulatory_basis,
-            confidence=clamp_confidence(base_conf - 2),
-            scoring_weight=2,
-            funnel_parent_id=qid_risk,
-            trigger_answers=high_risk_triggers,
-            rationale=(
-                "Triggered only when residual risk is Medium, High, Critical or Unknown. Tests "
-                "whether the client has moved from gap identification to a funded and measurable "
-                "remediation plan."
-            ),
-            branch_theme=branch_theme_label,
-            explainability=explain(
-                reason=(
-                    "Without a funded remediation plan the gap stays open at the next inspection — "
-                    "this question tests programme maturity, not just intent."
-                ),
-                expected_evidence=(
-                    "Project plan, funded line in the programme budget, accountable owner and "
-                    "target milestones."
-                ),
-            ),
-        ),
-    ]
-
-    theme_key = theme_key_local
-    if theme_key:
-        text, rationale = _theme_question_text(theme_key, anchor, pair)
-        if text:
-            questions.append(Question(
-                question_id=f"Q-{start_idx + 5:04d}",
-                area=pair.area,
-                function=pair.function,
-                question_type="Single Select",
-                question=text,
-                options=THEME_OPTIONS[theme_key],
-                mapped_requirement_ids=req_ids,
-                regulatory_basis=pair.regulatory_basis,
-                confidence=clamp_confidence(base_conf - 1),
-                scoring_weight=2,
-                funnel_parent_id=qid_status,
-                trigger_answers=negative_status_triggers,
-                rationale=(
-                    f"Theme-specific deep dive ({theme_key.replace('_', ' ')}). {rationale} "
-                    f"Triggered when implementation status is below 'Fully Implemented'."
-                ),
-                branch_theme=branch_theme_label,
-                explainability=explain(
-                    reason=(
-                        f"Theme deep-dive for {theme_label}. {rationale}"
-                    ),
-                    expected_evidence=evidence,
-                ),
-            ))
-
-    return questions
-
-
-_THEME_FREE_TEXT_PROMPTS = {
-    "Incident reporting": (
-        "How does {function} report major incidents on time for {focus}? "
-        "Share any recent close calls."
-    ),
-    "Third-party risk": (
-        "For {focus}, which key vendors support {function}, and what "
-        "contract or exit gaps are still open?"
-    ),
-    "Resilience testing": (
-        "What was the last resilience test {function} ran for {focus}, "
-        "and what is still open?"
-    ),
-    "Security and access": (
-        "Describe the key security controls in place for {function} "
-        "covering {focus}, including known exceptions."
-    ),
-    "Governance": (
-        "Who approved the policy for {focus}, and are any approvals "
-        "still pending in {function}?"
-    ),
-    "Data and evidence": (
-        "For {focus}, how does {function} prove the control works — "
-        "which artefacts and any data gaps?"
-    ),
-    "Reporting": (
-        "How does {function} report on {focus} to leadership, and "
-        "what reporting gaps remain?"
-    ),
-    "ICT risk management": (
-        "How does {function} manage risk for {focus} — accepted risks, "
-        "register entries, and review cycle?"
-    ),
-}
-
-_GENERIC_FREE_TEXT_PROMPTS = [
-    "What are the biggest gaps that could block compliance with {ids}?",
-    "Any assumptions on {ids} that Legal or Compliance should confirm?",
-    "What data, evidence or reporting limits affect scoring for {ids}?",
-    "Any budget, sponsorship or ownership constraints for {ids}?",
-    "Any scope exclusions for {ids} — and why?",
-    "Anything else the reviewer should know about {ids}?",
-]
-
-
-def build_free_text_questions(
-    requirements: Sequence[Requirement],
-    pairs: Sequence[ImpactPair],
-    start_idx: int,
-) -> List[Question]:
-    """Produce theme- and requirement-specific narrative questions.
-
-    Each free-text prompt now references concrete requirement IDs and (where
-    possible) the requirement focus phrase, instead of asking generic
-    ``describe...`` questions. The pair list seeds the function context.
-    """
-    theme_counts = Counter(theme for r in requirements for theme in r.themes)
-    top_themes = [t for t, _ in theme_counts.most_common(len(_THEME_FREE_TEXT_PROMPTS))]
-
-    pair_by_theme: Dict[str, ImpactPair] = {}
-    for pair in pairs:
-        if not pair.requirement_ids:
-            continue
-        pair_reqs = [r for r in requirements if r.normalized_id in pair.requirement_ids]
-        for theme in (t for r in pair_reqs for t in r.themes):
-            pair_by_theme.setdefault(theme, pair)
-
-    questions: List[Question] = []
-    used_prompts: set[str] = set()
-    qid_counter = start_idx
-
-    def append(prompt: str, mapped: List[str], theme: str, function: str) -> None:
-        nonlocal qid_counter
-        key = prompt.lower().strip()
-        if key in used_prompts:
-            return
-        used_prompts.add(key)
-        questions.append(Question(
-            question_id=f"Q-{qid_counter:04d}",
-            area="Free Text / SME Narrative",
-            function=function,
-            question_type="Open Ended",
-            question=prompt,
-            options=["Free text response"],
-            mapped_requirement_ids=mapped,
-            regulatory_basis=theme,
-            confidence=92,
-            scoring_weight=1,
-            funnel_parent_id="",
-            trigger_answers=[],
-            rationale=(
-                "Captures qualitative context, evidence references and SME judgement that the closed-ended "
-                f"questions cannot score. Anchored to mapped requirement(s): {', '.join(mapped)}."
-            ),
-            is_free_text=True,
-        ))
-        qid_counter += 1
-
-    # Theme-anchored prompts, populated from the actual requirement set.
-    for theme in top_themes:
-        template = _THEME_FREE_TEXT_PROMPTS.get(theme)
-        if not template:
-            continue
-        theme_reqs = [r for r in requirements if theme in r.themes][:3]
-        if not theme_reqs:
-            continue
-        anchor = _select_anchor_requirement(theme_reqs) or theme_reqs[0]
-        pair_ctx = pair_by_theme.get(theme)
-        function = pair_ctx.function if pair_ctx else "Cross-functional"
-        focus = _format_req_label(anchor)
-        mapped_ids = [r.normalized_id for r in theme_reqs]
-        prompt = template.format(focus=focus, function=function)
-        append(prompt, mapped_ids, theme, function)
-
-    # Pad with cross-cutting generic prompts that still reference real IDs.
-    rotation = [r.normalized_id for r in requirements[:8]] or ["the mapped requirements"]
-    for i, template in enumerate(_GENERIC_FREE_TEXT_PROMPTS):
-        if len(questions) >= MAX_FREE_TEXT:
-            break
-        ids_subset = rotation[i % len(rotation): i % len(rotation) + 3] or rotation[:3]
-        ids_text = ", ".join(ids_subset)
-        mapped_ids = list(ids_subset)
-        prompt = template.format(ids=ids_text)
-        theme = top_themes[i % len(top_themes)] if top_themes else "General regulatory coverage"
-        append(prompt, mapped_ids, theme, "Cross-functional")
-
-    # Honour the configured minimum count if we have somehow generated fewer.
-    while len(questions) < MIN_FREE_TEXT and len(questions) < MAX_FREE_TEXT:
-        idx = len(questions)
-        template = _GENERIC_FREE_TEXT_PROMPTS[idx % len(_GENERIC_FREE_TEXT_PROMPTS)]
-        ids_subset = rotation[idx % len(rotation): idx % len(rotation) + 3] or rotation[:3]
-        ids_text = ", ".join(ids_subset)
-        append(template.format(ids=ids_text), list(ids_subset), "General regulatory coverage", "Cross-functional")
-
-    return questions[:MAX_FREE_TEXT]
-
 
 # ---------------------------------------------------------------------------
 # Deduplication
@@ -1671,16 +764,225 @@ def generate_question_bank(
     requirements: Sequence[Requirement],
     pairs: Sequence[ImpactPair],
     regulation: str = "DORA",
+    *,
+    obligations: Sequence[Any] = (),
+    rtm_entries: Sequence[Any] = (),
+    impact: Optional[Any] = None,
+    readiness: Optional[Any] = None,
+    client_roles: Sequence[str] = (),
+    client_profile: Optional[Mapping[str, Any]] = None,
+    source_refs_by_item: Optional[Mapping[str, List[Dict[str, Any]]]] = None,
+    client: Optional[Any] = None,
 ) -> List[Question]:
-    questions: List[Question] = []
-    idx = 1
+    """Generate the questionnaire question bank via the AI agent.
+
+    Delegates to :func:`services.ai_questionnaire_generator.generate_ai_questionnaire`.
+    All hardcoded template functions have been removed from this module; the
+    AI agent is the single source of question, option and follow-up content.
+
+    The ``impact`` (Agent 1 :class:`ImpactAssessment`) and ``readiness``
+    (Agent 1 :class:`ReadinessAssessment`) inputs are the two "context
+    lenses" the AI generator uses to (a) target impact-probing questions
+    at the specific affected items and (b) target readiness-probing
+    questions at the client's weakest maturity dimensions.
+
+    When ``client`` is ``None`` the AI generator emits a small set of "manual
+    review required" placeholders (one per top impact pair) so downstream code
+    still receives a valid package — it will NOT fabricate hardcoded questions.
+    """
+    from services.ai_questionnaire_generator import generate_ai_questionnaire
+
     clean_pairs = dedupe_impact_pairs(pairs)
-    for pair in clean_pairs:
-        qs = build_closed_questions_for_pair(pair, requirements, idx, regulation=regulation)
-        questions.extend(qs)
-        idx += len(qs)
-    questions.extend(build_free_text_questions(requirements, clean_pairs, idx))
-    return dedupe_and_resequence_questions(questions)
+    question_dicts = generate_ai_questionnaire(
+        regulation=regulation,
+        requirements=requirements,
+        impact_pairs=clean_pairs,
+        obligations=obligations,
+        rtm_entries=rtm_entries,
+        impact=impact,
+        readiness=readiness,
+        client_roles=client_roles,
+        client_profile=client_profile,
+        source_refs_by_item=source_refs_by_item,
+        client=client,
+    )
+    questions: List[Question] = []
+    for q_dict in question_dicts:
+        try:
+            filtered = {
+                k: v for k, v in q_dict.items()
+                if k in Question.__dataclass_fields__
+            }
+            questions.append(Question(**filtered))
+        except Exception:
+            continue
+    questions = dedupe_and_resequence_questions(questions)
+    # Style diversification: turn suitable questions into Multi Select and
+    # inject quantitative bracket options for Budget / Timeline / Coverage /
+    # Frequency / Team size / SLA wording. Deterministic + idempotent.
+    from services.question_style_enhancer import (
+        diversify_question_styles,
+        sanitize_questions_without_options,
+    )
+    diversify_question_styles(questions)
+    # Never surface a closed question without answerable options - the SME
+    # would just see an empty "— Select an answer —" dropdown. Free-text
+    # style wording is auto-converted to Open Ended, anything else is
+    # dropped. Runs after diversification so we don't accidentally strip
+    # newly-injected quantitative bracket options.
+    questions = sanitize_questions_without_options(questions)
+    questions = dedupe_and_resequence_questions(questions)
+    # Guarantee that every closed L1 question has at least one adaptive
+    # follow-up child. The AI system prompt already requires this, but
+    # LLMs occasionally forget - the deterministic guarantee injects a
+    # synthetic evidence follow-up tied to the option with the lowest
+    # readiness score so the questionnaire always feels adaptive.
+    questions = ensure_funnel_followups(questions)
+    return questions
+
+
+def ensure_funnel_followups(questions: List[Question]) -> List[Question]:
+    """Guarantee every closed L1 question exposes at least one funnel child.
+
+    Rules:
+      * Free-text and child questions are left untouched.
+      * If a closed L1 question already has ``child_question_ids`` populated
+        (via the LLM) it is left untouched.
+      * Otherwise, we pick the option with the lowest ``score_value`` (or
+        the first option when scores are missing), mark it as
+        ``triggers_followup=True`` with a fresh ``followup_question_id``
+        pointing at a new free-text evidence question. The new question
+        is appended to the list, then the whole list is re-numbered so
+        IDs stay contiguous.
+
+    Idempotent: running twice does not add extra follow-ups because the
+    first pass populates ``child_question_ids`` which short-circuits the
+    check on the second pass.
+    """
+    if not questions:
+        return questions
+
+    parents_needing_children: List[Question] = []
+    for q in questions:
+        if q.is_free_text or q.is_child or q.funnel_parent_id:
+            continue
+        if q.child_question_ids:
+            continue
+        # Only closed questions with usable options can spawn a follow-up.
+        opts = q.options or []
+        if not opts:
+            continue
+        parents_needing_children.append(q)
+
+    if not parents_needing_children:
+        return questions
+
+    next_index = len(questions) + 1
+
+    def _option_label(opt: Any) -> str:
+        if isinstance(opt, Mapping):
+            return str(opt.get("label") or opt.get("value") or "").strip()
+        return str(opt or "").strip()
+
+    def _option_score(opt: Any) -> Optional[float]:
+        if isinstance(opt, Mapping):
+            for key in ("score_value", "readiness_score", "score", "value"):
+                v = opt.get(key)
+                if isinstance(v, (int, float)):
+                    return float(v)
+        return None
+
+    for parent in parents_needing_children:
+        opts = list(parent.options or [])
+        # Find the option with the lowest readiness score (weakest state)
+        # so the follow-up probes the biggest gap. If no options carry a
+        # numeric score, fall back to the first option.
+        weak_idx = 0
+        weak_score = float("inf")
+        for i, opt in enumerate(opts):
+            sv = _option_score(opt)
+            if sv is None:
+                continue
+            if sv < weak_score:
+                weak_score = sv
+                weak_idx = i
+        weak_opt = opts[weak_idx]
+        weak_label = _option_label(weak_opt) or "the answer above"
+
+        child_qid = f"Q-{next_index:04d}"
+        next_index += 1
+
+        # Mutate the parent's option (dict shape only) so the UI knows to
+        # branch on this option. Plain-string options get promoted to a
+        # dict in-place.
+        if isinstance(weak_opt, Mapping):
+            weak_opt_dict = dict(weak_opt)
+        else:
+            weak_opt_dict = {"label": str(weak_opt), "score_value": None}
+        weak_opt_dict["triggers_followup"] = True
+        weak_opt_dict["followup_question_id"] = child_qid
+        opts[weak_idx] = weak_opt_dict
+        parent.options = opts
+        parent.child_question_ids = list(parent.child_question_ids or []) + [child_qid]
+        parent.is_parent = True
+
+        # Compose the child evidence question. Deterministic wording so
+        # every follow-up reads consistently.
+        child_question_text = (
+            f"You indicated \"{weak_label}\" for the previous question. "
+            f"Describe the current state, any evidence in place, and the "
+            f"specific gap that would need to close for this to move to a "
+            f"stronger rating."
+        )
+        child_rationale = (
+            f"Adaptive follow-up triggered because the previous answer "
+            f"(\"{weak_label}\") indicates a state that requires more "
+            f"detail to be defensible in an audit."
+        )
+
+        child_explainability = dict(parent.explainability or {})
+        child_explainability["reason"] = child_rationale
+        child_explainability["question_purpose"] = (
+            parent.explainability.get("question_purpose")
+            if isinstance(parent.explainability, Mapping) else "readiness"
+        ) or "readiness"
+
+        child = Question(
+            question_id=child_qid,
+            area=parent.area,
+            function=parent.function,
+            question_type="Open Ended",
+            question=child_question_text,
+            options=[],
+            mapped_requirement_ids=list(parent.mapped_requirement_ids or []),
+            regulatory_basis=parent.regulatory_basis,
+            confidence=max(70, parent.confidence - 10),
+            scoring_weight=max(1, parent.scoring_weight),
+            funnel_parent_id=parent.question_id,
+            trigger_answers=[weak_label],
+            rationale=child_rationale,
+            is_free_text=True,
+            branch_theme=parent.branch_theme or parent.area,
+            source_parent_id=parent.question_id,
+            dynamic_depth=1,
+            explainability=child_explainability,
+            owning_team=parent.owning_team,
+            team_rationale=parent.team_rationale,
+            impact_level=parent.impact_level,
+            impact_reason=parent.impact_reason,
+            impact_severity=parent.impact_severity,
+            impact_weight=parent.impact_weight,
+            plain_language_explainer=parent.plain_language_explainer,
+            evidence_expectations=list(parent.evidence_expectations or []),
+            mapped_obligation_ids=list(parent.mapped_obligation_ids or []),
+            is_child=True,
+            requires_manual_review=False,
+            generated_by_ai=False,
+            priority_rank=parent.priority_rank,
+        )
+        questions.append(child)
+
+    return questions
 
 
 # ---------------------------------------------------------------------------
@@ -2100,9 +1402,43 @@ def package_dict(
 # Top-level orchestrators
 # ---------------------------------------------------------------------------
 
-def _build_package(requirements: List[Requirement], regulation: str) -> Dict[str, Any]:
+def _build_package(
+    requirements: List[Requirement],
+    regulation: str,
+    *,
+    obligations: Sequence[Any] = (),
+    rtm_entries: Sequence[Any] = (),
+    impact: Optional[Any] = None,
+    readiness: Optional[Any] = None,
+    client_roles: Sequence[str] = (),
+    client_profile: Optional[Mapping[str, Any]] = None,
+    source_refs_by_item: Optional[Mapping[str, List[Dict[str, Any]]]] = None,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Assemble a full questionnaire package (AI-driven).
+
+    ``client`` is the optional :class:`~services.genai_service.GenAIClient`.
+    When present the AI generator produces the full question bank; when
+    absent the AI generator emits manual-review placeholders (no
+    hardcoded template questions are used).
+
+    ``impact`` and ``readiness`` are the Agent 1 assessments; when
+    provided the AI generator uses them to (a) target impact-probing
+    questions at the specific affected items and (b) target
+    readiness-probing questions at the weakest maturity dimensions.
+    """
     pairs = dedupe_impact_pairs(derive_impact_pairs(requirements, regulation))
-    questions = generate_question_bank(requirements, pairs, regulation=regulation)
+    questions = generate_question_bank(
+        requirements, pairs, regulation=regulation,
+        obligations=obligations,
+        rtm_entries=rtm_entries,
+        impact=impact,
+        readiness=readiness,
+        client_roles=client_roles,
+        client_profile=client_profile,
+        source_refs_by_item=source_refs_by_item,
+        client=client,
+    )
     overall, metrics = validate_and_score_package(requirements, pairs, questions)
     return package_dict(regulation, requirements, pairs, questions, overall, metrics)
 
@@ -2110,8 +1446,23 @@ def _build_package(requirements: List[Requirement], regulation: str) -> Dict[str
 def build_questionnaire_package(
     source: DocxSource,
     regulation: str = "DORA",
+    *,
+    obligations: Sequence[Any] = (),
+    rtm_entries: Sequence[Any] = (),
+    impact: Optional[Any] = None,
+    readiness: Optional[Any] = None,
+    client_roles: Sequence[str] = (),
+    client_profile: Optional[Mapping[str, Any]] = None,
+    client: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Parse a BRD/FRD DOCX and return the complete questionnaire package."""
+    """Parse a BRD/FRD DOCX and return the complete questionnaire package.
+
+    Optional context (obligations / rtm_entries / impact / readiness /
+    client_roles / client_profile / client) is forwarded to the AI
+    questionnaire agent so the generated questions are scoped to the
+    selected client type and grounded in the live regulatory obligations
+    and Agent 1 impact + readiness assessments.
+    """
     requirements = read_docx_requirements(source)
     if not requirements:
         raise ValueError(
@@ -2119,13 +1470,30 @@ def build_questionnaire_package(
             "the columns: ID, Category, Requirement, Detailed Requirement, DORA Alignment, "
             "Priority, Acceptance Criteria (AI Confidence optional)."
         )
-    return _build_package(requirements, regulation)
+    return _build_package(
+        requirements, regulation,
+        obligations=obligations,
+        rtm_entries=rtm_entries,
+        impact=impact,
+        readiness=readiness,
+        client_roles=client_roles,
+        client_profile=client_profile,
+        client=client,
+    )
 
 
 def build_package_from_report(
     report: Any,
     regulation: str = "DORA",
     source_refs_by_item: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    *,
+    obligations: Sequence[Any] = (),
+    rtm_entries: Sequence[Any] = (),
+    impact: Optional[Any] = None,
+    readiness: Optional[Any] = None,
+    client_roles: Sequence[str] = (),
+    client_profile: Optional[Mapping[str, Any]] = None,
+    client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build a questionnaire package directly from a Phase-4 DoraDetailedBRD model.
 
@@ -2137,11 +1505,28 @@ def build_package_from_report(
     derived from. Pass the ``source_references_by_item`` map carried on
     ``BRDArtifact.metadata`` to enable end-to-end traceability into the
     questionnaire.
+
+    The AI-agent context parameters (``obligations``, ``rtm_entries``,
+    ``impact``, ``readiness``, ``client_roles``, ``client_profile``,
+    ``client``) are forwarded to :mod:`services.ai_questionnaire_generator`
+    so the questions are grounded in the live regulatory analysis, RTM
+    entries, Agent 1 impact + readiness assessments and selected client
+    type.
     """
     requirements = requirements_from_report(report, source_refs_by_item or {})
     if not requirements:
         raise ValueError("Report has no requirements; cannot build questionnaire package.")
-    return _build_package(requirements, regulation)
+    return _build_package(
+        requirements, regulation,
+        obligations=obligations,
+        rtm_entries=rtm_entries,
+        impact=impact,
+        readiness=readiness,
+        client_roles=client_roles,
+        client_profile=client_profile,
+        source_refs_by_item=source_refs_by_item,
+        client=client,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2284,12 +1669,14 @@ def write_excel_from_package(path: str, package: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    # Legacy scoring compatibility (used only when loading pre-AI packages).
     "ANSWER_SCORES",
+    # Impact taxonomies used by regulatory_analysis_agent to bucket
+    # requirements — NOT question templates.
     "AREA_KEYWORDS",
-    "CONFIDENCE_FLOOR",
-    "DEFAULT_OPTIONS",
-    "EXPLAINABILITY_REQUIRED_KEYS",
     "FUNCTION_KEYWORDS",
+    "CONFIDENCE_FLOOR",
+    "EXPLAINABILITY_REQUIRED_KEYS",
     "ImpactPair",
     "option_label",
     "option_labels",
@@ -2302,14 +1689,13 @@ __all__ = [
     "Question",
     "REGULATORY_TAXONOMY",
     "Requirement",
-    "build_closed_questions_for_pair",
-    "build_free_text_questions",
     "build_package_from_report",
     "build_questionnaire_package",
     "clamp_confidence",
     "dedupe_and_resequence_questions",
     "dedupe_impact_pairs",
     "derive_impact_pairs",
+    "ensure_funnel_followups",
     "evaluate_responses",
     "generate_question_bank",
     "impacted_labels_for_requirement",
@@ -2320,7 +1706,6 @@ __all__ = [
     "regulatory_basis_for",
     "requirements_from_report",
     "score_keywords",
-    "select_option_family",
     "validate_and_score_package",
     "write_excel",
     "write_excel_from_package",

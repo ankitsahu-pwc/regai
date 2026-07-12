@@ -52,7 +52,25 @@ from services.brd_frd_generator import (
     build_brd_frd_report,
     calculate_overall_confidence,
 )
+from services.client_profile import (
+    client_profile_context_text,
+    is_client_profile_populated,
+    normalize_client_profile,
+)
+from services.client_roles import (
+    APPLICABILITY_APPLICABLE,
+    APPLICABILITY_NOT_APPLICABLE,
+    APPLICABILITY_PARTIAL,
+    APPLICABILITY_UNCERTAIN,
+    RoleApplicability,
+    RoleAwareInterpretation,
+    build_role_aware_interpretation,
+    derive_role_applicability,
+    get_institution_type,
+    normalize_client_roles,
+)
 from services.genai_service import GenAIClient
+from services.obligation_verb import classify_verb_from_sources
 from services.regulatory_intelligence_service import RegulatoryIntelligencePackage
 from services.source_traceability import control_key, requirement_key
 from services.questionnaire_generator import (
@@ -91,6 +109,8 @@ class RegulatoryAnalysisAgent:
         consulting_selection: Optional[Sequence[str]] = None,
         include_consulting_guidance: bool = True,
         intelligence_package: Optional[RegulatoryIntelligencePackage] = None,
+        client_roles: Optional[Sequence[str]] = None,
+        client_profile: Optional[Dict[str, Any]] = None,
     ) -> RegulatoryAnalysis:
         """Produce a :class:`RegulatoryAnalysis` for the supplied input.
 
@@ -121,7 +141,24 @@ class RegulatoryAnalysisAgent:
             Optional pre-built :class:`RegulatoryIntelligencePackage` reused
             from a previous call (e.g. when the UI previewed sources on Page 1
             and we don't want to double-query the network).
+        client_roles
+            Institution types the analysis should be scoped to (e.g.
+            ``["Commercial Bank", "Broker Dealer (Small)"]``). Drives the
+            Client Role-Aware Regulatory Interpretation: obligations are
+            tagged with per-role applicability, and out-of-scope items are
+            marked so downstream agents can filter accordingly. Empty list =
+            generic (pre-role-aware) analysis.
+        client_profile
+            Optional keyword profile collected on Page 1 (organization
+            profile, business lines, products in scope, countries of
+            operation, legal entities, vendor & third parties). Each value
+            is a list of keywords (curated + free-form). The keywords are
+            appended to the interpretation engine's context corpus and
+            prepended to the BRD LLM prompt so the generated content is
+            scoped to the profile, not to a generic FS baseline.
         """
+        roles = normalize_client_roles(client_roles) if client_roles else []
+        profile = normalize_client_profile(client_profile) if client_profile else {}
         extra_context = parsed_document.text if parsed_document and not parsed_document.is_empty else None
         report, metadata = build_brd_frd_report(
             regulation=regulation,
@@ -133,21 +170,174 @@ class RegulatoryAnalysisAgent:
             consulting_selection=consulting_selection,
             include_consulting_guidance=include_consulting_guidance,
             intelligence_package=intelligence_package,
+            client_roles=roles,
+            client_profile=profile,
         )
 
         source_refs_map: Dict[str, List[Dict[str, Any]]] = (
             metadata.get("source_references_by_item") or {}
         )
         obligations = self._extract_obligations(report, source_refs_map)
+
+        regulation_context = self._build_regulation_context(
+            metadata=metadata,
+            extra_context=extra_context,
+        )
+        # Splice the Client Profile keywords into the corpus the
+        # deterministic interpretation engine reads. That way profile
+        # keywords count as regulatory-surface signal when the engine
+        # scores per-role applicability — a Digital Bank profile with
+        # ``Cloud Service Provider`` in Vendor & Third Parties will
+        # correctly bias obligations touching cloud outsourcing.
+        profile_context = client_profile_context_text(profile) if profile else ""
+        if profile_context:
+            regulation_context = (
+                f"{regulation_context}\n\n--- Client Profile Keywords ---\n"
+                f"{profile_context}"
+            )
+
+        interpretation = build_role_aware_interpretation(
+            regulation=regulation,
+            client_roles=roles,
+            regulation_context=regulation_context,
+            obligations=obligations,
+        )
+
+        # Tag each obligation with the per-role applicability record so
+        # downstream agents (BRD, RTM, questionnaire, recommendations) never
+        # need to reinterpret the regulation. This mutates obligations in
+        # place; interpretation.per_obligation_applicability keeps the same
+        # RoleApplicability records for the exported bundle.
+        for obligation in obligations:
+            rows = interpretation.per_obligation_applicability.get(
+                obligation.obligation_id, []
+            )
+            self._tag_obligation_with_roles(obligation, rows, roles=roles)
+
         themes = sorted({o.theme for o in obligations})
         areas = sorted({o.impacted_area for o in obligations})
 
-        summary = (
-            f"Regulatory analysis for {regulation} ({tier}) produced "
-            f"{len(obligations)} obligations across {len(areas)} impacted areas "
-            f"and {len(themes)} obligation themes. Overall BRD coverage confidence "
-            f"is {calculate_overall_confidence(report)}."
+        if roles:
+            in_scope_count = sum(
+                1 for o in obligations if o.is_applicable_for(roles)
+            )
+            role_label = ", ".join(roles)
+            summary = (
+                f"Client role-aware regulatory analysis of {regulation} "
+                f"({tier}) for {role_label}: {in_scope_count} of "
+                f"{len(obligations)} obligations are in scope for the "
+                f"selected institution type(s), across {len(areas)} impacted "
+                f"areas and {len(themes)} obligation themes. Overall BRD "
+                f"coverage confidence is {calculate_overall_confidence(report)}."
+            )
+        else:
+            summary = (
+                f"Regulatory analysis for {regulation} ({tier}) produced "
+                f"{len(obligations)} obligations across {len(areas)} impacted areas "
+                f"and {len(themes)} obligation themes. Overall BRD coverage confidence "
+                f"is {calculate_overall_confidence(report)}. "
+                f"No client role was selected — the output is generic; select an "
+                f"institution type on Page 1 to enable role-aware interpretation."
+            )
+
+        # ------------------------------------------------------------------
+        # Guardrail sweep across every obligation. This is a *deterministic*
+        # post-hoc pass — no additional LLM calls — that:
+        #
+        # * scrubs any AI meta-leakage the model may have slipped into the
+        #   BRD requirement text before it was carried onto the obligation
+        #   ("As an AI language model…", "OpenAI", etc.);
+        # * replaces citations (Article / RTS / Chapter / …) that do NOT
+        #   appear anywhere in the regulation corpus with the standard
+        #   "[citation not verified against source]" marker so the
+        #   downstream artefacts (BRD, RTM, questionnaire) never silently
+        #   propagate a fabricated reference;
+        # * flags mentions of institution types that are NOT in the
+        #   selected client-role list, so silent scope expansion is
+        #   visible on the audit trail; and
+        # * flags off-scope regulation names (a DORA run referencing MiFID
+        #   II applicability, etc.).
+        #
+        # The aggregated report is attached to the analysis metadata so
+        # the Streamlit UI can render the anti-hallucination audit trail
+        # on Page 2 next to the Regulatory Analysis.
+        # ------------------------------------------------------------------
+        from services.guardrails import (
+            CitationValidator, GuardrailReport, RegulationScopeValidator,
+            RoleScopeValidator, apply_text_guardrails,
         )
+
+        agent_report = GuardrailReport(component="regulatory_analysis_agent")
+        citation_v = CitationValidator(regulation_context, regulation=regulation)
+        regulation_v = RegulationScopeValidator(regulation)
+        role_v = RoleScopeValidator(roles) if roles else None
+
+        for obligation in obligations:
+            prefix = f"obligation[{obligation.obligation_id}]."
+            for attr in (
+                "title", "theme", "compliance_requirement", "regulatory_basis",
+                "risk_implication", "role_interpretation",
+            ):
+                value = getattr(obligation, attr, None)
+                if isinstance(value, str) and value:
+                    new_value = apply_text_guardrails(
+                        value, field_path=prefix + attr,
+                        report=agent_report,
+                        citation_validator=citation_v,
+                        regulation_validator=regulation_v,
+                        role_validator=role_v,
+                    )
+                    if new_value != value:
+                        try:
+                            setattr(obligation, attr, new_value)
+                        except Exception:
+                            pass
+            for list_attr in ("control_expectations", "evidence_needs"):
+                items = getattr(obligation, list_attr, None) or []
+                new_items: List[str] = []
+                for idx, item in enumerate(items):
+                    if isinstance(item, str) and item:
+                        new_items.append(apply_text_guardrails(
+                            item, field_path=f"{prefix}{list_attr}[{idx}]",
+                            report=agent_report,
+                            citation_validator=citation_v,
+                            regulation_validator=regulation_v,
+                            role_validator=role_v,
+                        ))
+                    else:
+                        new_items.append(item)
+                try:
+                    setattr(obligation, list_attr, new_items)
+                except Exception:
+                    pass
+
+        # Persist client roles + profile + interpretation on the analysis
+        # metadata so exports and persistence pick them up automatically.
+        metadata_with_roles = dict(metadata)
+        metadata_with_roles["client_roles"] = list(roles)
+        metadata_with_roles["client_profile"] = dict(profile)
+        metadata_with_roles["role_interpretation"] = interpretation.to_dict()
+        # Merge the agent-level guardrail sweep into the BRD-level
+        # guardrail bundle so the UI has a single place to look.
+        agent_report_dict = agent_report.to_dict()
+        existing = dict(metadata_with_roles.get("guardrails") or {})
+        existing.setdefault("reports", [])
+        existing["reports"] = list(existing["reports"]) + [agent_report_dict]
+        totals = dict(existing.get("totals") or {})
+        totals["citations_verified"] = int(totals.get("citations_verified", 0)) + agent_report.citations_verified
+        totals["citations_flagged"] = int(totals.get("citations_flagged", 0)) + agent_report.citations_flagged
+        totals["meta_leaks_scrubbed"] = int(totals.get("meta_leaks_scrubbed", 0)) + agent_report.meta_leaks_scrubbed
+        totals.setdefault("off_scope_regulations", [])
+        totals["off_scope_regulations"] = sorted(set(
+            list(totals["off_scope_regulations"]) + list(agent_report.off_scope_regulations)
+        ))
+        totals.setdefault("off_scope_roles", [])
+        totals["off_scope_roles"] = sorted(set(
+            list(totals["off_scope_roles"]) + list(agent_report.off_scope_roles)
+        ))
+        totals["bundles_run"] = int(totals.get("bundles_run", 0)) + 1
+        existing["totals"] = totals
+        metadata_with_roles["guardrails"] = existing
 
         return RegulatoryAnalysis(
             regulation=regulation,
@@ -157,9 +347,93 @@ class RegulatoryAnalysisAgent:
             obligation_themes=themes,
             obligations=obligations,
             used_genai=bool(metadata.get("used_genai_shared_service")),
-            metadata=metadata,
+            metadata=metadata_with_roles,
             brd_report=report,
+            client_roles=list(roles),
+            role_interpretation=interpretation.to_dict(),
+            client_profile=dict(profile),
         )
+
+    # ------------------------------------------------------------------
+    # Role-aware helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_regulation_context(
+        *,
+        metadata: Dict[str, Any],
+        extra_context: Optional[str],
+    ) -> str:
+        """Assemble a text corpus the interpretation engine can scan for
+        role-specific keywords.
+
+        Combines:
+          * the uploaded regulation text (when provided);
+          * every retrieved regulator publication snippet / title; and
+          * the BRD's source-references catalogue titles.
+
+        The engine only *reads* this string — it does not send it to a
+        third-party service.
+        """
+        chunks: List[str] = []
+        if extra_context:
+            chunks.append(extra_context)
+        for row in metadata.get("all_sources_ranked") or []:
+            chunks.append(str(row.get("title") or ""))
+            chunks.append(str(row.get("snippet") or ""))
+        for row in metadata.get("source_references_catalogue") or []:
+            chunks.append(str(row.get("title") or ""))
+            chunks.append(str(row.get("regulation_reference") or ""))
+        for row in metadata.get("official_sources") or []:
+            chunks.append(str(row.get("title") or ""))
+            chunks.append(str(row.get("snippet") or ""))
+        return " \n".join(c for c in chunks if c)
+
+    @staticmethod
+    def _tag_obligation_with_roles(
+        obligation: Obligation,
+        rows: Sequence[RoleApplicability],
+        *,
+        roles: Sequence[str],
+    ) -> None:
+        """Populate the client-role fields on ``obligation`` in place.
+
+        ``rows`` is the ordered list of
+        :class:`~services.client_roles.RoleApplicability` records produced by
+        :func:`build_role_aware_interpretation`. When no roles were selected
+        the fields are left empty and downstream agents fall back to their
+        pre-role-aware behaviour.
+        """
+        if not rows and not roles:
+            return
+
+        role_applicability: List[Dict[str, Any]] = []
+        applicable: List[str] = []
+        partial: List[str] = []
+        not_applicable: List[str] = []
+        uncertain: List[str] = []
+        interpretation_bits: List[str] = []
+
+        for row in rows:
+            role_applicability.append(row.to_dict())
+            if row.applicability == APPLICABILITY_APPLICABLE:
+                applicable.append(row.role)
+            elif row.applicability == APPLICABILITY_PARTIAL:
+                partial.append(row.role)
+            elif row.applicability == APPLICABILITY_NOT_APPLICABLE:
+                not_applicable.append(row.role)
+            else:
+                uncertain.append(row.role)
+            interpretation_bits.append(
+                f"{row.role}: {row.applicability} — {row.rationale}"
+            )
+
+        obligation.applicable_roles = applicable
+        obligation.partial_roles = partial
+        obligation.not_applicable_roles = not_applicable
+        obligation.uncertain_roles = uncertain
+        obligation.role_applicability = role_applicability
+        obligation.role_interpretation = "\n".join(interpretation_bits)
 
     # ------------------------------------------------------------------
     # Obligation extraction (deterministic)
@@ -198,6 +472,12 @@ class RegulatoryAnalysisAgent:
             # keyed on.
             sources = list(source_refs_map.get(requirement_key(req.source_id), []))
 
+            obligation_verb = classify_verb_from_sources((
+                req.requirement,
+                req.detail,
+                req.alignment,
+            ))
+
             obligations.append(Obligation(
                 obligation_id=f"OBL-{seq:03d}",
                 title=req.requirement or req.category or req.normalized_id,
@@ -212,6 +492,7 @@ class RegulatoryAnalysisAgent:
                 source_requirement_id=req.normalized_id,
                 regulatory_basis=req.alignment or req.source_section,
                 priority=req.priority or "Should",
+                obligation_verb=obligation_verb,
                 confidence=int(req.confidence or 92),
                 source_references=sources,
             ))
@@ -324,6 +605,10 @@ def _obligation_from_checkpoint(
     sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Obligation:
     theme = f"Control: {cp.stage}"
+    obligation_verb = classify_verb_from_sources((
+        cp.requirement,
+        cp.control_checkpoint,
+    )) or "Must"
     return Obligation(
         obligation_id=f"OBL-{seq:03d}",
         title=cp.control_checkpoint,
@@ -341,6 +626,7 @@ def _obligation_from_checkpoint(
         source_requirement_id=f"CTRL-{cp.stage[:3].upper()}-{seq:03d}",
         regulatory_basis=f"Control framework / {cp.stage}",
         priority="Must",
+        obligation_verb=obligation_verb,
         confidence=95,
         source_references=list(sources or []),
     )

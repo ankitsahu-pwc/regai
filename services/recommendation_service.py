@@ -17,6 +17,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .owner_registry import owner_for as _suggested_owner
 from .scoring_engine import cxo_status
 
 # ---------------------------------------------------------------------------
@@ -73,31 +74,6 @@ _SEVERITY_HORIZON = {
     "Watch": "Medium-term (90-180 days)",
     "Ready": "Steady-state (periodic)",
 }
-
-# Suggested owner is a heuristic mapping derived from the impacted function.
-# Falls back to "Compliance / Programme Owner" if no match.
-_OWNER_BY_FUNCTION = {
-    "Execution / Client Activity": "Front Office / Business Owner",
-    "Risk Management": "Chief Risk Officer",
-    "Compliance & Legal": "Chief Compliance Officer",
-    "Technology / IT Operations": "Chief Technology Officer",
-    "Cyber Security": "Chief Information Security Officer",
-    "Business Continuity / Resilience": "Business Continuity Manager",
-    "Incident Management": "ICT Incident Response Lead",
-    "Vendor / Third-Party Management": "Head of Vendor / Third-Party Risk",
-    "Data Governance / Reporting": "Chief Data Officer",
-    "Internal Audit / Assurance": "Head of Internal Audit",
-    "Operations / Settlement": "Head of Operations",
-    "Programme Management": "DORA Programme Manager",
-    "Human Resources / Training": "Head of HR / Talent",
-}
-
-
-def _suggested_owner(function: Optional[str]) -> str:
-    if not function:
-        return "Compliance / Programme Owner"
-    return _OWNER_BY_FUNCTION.get(function, "Compliance / Programme Owner")
-
 
 # ---------------------------------------------------------------------------
 # Rationale templates
@@ -328,6 +304,46 @@ def recommendations_to_dicts(recs: Sequence[Recommendation]) -> List[Dict[str, A
 # Optional GenAI augmentation hook
 # ---------------------------------------------------------------------------
 
+# Pydantic payload used by :func:`enrich_recommendations_with_genai`.
+# Defining it at module scope (rather than inside the function) so the
+# schema class survives Streamlit's hot-reload reference-equality checks
+# and so we can share the same payload across every enrichment call in a
+# batch.
+try:
+    from pydantic import BaseModel, Field
+
+    class _ActionRewritePayload(BaseModel):  # type: ignore[misc]
+        """Structured output for a GenAI-driven recommendation rewrite.
+
+        The whole point of using a Pydantic schema (rather than free-form
+        text) here is that the LangChain structured-output wrapper will
+        REJECT any response that doesn't populate ``suggested_action``
+        with a string. That eliminates the two failure modes of the
+        original free-form call:
+
+        1. Empty / off-topic responses (the model apologised, refused,
+           or returned meta-language) → schema violation → we fall back
+           to the deterministic action.
+        2. Half-formed JSON, code fences, prose around the payload →
+           schema violation → same graceful fallback.
+
+        Combined with :func:`services.guardrails.safe_generate`, this
+        moves the rewrite from "highest risk" to the same tier as every
+        other structured LLM call in the codebase.
+        """
+
+        suggested_action: str = Field(
+            description=(
+                "One concise paragraph (60-100 words), formal business "
+                "English, that preserves the exact intent of the input "
+                "action. Do not invent new evidence, owners, deadlines "
+                "or regulatory citations. Do not use AI meta-language."
+            ),
+        )
+except ImportError:  # pragma: no cover - pydantic is a project-wide dep
+    _ActionRewritePayload = None  # type: ignore[assignment]
+
+
 def enrich_recommendations_with_genai(
     recommendations: Sequence[Recommendation],
     package: Mapping[str, Any],
@@ -336,50 +352,72 @@ def enrich_recommendations_with_genai(
 ) -> List[Recommendation]:
     """Optionally re-write each recommendation's ``suggested_action`` using GenAI.
 
-    If ``client`` is None or unavailable, the recommendations are returned
-    unchanged. The Streamlit UI can call this when ``GenAIClient.try_create()``
-    returned a valid client; otherwise it simply skips this step.
+    Every rewrite is now a **structured** LLM call: the model must
+    populate the ``_ActionRewritePayload`` schema (a single Pydantic
+    string field). This eliminates the "unstructured output" risk that
+    the previous free-form :class:`ChatPromptTemplate` chain carried —
+    schema-invalid responses are rejected outright, and the wrapper
+    :func:`services.guardrails.safe_generate` applies the full text
+    guardrail stack on the way out (meta-leakage scrub, citation
+    validation, scope validation, speculation / URL / numeric checks).
 
-    Kept intentionally minimal in the MVP: the prompt asks the model to produce
-    a one-paragraph, audit-ready phrasing of the existing action.
+    Contract:
+
+    * ``client`` is ``None`` or ``_ActionRewritePayload`` isn't
+      importable → recommendations are returned unchanged (deterministic
+      baseline retained).
+    * The LLM call succeeds AND the guardrails accept the payload → the
+      original ``suggested_action`` is replaced.
+    * The LLM call fails OR the guardrails reject the payload (empty
+      response, meta-leakage, invented citation etc.) → the original
+      deterministic action is kept.
     """
     if client is None or not recommendations:
         return list(recommendations)
-
-    # Import here to avoid a hard dependency on langchain at module-import time
-    # for callers that only need the deterministic baseline.
-    try:
-        from langchain_core.prompts import ChatPromptTemplate
-    except ImportError:
+    if _ActionRewritePayload is None:  # pragma: no cover - pydantic missing
         return list(recommendations)
 
-    template = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            "You are a regulatory compliance advisor. Rewrite the supplied action as one concise paragraph "
-            "(60-100 words) in formal business English. Do not invent new evidence, owners, or deadlines. "
-            "Preserve the original intent."
-        ),
-        ("user", "Severity: {severity}\nArea: {area}\nFunction: {function}\nCurrent action: {action}\n"),
-    ])
+    from .guardrails import safe_generate
+
+    regulation = str((package or {}).get("regulation") or "") or None
+
     enriched: List[Recommendation] = []
     for rec in recommendations:
-        try:
-            chain = template | client.llm
-            response = chain.invoke(
-                {
-                    "severity": rec.severity,
-                    "area": rec.area or "(unspecified)",
-                    "function": rec.function or "(unspecified)",
-                    "action": rec.suggested_action,
-                }
-            )
-            text = getattr(response, "content", None) or str(response)
-            if text and text.strip():
-                rec.suggested_action = text.strip()
-        except Exception:
-            # Fail soft — keep the deterministic action.
-            pass
+        instruction = (
+            "You are a regulatory compliance advisor. Rewrite the "
+            "supplied action as one concise paragraph (60-100 words) "
+            "in formal business English. Do NOT invent new evidence, "
+            "owners, deadlines or regulatory citations. Preserve the "
+            "original intent. Return only the rewritten action in the "
+            "'suggested_action' field."
+        )
+        context = (
+            f"Severity: {rec.severity}\n"
+            f"Area: {rec.area or '(unspecified)'}\n"
+            f"Function: {rec.function or '(unspecified)'}\n"
+            f"Current action: {rec.suggested_action}\n"
+        )
+        payload, report = safe_generate(
+            client,
+            _ActionRewritePayload,
+            f"Recommendation rewrite: {rec.area or rec.recommendation_id}",
+            instruction,
+            context,
+            regulation=regulation,
+            # No source corpus here — the rewrite is bounded to the
+            # existing deterministic action string, not to the source
+            # regulation text. Citation-ratio enforcement is disabled
+            # accordingly (min_citation_ratio=0) so a well-formed
+            # rewrite that happens to name-check an in-scope Article
+            # isn't rejected because the corpus is empty.
+            source_corpus="",
+            text_fields=("suggested_action",),
+            min_citation_ratio=0.0,
+        )
+        if payload is not None and report.ok:
+            rewritten = str(payload.suggested_action or "").strip()
+            if rewritten:
+                rec.suggested_action = rewritten
         enriched.append(rec)
     return enriched
 

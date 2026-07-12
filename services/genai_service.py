@@ -272,17 +272,56 @@ def create_configured_llm(
 
 
 _DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are a principal regulatory compliance architect, DORA SME, and senior business analyst. "
-    "Generate consulting-grade BRD/FRD content for a regulated financial services company.\n\n"
-    "Important output rules:\n"
-    "- Return valid structured output only.\n"
-    "- Be detailed, practical, and implementation-oriented.\n"
+    "You are a principal regulatory compliance architect and senior business analyst "
+    "authoring consulting-grade BRD / FRD / RTM artefacts for a regulated financial "
+    "services company. Work strictly within the current regulation in scope; do not "
+    "invent references to other frameworks.\n\n"
+    "Frameworks you MUST follow when structuring output:\n"
+    "- IIBA BABOK v3 (Business Analysis Body of Knowledge) for BRD structure: "
+    "business need, scope, in-scope / out-of-scope, stakeholders, assumptions, "
+    "constraints, dependencies, risks, business requirements, acceptance criteria, "
+    "success measures, and traceability.\n"
+    "- IREB CPRE (Certified Professional for Requirements Engineering) for FRD "
+    "requirement quality: each requirement must be atomic, unambiguous, testable, "
+    "prioritised (MoSCoW), traced to a source, and free of implementation bias.\n"
+    "- SDLC discipline for RTM entries: every requirement traces to (a) a "
+    "regulatory clause, (b) a business capability / function, (c) an assessment "
+    "question, (d) a recommendation, and (e) supporting evidence.\n\n"
+    "Every BRD MUST include, as first-class sections, the following BABOK "
+    "artefacts (do not omit or merge them):\n"
+    "  1. Prerequisites / preconditions\n"
+    "  2. In-scope and out-of-scope\n"
+    "  3. Assumptions\n"
+    "  4. Dependencies\n"
+    "  5. Risks (with impact and likelihood)\n"
+    "  6. Controls (preventive / detective / corrective / governance)\n"
+    "  7. Recommendations\n"
+    "  8. Success criteria / acceptance criteria\n\n"
+    "Output rules:\n"
+    "- Return valid structured output only (matching the requested schema).\n"
+    "- Be detailed, practical, and implementation-oriented; never speculative.\n"
     "- Keep the response bounded; do not over-generate.\n"
     "- Use formal business English.\n"
-    "- Apply Tier-2 proportionality: detailed but not over-engineered.\n"
-    "- Include diagnostic cockpit concepts where relevant: data ingestion, mapping, rules, "
-    "exceptions, dashboards, evidence, controls, workflow, and traceability."
+    "- Apply proportionality (Tier-1 / Tier-2 / Tier-3) as directed: detailed "
+    "but not over-engineered.\n"
+    "- Include diagnostic cockpit concepts where relevant: data ingestion, "
+    "mapping, rules, exceptions, dashboards, evidence, controls, workflow, and "
+    "traceability."
 )
+
+
+def _harden(text: str) -> str:
+    """Prepend the shared anti-hallucination directive to a prompt string.
+
+    Deferred / local import of :mod:`services.guardrails` so we avoid a
+    circular import at module load time (guardrails imports the default
+    system instruction for its own ``safe_generate`` wrapper).
+    """
+    try:
+        from .guardrails import harden_instruction
+    except Exception:  # pragma: no cover - defensive
+        return text
+    return harden_instruction(text or "")
 
 
 def generate_structured_component(
@@ -293,12 +332,25 @@ def generate_structured_component(
     context: str,
     system_instruction: str = _DEFAULT_SYSTEM_INSTRUCTION,
 ) -> Any:
-    """Invoke the LLM once for a single Pydantic schema slice (token-optimised)."""
+    """Invoke the LLM once for a single Pydantic schema slice (token-optimised).
+
+    Every call passes through the shared anti-hallucination guardrails in
+    :mod:`services.guardrails`. Both the system prompt AND the component
+    instruction are hardened before dispatch — so every existing caller
+    in the codebase is automatically protected without any signature
+    change. Callers that need the *stronger* post-hoc validation
+    (citation checking, regulation-scope validation, role-scope
+    validation) should use :func:`services.guardrails.safe_generate`
+    instead.
+    """
     structured_llm = llm.with_structured_output(schema_model)
+
+    system_prompt = _harden(system_instruction)
+    hardened_component = _harden(component_instruction)
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", system_instruction),
+            ("system", system_prompt),
             (
                 "user",
                 "Component to generate:\n{component_name}\n\n"
@@ -311,7 +363,7 @@ def generate_structured_component(
     return chain.invoke(
         {
             "component_name": component_name,
-            "component_instruction": component_instruction,
+            "component_instruction": hardened_component,
             "context": context,
         }
     )
@@ -371,12 +423,34 @@ class GenAIClient:
         component_instruction: str,
         context: str,
         system_instruction: str = _DEFAULT_SYSTEM_INSTRUCTION,
+        *,
+        regulation: Optional[str] = None,
+        client_roles: Optional[Any] = None,
     ) -> Any:
+        """Invoke the LLM with anti-hallucination guardrails applied.
+
+        The optional ``regulation`` and ``client_roles`` arguments let the
+        caller specialise the shared guardrail directive with the current
+        scope so the LLM knows exactly which regulation to stay inside and
+        which institution types to consider. Callers can also skip these
+        arguments — the generic (unspecialised) directive still applies.
+        """
+        component_hardened = component_instruction
+        if regulation or client_roles:
+            try:
+                from .guardrails import harden_instruction
+                component_hardened = harden_instruction(
+                    component_instruction or "",
+                    regulation=regulation,
+                    client_roles=list(client_roles) if client_roles else None,
+                )
+            except Exception:  # pragma: no cover
+                component_hardened = component_instruction
         return generate_structured_component(
             self.llm,
             schema_model,
             component_name,
-            component_instruction,
+            component_hardened,
             context[: self.settings.context_chars],
             system_instruction=system_instruction,
         )
@@ -391,6 +465,8 @@ class GenAIClient:
         *,
         max_retry_tokens: int = 12000,
         on_retry: Optional[Any] = None,
+        regulation: Optional[str] = None,
+        client_roles: Optional[Any] = None,
     ) -> Any:
         """Like :meth:`generate`, but retries once with a higher ``max_tokens``
         if the model trips a length-limit error.
@@ -408,6 +484,7 @@ class GenAIClient:
             return self.generate(
                 schema_model, component_name, component_instruction,
                 context, system_instruction,
+                regulation=regulation, client_roles=client_roles,
             )
         except Exception as exc:
             if not _is_length_limit_error(exc):
@@ -426,6 +503,7 @@ class GenAIClient:
                 return self.generate(
                     schema_model, component_name, component_instruction,
                     context, system_instruction,
+                    regulation=regulation, client_roles=client_roles,
                 )
             finally:
                 if original_max is not None:

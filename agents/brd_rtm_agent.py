@@ -62,16 +62,36 @@ class BRDRTMAgent:
 
         Returning a dict (rather than a tuple) keeps the call-site readable
         from the orchestrator and is easy to extend with future artefacts.
+
+        The RTM is filtered and annotated with the Client Role-Aware
+        applicability information carried on each obligation by Agent 1:
+
+        * requirements applicable to at least one selected role become live
+          RTM rows tagged with ``applicable_roles``;
+        * requirements that are explicitly out of scope for **every**
+          selected role are still emitted (per the "explicit out-of-scope"
+          requirement) but flagged with ``out_of_scope=True`` so downstream
+          consumers can skip them at will;
+        * every row carries per-role rationale strings, so exports quote why
+          the requirement matters (or doesn't) for each institution type.
         """
-        brd_artifact = self._wrap_brd(analysis, docx_export_path, tier or analysis.tier)
-        rtm_artifact = self._build_rtm(analysis.obligations, analysis.brd_report)
+        brd_artifact = self._wrap_brd(
+            analysis, docx_export_path, tier or analysis.tier,
+            regulation=analysis.regulation,
+        )
+        rtm_artifact = self._build_rtm(
+            analysis.obligations, analysis.brd_report,
+            client_roles=analysis.client_roles,
+        )
         return {"brd": brd_artifact, "rtm": rtm_artifact}
 
     def build_rtm_only(self, obligations: Sequence[Obligation],
-                       brd_report: Optional[DoraDetailedBRD] = None) -> RTMArtifact:
+                       brd_report: Optional[DoraDetailedBRD] = None,
+                       *,
+                       client_roles: Optional[Sequence[str]] = None) -> RTMArtifact:
         """Build only the RTM. Used by orchestration paths that already hold
         a BRD artefact (for example when re-running scoring on an existing BRD)."""
-        return self._build_rtm(obligations, brd_report)
+        return self._build_rtm(obligations, brd_report, client_roles=client_roles)
 
     # ------------------------------------------------------------------
     # BRD wrapping
@@ -82,6 +102,8 @@ class BRDRTMAgent:
         analysis: RegulatoryAnalysis,
         docx_export_path: Optional[Path],
         tier: str,
+        *,
+        regulation: str = "DORA",
     ) -> BRDArtifact:
         report = analysis.brd_report
         if report is None:
@@ -103,6 +125,7 @@ class BRDRTMAgent:
                     tier=tier,
                     source_references_by_item=source_refs_by_item,
                     source_catalogue=source_catalogue,
+                    regulation=regulation,
                 )
             except Exception:
                 docx_path = None
@@ -121,12 +144,39 @@ class BRDRTMAgent:
     def _build_rtm(
         obligations: Sequence[Obligation],
         brd_report: Optional[DoraDetailedBRD],
+        *,
+        client_roles: Optional[Sequence[str]] = None,
     ) -> RTMArtifact:
         functional_index = _index_functional_requirements(brd_report) if brd_report else {}
+        roles = [r for r in (client_roles or []) if r]
 
         entries: List[RTMEntry] = []
         for idx, obligation in enumerate(obligations, start=1):
             fr_id, fr_text = _pick_functional_requirement(obligation, functional_index)
+
+            # Client Role-Aware annotation. When no roles were selected the
+            # extra fields simply stay empty so the RTM continues to work as
+            # a generic matrix.
+            applicable = [r for r in obligation.applicable_roles if r in roles] if roles else []
+            partial = [r for r in obligation.partial_roles if r in roles] if roles else []
+            uncertain = [r for r in obligation.uncertain_roles if r in roles] if roles else []
+            not_applicable = [r for r in obligation.not_applicable_roles if r in roles] if roles else []
+            in_scope_roles = applicable + partial + uncertain
+            out_of_scope = bool(roles) and not in_scope_roles
+
+            role_rationale: Dict[str, str] = {}
+            for record in obligation.role_applicability or []:
+                role = str(record.get("role") or "")
+                if roles and role not in roles:
+                    continue
+                rationale = str(record.get("rationale") or "")
+                applicability = str(record.get("applicability") or "")
+                if rationale:
+                    role_rationale[role] = f"[{applicability}] {rationale}"
+
+            business_interpretation = _business_interpretation(obligation, applicable + partial)
+            business_justification = _business_justification(obligation, applicable + partial)
+
             entries.append(RTMEntry(
                 traceability_id=f"TR-{idx:04d}",
                 obligation_id=obligation.obligation_id,
@@ -141,16 +191,30 @@ class BRDRTMAgent:
                                   if obligation.evidence_needs else "Evidence to be defined",
                 regulatory_basis=obligation.regulatory_basis,
                 priority=obligation.priority,
+                obligation_verb=getattr(obligation, "obligation_verb", "") or "",
                 # Carry obligation's citations onto the RTM row so exported
                 # JSON/CSV stays self-contained for downstream consumers.
                 source_references=list(getattr(obligation, "source_references", []) or []),
+                applicable_roles=applicable + partial,
+                not_applicable_roles=not_applicable,
+                out_of_scope=out_of_scope,
+                business_interpretation=business_interpretation,
+                business_justification=business_justification,
+                role_rationale=role_rationale,
             ))
 
+        in_scope_entries = [e for e in entries if not e.out_of_scope]
         metadata = {
             "entry_count": len(entries),
-            "covered_functions": sorted({e.impacted_function for e in entries}),
-            "covered_areas": sorted({e.impacted_area for e in entries}),
-            "top_themes": [t for t, _ in Counter(o.theme for o in obligations).most_common(5)],
+            "in_scope_entry_count": len(in_scope_entries),
+            "out_of_scope_entry_count": len(entries) - len(in_scope_entries),
+            "covered_functions": sorted({e.impacted_function for e in in_scope_entries}),
+            "covered_areas": sorted({e.impacted_area for e in in_scope_entries}),
+            "top_themes": [t for t, _ in Counter(
+                o.theme for o in obligations
+                if not roles or o.is_applicable_for(roles)
+            ).most_common(5)],
+            "client_roles": list(roles),
         }
         return RTMArtifact(entries=entries, metadata=metadata)
 
@@ -205,6 +269,38 @@ def _system_process_impact(obligation: Obligation) -> str:
         f"Expected impact spans process, data, and reporting controls aligned to "
         f"{obligation.regulatory_basis or 'the mapped regulation'}."
     )
+
+
+def _business_interpretation(obligation: Obligation, in_scope_roles: Sequence[str]) -> str:
+    """Return a role-aware business interpretation for one RTM row."""
+    if not in_scope_roles:
+        return (
+            f"Interpretation: {obligation.compliance_requirement or obligation.title}. "
+            f"No client role filter was applied; a generic interpretation is used."
+        )
+    role_label = ", ".join(in_scope_roles)
+    return (
+        f"For {role_label}, this obligation drives implementation in the "
+        f"{obligation.impacted_area or 'target'} domain. Interpretation: "
+        f"{obligation.compliance_requirement or obligation.title}."
+    )
+
+
+def _business_justification(obligation: Obligation, in_scope_roles: Sequence[str]) -> str:
+    """Return a role-aware business justification for one RTM row."""
+    if obligation.risk_implication:
+        base = obligation.risk_implication
+    else:
+        base = (
+            f"Failure to comply may expose {obligation.impacted_function or 'the firm'} "
+            f"to regulatory findings against {obligation.regulatory_basis or 'the mapped regulation'}."
+        )
+    if in_scope_roles:
+        return (
+            f"{base} This applies to the selected institution type(s): "
+            f"{', '.join(in_scope_roles)}."
+        )
+    return base
 
 
 __all__ = ["BRDRTMAgent"]

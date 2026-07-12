@@ -26,16 +26,105 @@ Tables
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 DEFAULT_DB_PATH = Path("data") / "app.db"
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pre-persistence guardrail wiring
+# ---------------------------------------------------------------------------
+#
+# Mentor guidance #1: every write path SHOULD pass its payload through the
+# guardrail stack BEFORE INSERT so hallucinated / meta-leaked content
+# never lands in ``data/app.db``. Callers pass ``guardrail_context``
+# (regulation / roles / source_corpus) so the citation and role validators
+# can do their job; when absent we still run meta-leakage scrubbing and
+# speculation detection.
+#
+# The behaviour is controlled by ``APP_PERSIST_GUARDRAIL`` env var:
+#
+# * ``off``    — no guardrail sweep (use for tests / seeding).
+# * ``warn``   — run the sweep; on critical findings, LOG and continue.
+# * ``strict`` — run the sweep; on critical findings, refuse the write.
+#
+# Default is ``warn`` so existing user data continues to load even if it
+# contains legacy strings that would trip a modern validator.
+
+def _persist_guardrail_mode() -> str:
+    """Return the current pre-persistence guardrail mode.
+
+    Mode is read from the ``APP_PERSIST_GUARDRAIL`` env var on every call
+    so tests / operators can flip behaviour without a restart.
+    """
+    return (os.getenv("APP_PERSIST_GUARDRAIL") or "warn").strip().lower()
+
+
+def _run_persist_guardrail(
+    payload: Any,
+    *,
+    component: str,
+    context: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run the pre-persistence guardrail and return its serialised report.
+
+    Returns ``None`` when the mode is ``off``. Otherwise runs the sweep
+    and either raises (``strict`` mode) or logs (``warn`` mode) on
+    critical findings. The returned dict can be embedded inside JSON
+    payloads (``package_json`` / ``evaluation_json``) for later review.
+    """
+    mode = _persist_guardrail_mode()
+    if mode == "off":
+        return None
+
+    try:
+        # Deferred import to avoid a circular import at module load time
+        # (``services.guardrails`` imports from other services that may
+        # transitively touch persistence during rare code paths).
+        from .guardrails import (
+            PersistenceGuardrailError,
+            check_before_persist,
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Could not import guardrails; skipping persistence sweep.")
+        return None
+
+    ctx = dict(context or {})
+    try:
+        report = check_before_persist(
+            payload,
+            component=component,
+            source_corpus=ctx.get("source_corpus"),
+            regulation=ctx.get("regulation"),
+            client_roles=ctx.get("client_roles"),
+            strict=(mode == "strict"),
+        )
+    except PersistenceGuardrailError:
+        # Re-raise so the caller can surface the error to the user.
+        raise
+    except Exception:  # pragma: no cover - defensive; never block writes on a guardrail bug
+        logger.exception(
+            "Pre-persistence guardrail crashed for component=%s; continuing without sweep.",
+            component,
+        )
+        return None
+    if not report.ok:
+        logger.warning(
+            "Pre-persistence guardrail flagged findings for component=%s: %s",
+            component,
+            report.summary(),
+        )
+    return report.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +289,14 @@ def save_document(
     regulation: Optional[str] = None,
     db_path: Optional[os.PathLike[str] | str] = None,
 ) -> int:
+    """Register an uploaded file in the ``documents`` table.
+
+    The document row itself carries only metadata (name, path, size,
+    regulation label) — no LLM-generated text — so we don't run the
+    guardrail sweep here. Guardrails apply to the derived artefacts
+    (requirements, questionnaires, assessments) generated *from* the
+    document, which are written through the other ``save_*`` functions.
+    """
     if kind not in {"regulation", "brd", "frd", "other"}:
         raise ValueError(f"Invalid document kind: {kind!r}")
     with session(db_path) as conn:
@@ -244,12 +341,23 @@ def save_requirements(
     document_id: int,
     requirements: Iterable[Mapping[str, Any]],
     db_path: Optional[os.PathLike[str] | str] = None,
+    guardrail_context: Optional[Mapping[str, Any]] = None,
 ) -> int:
-    """Replace requirement rows for a document. Returns rows inserted."""
+    """Replace requirement rows for a document. Returns rows inserted.
+
+    Runs the pre-persistence guardrail against the incoming requirement
+    list before deleting the old rows so a hallucinated / meta-leaked
+    payload cannot destroy the existing set. Any critical finding in
+    strict mode aborts the write.
+    """
+    requirements_list = list(requirements)
+    _run_persist_guardrail(
+        requirements_list, component="requirements", context=guardrail_context,
+    )
     rows_written = 0
     with session(db_path) as conn:
         conn.execute("DELETE FROM requirements WHERE document_id = ?", (document_id,))
-        for req in requirements:
+        for req in requirements_list:
             conn.execute(
                 """
                 INSERT INTO requirements (document_id, requirement_id, section, description, impacted_areas, impacted_functions)
@@ -300,10 +408,29 @@ def save_questionnaire(
     document_id: Optional[int] = None,
     regulation: Optional[str] = None,
     db_path: Optional[os.PathLike[str] | str] = None,
+    guardrail_context: Optional[Mapping[str, Any]] = None,
 ) -> int:
+    """Persist a questionnaire package after running the pre-persistence guardrail.
+
+    ``guardrail_context`` accepts ``source_corpus`` (concatenated regulation
+    text), ``regulation`` (label — defaults to the argument above), and
+    ``client_roles`` (list of institution types). The guardrail report is
+    embedded inside ``package_json`` under the ``_persistence_guardrail``
+    key so the review-queue page can surface it.
+    """
     meta = dict(package.get("metadata", {})) if isinstance(package.get("metadata"), Mapping) else {}
     questions = list(package.get("questions") or [])
     requirements = list(package.get("requirements") or [])
+
+    ctx = dict(guardrail_context or {})
+    ctx.setdefault("regulation", regulation or meta.get("regulation"))
+    guardrail_dict = _run_persist_guardrail(
+        package, component="questionnaire", context=ctx,
+    )
+    package_to_write = dict(package)
+    if guardrail_dict is not None:
+        package_to_write["_persistence_guardrail"] = guardrail_dict
+
     with session(db_path) as conn:
         cur = conn.execute(
             """
@@ -315,7 +442,7 @@ def save_questionnaire(
                 document_id,
                 regulation or meta.get("regulation"),
                 name,
-                json.dumps(package, ensure_ascii=False),
+                json.dumps(package_to_write, ensure_ascii=False),
                 len(questions),
                 len(requirements),
                 float(meta.get("overall_confidence_pct") or 0.0),
@@ -382,13 +509,50 @@ def update_assessment_snapshot(
     recommendations: Optional[Iterable[Mapping[str, Any]]] = None,
     completed: bool = False,
     db_path: Optional[os.PathLike[str] | str] = None,
+    guardrail_context: Optional[Mapping[str, Any]] = None,
 ) -> None:
+    """Update the snapshot columns on an assessment row.
+
+    Runs the pre-persistence guardrail against ``evaluation`` and
+    ``recommendations`` (whichever are supplied) before writing. Any
+    resulting report is embedded alongside the JSON so the review queue
+    can render it later.
+    """
+    recommendations_list = list(recommendations) if recommendations is not None else None
+
+    guardrail_dicts: List[Dict[str, Any]] = []
+    if evaluation is not None:
+        report_eval = _run_persist_guardrail(
+            _jsonable(evaluation),
+            component="assessment_evaluation",
+            context=guardrail_context,
+        )
+        if report_eval:
+            guardrail_dicts.append(report_eval)
+    if recommendations_list is not None:
+        report_recs = _run_persist_guardrail(
+            [dict(r) for r in recommendations_list],
+            component="assessment_recommendations",
+            context=guardrail_context,
+        )
+        if report_recs:
+            guardrail_dicts.append(report_recs)
+
+    evaluation_to_write = evaluation
+    if evaluation is not None and guardrail_dicts:
+        try:
+            evaluation_to_write = dict(evaluation)
+            evaluation_to_write["_persistence_guardrail"] = guardrail_dicts
+        except Exception:  # pragma: no cover
+            evaluation_to_write = evaluation
+
     eval_json = (
-        json.dumps(_jsonable(evaluation), ensure_ascii=False) if evaluation is not None else None
+        json.dumps(_jsonable(evaluation_to_write), ensure_ascii=False)
+        if evaluation_to_write is not None else None
     )
     recs_json = (
-        json.dumps([dict(r) for r in recommendations], ensure_ascii=False)
-        if recommendations is not None
+        json.dumps([dict(r) for r in recommendations_list], ensure_ascii=False)
+        if recommendations_list is not None
         else None
     )
     compliance = None

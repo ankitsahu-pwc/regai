@@ -1,0 +1,432 @@
+{
+  "$schema": "institution_types.v1",
+  "description": "Canonical catalog of Banking & Capital Markets institution types used by the Client Role-Aware Regulatory Interpretation engine. Restricted to B&CM only - Insurance, Payments-only, Non-bank Consumer Finance and FinTech/RegTech are intentionally out of scope. Every entry drives the multi-select dropdown on Page 1 and the deterministic applicability scoring for the selected regulation. Update this file (or ship an overriding file via the REGAI_INSTITUTION_TYPES_PATH environment variable) to add new institution types WITHOUT touching Python code.",
+  "categories": ["Banking", "Capital Markets"],
+  "institution_types": [
+
+    { "name": "Global Systemically Important Bank (G-SIB)",
+      "category": "Banking",
+      "summary": "Cross-border banking group designated by the FSB as systemically important; subject to the highest capital, resolution and disclosure requirements globally.",
+      "domains": ["capital adequacy", "TLAC", "recovery and resolution", "systemic risk", "cross-border supervision", "operational resilience", "governance", "reporting"],
+      "keywords": ["G-SIB", "global systemically important bank", "FSB", "TLAC", "systemic buffer", "SIFI"],
+      "typical_obligations": ["higher loss absorbency buffer", "TLAC", "recovery and resolution planning", "consolidated supervision", "operational resilience"]
+    },
+
+    { "name": "Domestic Systemically Important Bank (D-SIB)",
+      "category": "Banking",
+      "summary": "Bank designated by its home supervisor as systemically important to the domestic market; subject to elevated buffers and supervisory scrutiny.",
+      "domains": ["capital adequacy", "systemic risk", "recovery and resolution", "operational resilience", "governance", "reporting"],
+      "keywords": ["D-SIB", "domestic systemically important bank", "systemic buffer", "national supervisor"],
+      "typical_obligations": ["additional capital buffer", "recovery and resolution planning", "enhanced supervisory review", "operational resilience"]
+    },
+
+    { "name": "Universal Bank",
+      "category": "Banking",
+      "summary": "Financial group offering both commercial and investment banking services under one licence.",
+      "domains": ["credit risk", "market risk", "capital markets", "AML", "operational resilience", "conduct risk", "governance", "third-party risk"],
+      "keywords": ["universal bank", "financial group", "banking group", "consolidated supervision"],
+      "typical_obligations": ["consolidated supervision", "capital adequacy", "market abuse", "conduct risk", "operational resilience"]
+    },
+
+    { "name": "Commercial Bank",
+      "category": "Banking",
+      "summary": "Deposit-taking institution offering lending, payments, cash management and treasury services to corporate and retail clients.",
+      "domains": ["credit risk", "market risk", "liquidity", "capital adequacy", "AML", "KYC", "payments", "operational resilience", "ICT risk", "third-party risk", "governance", "reporting"],
+      "keywords": ["credit institution", "bank", "deposit", "lending", "loan", "capital adequacy", "CRR", "CRD", "prudential", "liquidity", "LCR", "NSFR", "risk-weighted assets", "supervisory review"],
+      "typical_obligations": ["capital adequacy", "credit risk", "liquidity risk", "market risk", "operational resilience", "governance", "AML/CFT", "large exposures", "recovery and resolution"]
+    },
+
+    { "name": "Retail Bank",
+      "category": "Banking",
+      "summary": "Consumer-focused bank offering accounts, mortgages, cards and personal lending.",
+      "domains": ["consumer protection", "AML", "KYC", "payments", "mortgage lending", "conduct risk", "vulnerable customers", "operational resilience"],
+      "keywords": ["retail bank", "consumer credit", "mortgage", "consumer protection", "vulnerable customer", "payment account", "current account"],
+      "typical_obligations": ["consumer duty", "AML/CFT", "payment services", "operational resilience", "conduct risk"]
+    },
+
+    { "name": "Corporate Bank",
+      "category": "Banking",
+      "summary": "Provides commercial lending, cash management, trade finance and treasury services to corporate clients.",
+      "domains": ["credit risk", "trade finance", "cash management", "corporate lending", "AML", "sanctions"],
+      "keywords": ["corporate bank", "trade finance", "cash management", "corporate lending", "wholesale banking"],
+      "typical_obligations": ["credit risk", "AML/CFT", "sanctions", "large exposures"]
+    },
+
+    { "name": "Wholesale Bank",
+      "category": "Banking",
+      "summary": "Bank whose clients are exclusively financial institutions, corporates and public bodies; no retail deposit-taking.",
+      "domains": ["credit risk", "market risk", "counterparty risk", "large exposures", "wholesale funding", "AML", "operational resilience"],
+      "keywords": ["wholesale bank", "financial institution client", "interbank", "wholesale funding"],
+      "typical_obligations": ["large exposures", "counterparty credit risk", "wholesale conduct", "operational resilience"]
+    },
+
+    { "name": "Private Bank",
+      "category": "Banking",
+      "summary": "High-net-worth wealth management with discretionary and advisory investment services.",
+      "domains": ["wealth management", "suitability", "AML", "KYC", "conflicts of interest", "cross-border", "tax reporting"],
+      "keywords": ["private bank", "high-net-worth", "wealth management", "discretionary mandate", "suitability"],
+      "typical_obligations": ["suitability", "MiFID conduct", "AML/CFT", "cross-border reporting", "product governance"]
+    },
+
+    { "name": "Investment Bank",
+      "category": "Banking",
+      "summary": "Deals in securities, underwriting, M&A advisory, trading and capital markets services for institutional clients.",
+      "domains": ["market risk", "trading book", "capital markets", "underwriting", "securities", "prime brokerage", "conflicts of interest", "market abuse", "best execution", "ICT risk", "operational resilience"],
+      "keywords": ["investment firm", "trading book", "securities", "underwriting", "prime brokerage", "capital markets", "MiFID", "market abuse", "systematic internaliser", "OTF", "MTF"],
+      "typical_obligations": ["market abuse", "best execution", "trade reporting", "prudential requirements for investment firms", "conflicts of interest", "product governance"]
+    },
+
+    { "name": "Digital Bank",
+      "category": "Banking",
+      "summary": "Digital-only bank offering payments, deposits and lending primarily through mobile and web channels.",
+      "domains": ["digital operational resilience", "ICT risk", "cybersecurity", "third-party / cloud", "customer onboarding", "AML/KYC", "consumer protection", "outsourcing"],
+      "keywords": ["digital bank", "mobile-only", "cloud", "API", "e-KYC", "onboarding", "digital identity"],
+      "typical_obligations": ["ICT risk management", "operational resilience", "third-party risk", "cyber incident reporting", "consumer protection", "AML/CFT"]
+    },
+
+    { "name": "Challenger Bank",
+      "category": "Banking",
+      "summary": "New-entrant bank competing with incumbents through digital channels and simpler product ranges.",
+      "domains": ["digital operational resilience", "cybersecurity", "consumer protection", "onboarding", "AML/KYC"],
+      "keywords": ["challenger bank", "new-entrant", "mobile-first"],
+      "typical_obligations": ["operational resilience", "consumer duty", "AML/CFT", "third-party risk"]
+    },
+
+    { "name": "Neo Bank",
+      "category": "Banking",
+      "summary": "Digital-first bank often operating on a partner licence; typically thin-balance-sheet with product distribution focus.",
+      "domains": ["digital operational resilience", "cybersecurity", "third-party / cloud", "onboarding", "AML/KYC", "consumer protection", "outsourcing"],
+      "keywords": ["neo-bank", "neobank", "banking-as-a-service", "BaaS", "partner bank", "app-only"],
+      "typical_obligations": ["operational resilience", "outsourcing controls", "consumer protection", "AML/CFT"]
+    },
+
+    { "name": "Small Finance Bank",
+      "category": "Banking",
+      "summary": "Specialised bank providing basic banking services to under-served or micro / small business segments.",
+      "domains": ["financial inclusion", "priority sector lending", "consumer protection", "AML/KYC"],
+      "keywords": ["small finance bank", "financial inclusion", "priority sector", "microfinance"],
+      "typical_obligations": ["priority sector lending", "financial inclusion", "AML/CFT"]
+    },
+
+    { "name": "Cooperative Bank",
+      "category": "Banking",
+      "summary": "Member-owned bank that mutualises retail / SME banking services.",
+      "domains": ["governance", "member protection", "consumer protection", "AML/KYC", "capital adequacy"],
+      "keywords": ["cooperative bank", "credit cooperative", "member-owned", "mutual bank"],
+      "typical_obligations": ["governance", "capital adequacy", "AML/CFT"]
+    },
+
+    { "name": "Regional Bank",
+      "category": "Banking",
+      "summary": "Bank whose franchise is concentrated in a specific geographic region; typically mid-sized with retail and SME lending.",
+      "domains": ["credit risk", "consumer protection", "AML/KYC", "capital adequacy", "SME lending"],
+      "keywords": ["regional bank", "regional franchise", "SME lending", "community lending"],
+      "typical_obligations": ["capital adequacy", "credit risk", "consumer protection", "AML/CFT"]
+    },
+
+    { "name": "Community Bank",
+      "category": "Banking",
+      "summary": "Small locally-focused bank serving a defined community; deposit-led with relationship-based lending.",
+      "domains": ["deposit protection", "consumer protection", "credit risk", "AML/KYC"],
+      "keywords": ["community bank", "local bank", "relationship banking"],
+      "typical_obligations": ["deposit guarantee", "consumer protection", "AML/CFT", "capital adequacy"]
+    },
+
+    { "name": "Savings Bank",
+      "category": "Banking",
+      "summary": "Institution focused on deposit-taking and low-risk lending, often with a regional or community mandate.",
+      "domains": ["deposit protection", "consumer protection", "AML/KYC", "capital adequacy"],
+      "keywords": ["savings bank", "thrift", "building society"],
+      "typical_obligations": ["deposit guarantee", "consumer protection", "AML/CFT"]
+    },
+
+    { "name": "Foreign Bank Branch",
+      "category": "Banking",
+      "summary": "Branch of a foreign parent bank operating locally under host-country supervision; carries the parent's licence.",
+      "domains": ["home-host supervision", "capital repatriation", "AML/KYC", "operational resilience", "governance"],
+      "keywords": ["foreign bank branch", "branch of foreign bank", "home-host", "cross-border branch"],
+      "typical_obligations": ["home-host supervisory cooperation", "AML/CFT", "operational resilience", "local reporting"]
+    },
+
+    { "name": "Islamic Bank",
+      "category": "Banking",
+      "summary": "Bank operating under Shariah principles; profit-sharing and asset-backed financing instead of interest-based lending.",
+      "domains": ["Shariah governance", "credit risk", "AML/KYC", "consumer protection", "asset-backed financing"],
+      "keywords": ["Islamic bank", "Shariah", "Sukuk", "Murabaha", "Ijara", "AAOIFI", "IFSB"],
+      "typical_obligations": ["Shariah governance", "capital adequacy", "consumer protection", "AML/CFT"]
+    },
+
+    { "name": "Development Bank",
+      "category": "Banking",
+      "summary": "State-owned or multilateral bank providing long-term finance for infrastructure and development objectives.",
+      "domains": ["long-term lending", "public policy mandate", "credit risk", "environmental & social risk", "sanctions"],
+      "keywords": ["development bank", "multilateral development bank", "MDB", "national development bank", "public bank"],
+      "typical_obligations": ["environmental and social risk management", "credit risk", "governance", "sanctions"]
+    },
+
+    { "name": "Central Bank",
+      "category": "Banking",
+      "summary": "State-owned monetary authority: monetary policy, payment systems, financial-stability oversight and banknote issuance.",
+      "domains": ["monetary policy", "financial stability", "payment systems", "settlement", "supervision"],
+      "keywords": ["central bank", "monetary authority", "payment system operator", "settlement", "supervisor"],
+      "typical_obligations": ["financial stability", "systemic risk oversight", "payment system operation"]
+    },
+
+    { "name": "Custodian Bank",
+      "category": "Banking",
+      "summary": "Safekeeps assets on behalf of institutional clients; provides settlement, corporate actions and fund services.",
+      "domains": ["custody", "settlement", "asset segregation", "fund services", "corporate actions"],
+      "keywords": ["custodian bank", "safekeeping", "custody", "asset segregation", "settlement agent"],
+      "typical_obligations": ["asset segregation", "safekeeping", "settlement discipline", "AIFMD/UCITS depositary duties"]
+    },
+
+    { "name": "Correspondent Bank",
+      "category": "Banking",
+      "summary": "Bank providing services (payments, FX, trade finance) to another bank, usually across borders.",
+      "domains": ["cross-border payments", "AML/KYC", "sanctions", "correspondent due diligence"],
+      "keywords": ["correspondent bank", "nostro", "vostro", "SWIFT", "wire transfer", "cross-border payments"],
+      "typical_obligations": ["correspondent banking due diligence", "AML/CFT", "sanctions screening", "wire transfer regulation"]
+    },
+
+    { "name": "Broker Dealer (Small)",
+      "category": "Capital Markets",
+      "summary": "Small broker-dealer executing client orders in securities with limited proprietary trading and simpler operating model.",
+      "domains": ["market conduct", "best execution", "client asset protection", "trade reporting", "AML/KYC"],
+      "keywords": ["broker-dealer", "small investment firm", "class 3 investment firm", "best execution", "trade reporting"],
+      "typical_obligations": ["best execution", "conflicts of interest", "client asset protection", "trade reporting"]
+    },
+
+    { "name": "Broker Dealer (Mid-sized)",
+      "category": "Capital Markets",
+      "summary": "Mid-sized broker-dealer with material trading activity and multiple product lines / venues.",
+      "domains": ["market conduct", "best execution", "market abuse", "algorithmic trading", "trade reporting", "AML/KYC"],
+      "keywords": ["broker-dealer", "mid-sized investment firm", "algorithmic trading", "systematic internaliser"],
+      "typical_obligations": ["market abuse surveillance", "algorithmic trading controls", "best execution", "trade reporting", "prudential (IFR/IFD)"]
+    },
+
+    { "name": "Broker Dealer (Large)",
+      "category": "Capital Markets",
+      "summary": "Large broker-dealer with cross-asset trading, market-making, prime brokerage and systemic footprint.",
+      "domains": ["market conduct", "market abuse", "best execution", "market making", "prime brokerage", "prudential", "operational resilience", "ICT risk"],
+      "keywords": ["broker-dealer", "large investment firm", "market maker", "prime broker", "systemic"],
+      "typical_obligations": ["market abuse surveillance", "operational resilience", "trade reporting", "prime brokerage risk", "prudential (IFR/IFD)"]
+    },
+
+    { "name": "Investment Firm",
+      "category": "Capital Markets",
+      "summary": "MiFID-authorised firm providing investment services (advice, execution, portfolio management) to professional or retail clients.",
+      "domains": ["MiFID", "best execution", "product governance", "suitability", "conflicts of interest", "prudential (IFR/IFD)", "AML/KYC"],
+      "keywords": ["investment firm", "MiFID firm", "IFR", "IFD", "class 2 investment firm", "class 3 investment firm"],
+      "typical_obligations": ["MiFID conduct", "best execution", "product governance", "prudential (IFR/IFD)", "AML/CFT"]
+    },
+
+    { "name": "Securities Firm",
+      "category": "Capital Markets",
+      "summary": "Regulated firm dealing in securities on behalf of clients or as principal; may hold trading, dealing or arranging permissions.",
+      "domains": ["market conduct", "securities trading", "trade reporting", "market abuse", "client assets"],
+      "keywords": ["securities firm", "securities dealer", "arranging", "dealing on own account"],
+      "typical_obligations": ["market abuse", "trade reporting", "client asset protection", "conduct of business"]
+    },
+
+    { "name": "Asset Management Company",
+      "category": "Capital Markets",
+      "summary": "Firm organised to manage collective investment vehicles (UCITS / AIFs) as its principal business.",
+      "domains": ["UCITS", "AIFMD", "portfolio management", "risk management", "delegation", "conflicts of interest", "ESG disclosures"],
+      "keywords": ["asset management company", "AMC", "management company", "ManCo", "UCITS ManCo"],
+      "typical_obligations": ["risk and liquidity management", "delegation controls", "product governance", "ESG/SFDR disclosures", "conflicts of interest"]
+    },
+
+    { "name": "Asset Manager",
+      "category": "Capital Markets",
+      "summary": "Manages collective / segregated investment portfolios; UCITS and/or AIFMD authorised.",
+      "domains": ["portfolio management", "UCITS", "AIFMD", "risk management", "delegation", "conflicts of interest", "product governance", "ESG disclosures"],
+      "keywords": ["asset manager", "AIFM", "UCITS management company", "portfolio management", "collective investment", "management company"],
+      "typical_obligations": ["risk and liquidity management", "delegation controls", "product governance", "ESG/SFDR disclosures", "conflicts of interest"]
+    },
+
+    { "name": "Wealth Manager",
+      "category": "Capital Markets",
+      "summary": "Discretionary / advisory investment management for private clients.",
+      "domains": ["suitability", "AML/KYC", "conflicts of interest", "product governance", "cross-border"],
+      "keywords": ["wealth manager", "private client", "discretionary"],
+      "typical_obligations": ["suitability", "MiFID conduct", "AML/CFT", "product governance"]
+    },
+
+    { "name": "Portfolio Manager",
+      "category": "Capital Markets",
+      "summary": "Firm or business unit managing discretionary or advisory investment mandates for institutional or private clients.",
+      "domains": ["portfolio management", "MiFID", "suitability", "conflicts of interest", "product governance", "best execution"],
+      "keywords": ["portfolio manager", "discretionary mandate", "advisory mandate", "PM"],
+      "typical_obligations": ["suitability", "best execution", "conflicts of interest", "product governance"]
+    },
+
+    { "name": "Fund Manager",
+      "category": "Capital Markets",
+      "summary": "Firm managing one or more investment funds; may sit under a UCITS ManCo or an AIFM depending on the vehicle.",
+      "domains": ["UCITS", "AIFMD", "risk management", "delegation", "eligible assets", "investor disclosure"],
+      "keywords": ["fund manager", "fund management", "collective investment"],
+      "typical_obligations": ["risk and liquidity management", "delegation controls", "product governance", "investor disclosure"]
+    },
+
+    { "name": "Hedge Fund Manager",
+      "category": "Capital Markets",
+      "summary": "AIFM managing alternative investment funds using leverage, derivatives and short-selling to pursue absolute returns.",
+      "domains": ["AIFMD", "leverage", "risk management", "short selling", "prime brokerage", "conflicts of interest"],
+      "keywords": ["hedge fund manager", "AIFM", "alternative investment fund manager", "leverage", "short selling"],
+      "typical_obligations": ["AIFMD risk management", "leverage limits", "short-selling disclosure", "conflicts of interest"]
+    },
+
+    { "name": "Mutual Fund / UCITS Manager",
+      "category": "Capital Markets",
+      "summary": "UCITS-style retail fund manager with daily liquidity, eligible-assets rules and diversification constraints.",
+      "domains": ["UCITS", "eligible assets", "investor disclosure", "product governance", "risk management"],
+      "keywords": ["UCITS manager", "mutual fund manager", "retail fund manager", "UCITS ManCo"],
+      "typical_obligations": ["eligible assets", "KID/PRIIPs disclosure", "product governance", "risk management"]
+    },
+
+    { "name": "Alternative Investment Fund Manager (AIFM)",
+      "category": "Capital Markets",
+      "summary": "Firm authorised under AIFMD to manage one or more alternative investment funds (hedge, PE, real estate, infrastructure).",
+      "domains": ["AIFMD", "risk management", "leverage", "delegation", "valuation", "reporting", "ESG disclosures"],
+      "keywords": ["AIFM", "alternative investment fund manager", "AIFMD", "AIF", "sub-threshold AIFM"],
+      "typical_obligations": ["AIFMD Annex IV reporting", "risk management", "leverage disclosure", "valuation", "ESG/SFDR disclosures"]
+    },
+
+    { "name": "Fund Administrator (Small)",
+      "category": "Capital Markets",
+      "summary": "Small fund administrator delivering NAV, transfer agency and regulatory reporting to a handful of fund clients.",
+      "domains": ["NAV", "transfer agency", "fund accounting", "regulatory reporting", "outsourcing"],
+      "keywords": ["fund administrator", "transfer agency", "NAV", "fund accounting"],
+      "typical_obligations": ["outsourcing controls", "operational resilience", "regulatory reporting", "conflicts of interest"]
+    },
+
+    { "name": "Fund Administrator (Mid-sized)",
+      "category": "Capital Markets",
+      "summary": "Mid-sized fund administrator servicing multiple fund ranges and asset classes.",
+      "domains": ["NAV", "transfer agency", "fund accounting", "regulatory reporting", "outsourcing", "operational resilience"],
+      "keywords": ["fund administrator", "transfer agency", "NAV", "fund accounting", "middle office"],
+      "typical_obligations": ["outsourcing controls", "operational resilience", "regulatory reporting"]
+    },
+
+    { "name": "Fund Administrator (Large)",
+      "category": "Capital Markets",
+      "summary": "Large multi-jurisdiction fund administrator servicing thousands of funds across UCITS, AIF, PE, real estate and infrastructure.",
+      "domains": ["NAV", "transfer agency", "fund accounting", "regulatory reporting", "outsourcing", "operational resilience", "ICT risk", "critical third party"],
+      "keywords": ["fund administrator", "global fund admin", "TA", "NAV", "shared services"],
+      "typical_obligations": ["operational resilience", "critical third-party oversight", "regulatory reporting", "outsourcing controls"]
+    },
+
+    { "name": "Prime Broker",
+      "category": "Capital Markets",
+      "summary": "Bank / broker providing bundled services (financing, custody, securities lending, execution) to hedge funds and institutional clients.",
+      "domains": ["prime brokerage", "counterparty credit risk", "securities lending", "margin", "market abuse"],
+      "keywords": ["prime broker", "prime brokerage", "PB", "financing", "securities lending"],
+      "typical_obligations": ["counterparty credit risk", "margin", "client asset protection", "market abuse surveillance"]
+    },
+
+    { "name": "Custodian",
+      "category": "Capital Markets",
+      "summary": "Firm safekeeping securities and cash for institutional clients; may be a specialised (non-bank) custodian or a securities services division.",
+      "domains": ["custody", "settlement", "asset segregation", "corporate actions"],
+      "keywords": ["custodian", "safekeeping", "custody services", "depositary bank"],
+      "typical_obligations": ["asset segregation", "safekeeping", "settlement discipline", "AIFMD/UCITS depositary duties"]
+    },
+
+    { "name": "Depository Participant",
+      "category": "Capital Markets",
+      "summary": "Intermediary providing investors with access to a central securities depository (CSD); handles demat holdings and corporate actions.",
+      "domains": ["settlement", "demat holdings", "corporate actions", "AML/KYC", "investor protection"],
+      "keywords": ["depository participant", "DP", "demat", "CSD participant"],
+      "typical_obligations": ["settlement discipline", "investor protection", "AML/CFT", "asset segregation"]
+    },
+
+    { "name": "Central Securities Depository (CSD)",
+      "category": "Capital Markets",
+      "summary": "Provides securities settlement and safekeeping of securities in book-entry form.",
+      "domains": ["CSDR", "settlement discipline", "asset servicing", "operational resilience"],
+      "keywords": ["CSD", "central securities depository", "CSDR", "settlement", "T+2", "T+1"],
+      "typical_obligations": ["settlement discipline", "asset servicing", "operational resilience"]
+    },
+
+    { "name": "Central Counterparty (CCP)",
+      "category": "Capital Markets",
+      "summary": "Central counterparty interposing itself between buyers and sellers to clear derivatives / securities trades; systemically important.",
+      "domains": ["EMIR", "CCP", "default management", "margining", "recovery and resolution", "operational resilience"],
+      "keywords": ["central counterparty", "CCP", "EMIR", "default fund", "initial margin", "variation margin"],
+      "typical_obligations": ["EMIR", "default management", "CCP recovery and resolution", "operational resilience"]
+    },
+
+    { "name": "Clearing House",
+      "category": "Capital Markets",
+      "summary": "Multilateral clearer for derivatives / securities trades; typically operates one or more CCPs and settlement services.",
+      "domains": ["EMIR", "CCP", "default management", "margining", "recovery and resolution", "operational resilience"],
+      "keywords": ["clearing house", "clearing", "EMIR", "default fund"],
+      "typical_obligations": ["EMIR", "default management", "CCP recovery and resolution", "operational resilience"]
+    },
+
+    { "name": "Exchange / Stock Exchange",
+      "category": "Capital Markets",
+      "summary": "Regulated market operator hosting trading of shares, bonds, derivatives and other listed instruments.",
+      "domains": ["market operator", "regulated market", "market abuse", "listing rules", "operational resilience"],
+      "keywords": ["stock exchange", "regulated market", "exchange", "listed market", "market operator"],
+      "typical_obligations": ["market abuse surveillance", "market operator obligations", "listing supervision", "operational resilience"]
+    },
+
+    { "name": "Trading Venue (MTF/OTF)",
+      "category": "Capital Markets",
+      "summary": "Multilateral or organised trading facility bringing together buying and selling interests in financial instruments under MiFID rules.",
+      "domains": ["MiFID", "trading venue", "market abuse", "transparency", "operational resilience"],
+      "keywords": ["MTF", "OTF", "multilateral trading facility", "organised trading facility", "trading venue"],
+      "typical_obligations": ["market abuse surveillance", "pre- and post-trade transparency", "operational resilience"]
+    },
+
+    { "name": "Market Operator",
+      "category": "Capital Markets",
+      "summary": "Entity that operates a regulated market, MTF, OTF, exchange or benchmark administration platform.",
+      "domains": ["market operator", "benchmark administration", "market abuse", "operational resilience"],
+      "keywords": ["market operator", "regulated market operator", "benchmark administrator"],
+      "typical_obligations": ["market abuse surveillance", "operational resilience", "benchmark integrity"]
+    },
+
+    { "name": "Securities Lending Agent",
+      "category": "Capital Markets",
+      "summary": "Agent lending securities on behalf of beneficial owners; manages collateral and counterparty risk.",
+      "domains": ["securities financing", "SFTR", "collateral management", "counterparty risk"],
+      "keywords": ["securities lending", "SLA", "SFTR", "collateral", "recall"],
+      "typical_obligations": ["SFTR reporting", "collateral management", "counterparty risk"]
+    },
+
+    { "name": "Transfer Agent",
+      "category": "Capital Markets",
+      "summary": "Firm maintaining the register of holders of a fund or issuer; handles subscriptions, redemptions and record-keeping.",
+      "domains": ["transfer agency", "AML/KYC", "record-keeping", "investor protection"],
+      "keywords": ["transfer agent", "TA", "registrar of holders", "subscription", "redemption"],
+      "typical_obligations": ["record-keeping", "AML/CFT", "investor protection", "sanctions screening"]
+    },
+
+    { "name": "Registrar",
+      "category": "Capital Markets",
+      "summary": "Firm maintaining the register of shareholders / bondholders on behalf of an issuer; handles corporate actions and dividend payments.",
+      "domains": ["shareholder register", "corporate actions", "record-keeping", "data protection"],
+      "keywords": ["registrar", "share registrar", "corporate actions agent", "dividend agent"],
+      "typical_obligations": ["record-keeping", "corporate action processing", "investor communications"]
+    },
+
+    { "name": "Trustee Services",
+      "category": "Capital Markets",
+      "summary": "Trustee acting for bond issuances, unit trusts, structured products or fund vehicles; holds assets and enforces documentation.",
+      "domains": ["trustee obligations", "asset segregation", "investor protection", "corporate actions"],
+      "keywords": ["trustee", "bond trustee", "unit trust trustee", "security trustee"],
+      "typical_obligations": ["trust deed enforcement", "asset segregation", "investor protection", "conflicts of interest"]
+    },
+
+    { "name": "Capital Markets Infrastructure Provider",
+      "category": "Capital Markets",
+      "summary": "Post-trade / pre-trade infrastructure vendor providing critical services to trading venues, clearers and depositaries.",
+      "domains": ["critical third party", "operational resilience", "ICT risk", "outsourcing"],
+      "keywords": ["market infrastructure provider", "post-trade", "pre-trade", "critical third party", "capital markets infrastructure"],
+      "typical_obligations": ["critical third-party oversight", "operational resilience", "ICT risk management"]
+    }
+
+  ]
+}
