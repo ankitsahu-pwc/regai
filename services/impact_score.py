@@ -54,10 +54,13 @@ can be reused from CLI / batch scripts.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 from typing import (
     Any,
     Dict,
@@ -1014,7 +1017,7 @@ def compute_weighted_impact(
         })
     rec_input.sort(key=lambda r: r["weighted_score"], reverse=True)
 
-    return WeightedImpactResult(
+    result = WeightedImpactResult(
         overall_impact_score=overall,
         impact_rating=impact_rating(overall),
         factor_scores=factor_scores,
@@ -1031,6 +1034,11 @@ def compute_weighted_impact(
         overall_priority_score=overall_priority,
         recommendations_input=rec_input,
     )
+    logger.info(
+        "Weighted impact computed. overall=%.2f rating=%s priority=%.2f",
+        overall, result.impact_rating, overall_priority,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

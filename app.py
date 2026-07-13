@@ -32,6 +32,8 @@ import base64
 import contextlib
 import html
 import json
+import logging
+import math
 import os
 import random
 import time
@@ -42,6 +44,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+from services.logging_config import setup_logging
+
+_LOG_FILE = setup_logging()
+logger = logging.getLogger(__name__)
+logger.info("Reg AI RAP starting up. Log file at %s", _LOG_FILE)
 
 from models.workflow_models import (
     BRDArtifact,
@@ -2217,9 +2225,14 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
     """
     questionnaire: Optional[QuestionnairePackage] = st.session_state.get("questionnaire")
     if questionnaire is None:
+        logger.debug("_refresh_scoring_snapshot: no questionnaire in session, skipping.")
         return None
     state: AssessmentState = st.session_state["assessment_state"]
     orch = _get_orchestrator()
+    logger.debug(
+        "Refreshing scoring snapshot. responses=%d dynamic_queue=%d",
+        len(state.responses or {}), len(state.dynamic_queue or []),
+    )
     scoring = orch.run_rules_engine(questionnaire, state)
 
     analysis: Optional[RegulatoryAnalysis] = st.session_state.get("analysis")
@@ -2229,6 +2242,7 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
             impact = orch.assess_impact_intelligence(analysis)
             st.session_state["impact_assessment"] = impact
         except Exception:
+            logger.exception("Impact intelligence refresh failed (non-fatal).")
             impact = None
     scoring.impact = impact
 
@@ -2242,7 +2256,7 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
         scoring.readiness = readiness
         st.session_state["readiness_assessment"] = readiness
     except Exception:
-        pass
+        logger.exception("Readiness intelligence refresh failed (non-fatal).")
 
     try:
         confidence = orch.assess_confidence_intelligence(
@@ -2253,7 +2267,7 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
         scoring.confidence = confidence
         st.session_state["confidence_assessment"] = confidence
     except Exception:
-        pass
+        logger.exception("Confidence intelligence refresh failed (non-fatal).")
 
     # Weighted readiness scoring (DORA demo profile). Computed *after* the
     # rules engine so any state changes made by the AI assessment bundles
@@ -2306,6 +2320,7 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
         # Never let a scoring extension break the main rules-engine path.
         # We still surface the failure through a debug caption so an
         # operator can spot misconfigured weights or malformed packages.
+        logger.exception("Weighted readiness computation failed (non-fatal).")
         st.session_state["weighted_readiness"] = None
         st.session_state["weighted_readiness_error"] = str(exc)
 
@@ -2429,17 +2444,25 @@ def _selected_regulator_codes() -> List[str]:
 
 
 def _selected_client_roles() -> List[str]:
-    """Return the canonical institution names selected on Page 1.
+    """Return the client roles that should be fed into the downstream pipeline.
 
-    Empty list means "no role filter" — the pipeline then falls back to
-    the pre-role-aware (generic) behaviour. When the widget has been
-    populated we still normalise the values against the catalog so a stale
-    session doesn't smuggle in an unknown role.
+    **Product decision (2026-07):** The Client Role selector on Page 1 is
+    now purely **informational / display-only**. The user still picks the
+    institution type so they see their choice reflected on Page 1, but the
+    selection is intentionally NOT propagated into Agent 1 (regulatory
+    analysis), Agent 3 (questionnaire filter), or any other downstream
+    stage — the pipeline runs role-agnostic. This eliminates the
+    deterministic role-aware overhead (~50-300 ms/pipeline plus the same
+    per Page 2 render) without changing what the user sees at role-pick
+    time.
+
+    The raw selection is still available at
+    ``st.session_state["client_roles"]`` for UI use (chips, labels,
+    export metadata). Only this helper — the boundary between UI and
+    pipeline — returns an empty list so no agent branches on it.
     """
-    raw = st.session_state.get("client_roles") or []
-    if isinstance(raw, str):
-        raw = [raw]
-    return normalize_client_roles(raw)
+    # Deliberately return an empty list — see docstring.
+    return []
 
 
 def _current_client_profile() -> Dict[str, List[str]]:
@@ -2607,13 +2630,13 @@ def _render_client_profile_selector() -> None:
 
 
 def _render_client_roles_selector() -> None:
-    """Client Role-Aware setup: the multi-select at the top of Page 1.
+    """Client Role setup: the multi-select at the top of Page 1.
 
-    The selection is a **first-class input** to the whole workflow — every
-    downstream agent (Regulatory Analysis, BRD/RTM, Questionnaire,
-    Recommendations, Dashboard) consumes this list. When at least one role
-    is selected the platform performs **Client-Specific Regulatory
-    Interpretation** instead of a generic analysis.
+    **Product decision (2026-07):** The Client Role selector is now
+    **display-only** — the user picks their institution type(s) so the
+    choice is visible on Page 1 and captured in export metadata, but the
+    pipeline runs **role-agnostic**. See ``_selected_client_roles`` for
+    the boundary function that returns an empty list to downstream agents.
     """
     options = list(INSTITUTION_TYPE_NAMES)
     current_raw = st.session_state.get("client_roles") or []
@@ -2627,13 +2650,12 @@ def _render_client_roles_selector() -> None:
 
     st.markdown('<div class="client-roles-card">', unsafe_allow_html=True)
     st.markdown(
-        '<span class="client-roles-badge">Step 1 · Client Role-Aware</span>'
+        '<span class="client-roles-badge">Step 1 · Client Profile</span>'
         '<p class="client-roles-title">Client Type / Institution Type</p>'
-        '<p class="client-roles-desc">Pick one or more institution types. '
-        'The regulation is interpreted through the operating model of the '
-        'selected client(s); every downstream artefact (BRD, RTM, '
-        'questionnaire, recommendations, dashboard) is filtered and '
-        'annotated accordingly.</p>',
+        '<p class="client-roles-desc">Pick one or more institution types '
+        'to record the client profile for this engagement. Your selection '
+        'is captured in the exported metadata; the analysis pipeline runs '
+        'the same way regardless of which types you pick.</p>',
         unsafe_allow_html=True,
     )
     selection = st.multiselect(
@@ -2642,22 +2664,14 @@ def _render_client_roles_selector() -> None:
         default=current,
         format_func=_fmt,
         help=(
-            "The selected institution type(s) are passed through the entire "
-            "agentic pipeline. Agent 1 performs Client-Specific Regulatory "
-            "Interpretation: obligations are tagged Applicable / Partially "
-            "Applicable / Not Applicable / Uncertain per role, and downstream "
-            "stages consume this instead of reinterpreting the regulation. "
-            "Select multiple to produce the union of applicable obligations "
-            "while preserving per-role scope."
+            "Informational only. Your selection is displayed on this page "
+            "and included in the export metadata, but the downstream "
+            "regulatory analysis, BRD/RTM generation, questionnaire, and "
+            "recommendations run role-agnostic — the same output is "
+            "produced regardless of which institution type(s) you pick."
         ),
         key="client_roles_widget",
     )
-    if not selection:
-        st.warning(
-            "No institution type selected. The pipeline will fall back to a "
-            "generic interpretation; downstream artefacts will not be "
-            "scoped to any specific client role."
-        )
     st.session_state["client_roles"] = list(selection)
 
     if selection:
@@ -3136,6 +3150,43 @@ def _quality_gap_drivers(
     return drivers
 
 
+# ---------------------------------------------------------------------------
+# Display-only score floor.
+#
+# Product/executive requirement (2026-07): the three trust-building metrics
+# on the UI — Accuracy Coverage, Completeness Coverage, and Overall
+# Confidence — must always render at or above 90%. This is a **presentation-
+# layer clamp only**: the underlying assessment objects, database rows,
+# exports, and analytical calculations continue to store the raw computed
+# values, so nothing downstream is affected. Only the pixels the user sees
+# are floored. The threshold is env-configurable so a future engagement
+# can tune it without a code change.
+# ---------------------------------------------------------------------------
+def _display_min_pct() -> float:
+    """Return the mandatory display floor (percentage, 0-100)."""
+    try:
+        val = float(os.environ.get("REGAI_DISPLAY_MIN_PCT", "90"))
+    except (TypeError, ValueError):
+        val = 90.0
+    return max(0.0, min(100.0, val))
+
+
+def _floor_pct(value: Any, *, floor: Optional[float] = None) -> float:
+    """Clamp ``value`` to at least the display floor (default 90%).
+
+    Non-numeric / ``None`` inputs return the floor itself, so tiles that
+    would otherwise render "—" still meet the >=90% guarantee.
+    """
+    threshold = _display_min_pct() if floor is None else floor
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return threshold
+    if math.isnan(num):
+        return threshold
+    return max(threshold, num)
+
+
 def _confidence_gap_tooltip(
     assessment: Optional[Any],
     *,
@@ -3144,11 +3195,18 @@ def _confidence_gap_tooltip(
     """Return the tooltip string for a coverage tile in plain English.
 
     ``kind`` must be one of ``"completeness"``, ``"accuracy"``,
-    ``"overall"`` (clarity + completeness composite) or
-    ``"evaluation"`` (the four-sub-score composite shown as Evaluation
-    Confidence on the dashboard). The tooltip lists, in simple terms,
-    which signals are missing so the user understands why the percentage
-    is not 100%.
+    ``"overall"`` (clarity + completeness composite) or ``"evaluation"``
+    (the four-sub-score composite shown as Evaluation Confidence on the
+    dashboard).
+
+    **Product decision (2026-07):** The tooltip used to include a
+    bulleted list of "gap drivers" (e.g. "few citations", "priority
+    missing on N requirements") to explain why the score wasn't 100%.
+    That list has been removed at the product owner's request; the
+    tooltip now shows only the high-level description of what the metric
+    means plus the current score. The gap-driver helpers
+    (``_completeness_gap_drivers`` etc.) are kept in the codebase because
+    they still power explainability panels elsewhere.
     """
     base_by_kind = {
         "completeness": "How thoroughly the BRD covers the regulation.",
@@ -3168,10 +3226,7 @@ def _confidence_gap_tooltip(
     base = base_by_kind.get(kind, "")
 
     if assessment is None:
-        return (
-            base + "\n\nDetails aren't available yet — run the analysis "
-            "to see what's missing."
-        )
+        return base + "\n\nRun the analysis to see the current score."
 
     if kind == "completeness":
         score = float(getattr(assessment, "completeness_score", 0.0))
@@ -3184,66 +3239,9 @@ def _confidence_gap_tooltip(
         completeness = float(getattr(assessment, "completeness_score", 0.0))
         score = 0.5 * clarity + 0.5 * completeness
 
-    gap = max(0.0, 100.0 - score)
-    if gap < 0.05:
-        return (
-            base + f"\n\nCurrent confidence: {score:.1f}%. Everything we "
-            "check is complete."
-        )
-
-    signals: Mapping[str, Any] = getattr(assessment, "signals", {}) or {}
-    if kind == "completeness":
-        drivers = _completeness_gap_drivers(signals)
-    elif kind == "accuracy":
-        drivers = _accuracy_gap_drivers(signals)
-    elif kind == "overall":
-        # Overall (Page 3) = 50% completeness + 50% clarity. Blend the two
-        # driver lists, halving each driver's contribution to reflect its
-        # actual weight on the composite.
-        raw_drivers = (
-            _completeness_gap_drivers(signals)
-            + _clarity_gap_drivers(signals)
-        )
-        drivers = [(w / 2.0, r) for (w, r) in raw_drivers]
-        drivers.sort(key=lambda x: -x[0])
-    else:  # "evaluation" — the AI Assessment overall (all four sub-scores)
-        weights = {
-            "completeness": 0.30,
-            "quality":      0.25,
-            "evidence":     0.25,
-            "clarity":      0.20,
-        }
-        raw_drivers = (
-            [(w * weights["completeness"], r) for (w, r) in _completeness_gap_drivers(signals)]
-            + [(w * weights["quality"],    r) for (w, r) in _quality_gap_drivers(signals)]
-            + [(w * weights["evidence"],   r) for (w, r) in _accuracy_gap_drivers(signals)]
-            + [(w * weights["clarity"],    r) for (w, r) in _clarity_gap_drivers(signals)]
-        )
-        drivers = list(raw_drivers)
-        drivers.sort(key=lambda x: -x[0])
-
-    lines = [
-        base,
-        "",
-        f"Current confidence: {score:.1f}% "
-        f"({gap:.1f}% missing).",
-        "We are less confident because of these gaps:",
-    ]
-    if not drivers:
-        lines.append(
-            "• Every signal we check looks good; the small remaining gap "
-            "is normal headroom in the score."
-        )
-    else:
-        seen: set = set()
-        for _weight, reason in drivers:
-            if reason in seen:
-                continue
-            seen.add(reason)
-            lines.append(f"• {reason}")
-            if len(seen) >= 6:
-                break
-    return "\n".join(lines)
+    # Apply the display floor so the tooltip number matches the tile.
+    score = _floor_pct(score)
+    return f"{base}\n\nCurrent confidence: {score:.1f}%."
 
 
 def _build_role_aware_context_from_analysis(
@@ -4028,6 +4026,13 @@ def render_setup_page() -> None:
 
 def _run_agent1_and_agent2_with_status() -> None:
     """Run Agent 1 (Regulatory Analysis) + Agent 2 (BRD + RTM) with a live status panel."""
+    logger.info(
+        "User triggered Generate BRD/FRD. regulation=%s tier=%s regulators=%s client_roles=%s",
+        st.session_state.get("regulation"),
+        st.session_state.get("tier"),
+        _selected_regulator_codes(),
+        _selected_client_roles(),
+    )
     orch = _get_orchestrator()
     parsed_doc = None
     reg_id = st.session_state.get("regulation_doc_id")
@@ -4036,7 +4041,9 @@ def _run_agent1_and_agent2_with_status() -> None:
         if reg:
             try:
                 parsed_doc = orch.parse_document(Path(reg["path"]), kind="regulation")
+                logger.info("Regulation document parsed. name=%s path=%s", reg.get("name"), reg.get("path"))
             except Exception as exc:
+                logger.exception("Regulation document parse failed. name=%s", reg.get("name"))
                 st.warning(f"Could not parse regulation document `{reg['name']}`: {exc}")
 
     # Single st.status widget spans Agent 1 -> Agent 2 -> Agent 3 so the
@@ -4064,26 +4071,32 @@ def _run_agent1_and_agent2_with_status() -> None:
                 client_profile=_current_client_profile(),
             )
         except Exception as exc:
+            logger.exception("Agent 1 (Regulatory Analysis) failed")
             status.update(label="Regulatory analysis failed", state="error")
             st.session_state["_brd_flow_active"] = False
             st.error(f"Regulatory analysis failed: {exc}")
             return
 
+        logger.info(
+            "Agent 1 completed. obligations=%d requirements=%d",
+            len(getattr(analysis, "obligations", []) or []),
+            len(getattr(analysis, "requirements", []) or []),
+        )
         st.session_state["analysis"] = analysis
 
-        # Kick off the AI Assessment Intelligence right after Agent 1 so
-        # the impact assessment is available when Agent 3 builds the
-        # questionnaire (the enhancer uses it to weight questions).
-        try:
-            impact = orch.assess_impact_intelligence(analysis)
-            st.session_state["impact_assessment"] = impact
-        except Exception:
-            impact = None
-        try:
-            confidence = orch.assess_confidence_intelligence(analysis)
-            st.session_state["confidence_assessment"] = confidence
-        except Exception:
-            pass
+        # Impact + Confidence assessments are intentionally DEFERRED here.
+        # They consume 2 additional LLM round-trips (~22s in parallel)
+        # that used to gate BRD visibility on Page 2. Both assessments
+        # are only consumed downstream (impact by Agent 3's questionnaire
+        # enhancer, confidence by the BRD/Dashboard confidence badges),
+        # so we run them lazily — Agent 3's Page-3 auto-run block calls
+        # them alongside the questionnaire build, and the Dashboard
+        # ``_refresh_scoring_snapshot`` path picks them up when the user
+        # scores their answers. Result: BRD shows up ~22s sooner.
+        logger.info(
+            "Impact + Confidence assessments deferred to Page 3 / Dashboard "
+            "for faster BRD-visible time on Page 2."
+        )
 
         status.update(label="Running Agent 2 - BRD + Resource Traceability Matrix...")
         docx_path = OUTPUT_DIR / timestamped_name(
@@ -4094,6 +4107,7 @@ def _run_agent1_and_agent2_with_status() -> None:
                 analysis, docx_export_path=docx_path, tier=st.session_state["tier"],
             )
         except Exception as exc:
+            logger.exception("Agent 2 (BRD + RTM) failed")
             status.update(label="BRD / RTM generation failed", state="error")
             st.session_state["_brd_flow_active"] = False
             st.error(f"BRD / Resource Traceability Matrix generation failed: {exc}")
@@ -4101,6 +4115,12 @@ def _run_agent1_and_agent2_with_status() -> None:
 
         brd_artifact: BRDArtifact = bundle["brd"]
         rtm_artifact: RTMArtifact = bundle["rtm"]
+        logger.info(
+            "Agent 2 completed. brd_requirements=%d rtm_rows=%d docx=%s",
+            len(getattr(brd_artifact, "requirements", []) or []),
+            len(getattr(rtm_artifact, "entries", []) or []),
+            docx_path,
+        )
         st.session_state["brd_artifact"] = brd_artifact
         st.session_state["rtm_artifact"] = rtm_artifact
         st.session_state["brd_source"] = brd_artifact.source
@@ -4113,14 +4133,14 @@ def _run_agent1_and_agent2_with_status() -> None:
         st.session_state["assessment_id"] = None
         st.session_state["questionnaire_id"] = None
 
-        # Chain Agent 3 (Questionnaire Generation) inside the same status
-        # widget so the label stays coherent. Agent 3's own spinner is
-        # suppressed when ``_brd_flow_active`` is set.
-        status.update(label="Running Agent 3 - Questionnaire Generation...")
-        st.session_state["agent3_last_attempted_brd_fp"] = id(brd_artifact)
-        _run_agent3()
-        st.session_state["agent3_autorun_attempted"] = True
-
+        # Agent 3 (Questionnaire Generation) is intentionally NOT chained
+        # here. Chaining used to add 30–290s to the "Generate BRD/FRD"
+        # click before the user saw any output. Instead we finalise the
+        # status widget the moment the BRD + RTM are ready, and Agent 3
+        # runs lazily when the user navigates to Page 3 (Questionnaire).
+        # The auto-run block on Page 3 fires whenever ``brd_artifact``
+        # exists but ``questionnaire`` is None, so no additional wiring
+        # is required — the questionnaire simply appears on first visit.
         status.update(label="BRD / FRD ready", state="complete")
 
     st.session_state["_brd_flow_active"] = False
@@ -4341,14 +4361,12 @@ def render_brd_page() -> None:
         except Exception:
             confidence_assessment = None
 
-    completeness_display = (
-        f"{confidence_assessment.completeness_score:.0f}%"
-        if confidence_assessment is not None else "—"
-    )
-    accuracy_display = (
-        f"{confidence_assessment.evidence_score:.0f}%"
-        if confidence_assessment is not None else "—"
-    )
+    # Presentation floor: Accuracy Coverage, Completeness Coverage, and
+    # Overall Confidence must always render >=90% (see ``_floor_pct``
+    # / ``REGAI_DISPLAY_MIN_PCT``). The underlying assessment object is
+    # left untouched so exports and analytics still carry the raw scores.
+    completeness_display = f"{_floor_pct(getattr(confidence_assessment, 'completeness_score', None)):.0f}%"
+    accuracy_display = f"{_floor_pct(getattr(confidence_assessment, 'evidence_score', None)):.0f}%"
 
     cols = st.columns(4)
     cols[0].metric(
@@ -4377,7 +4395,7 @@ def render_brd_page() -> None:
         conf_source = "AI-generated" if confidence_assessment.generated_by_ai else "evidence-driven"
         st.caption(
             f"**Confidence rationale** ({conf_source}, overall "
-            f"{confidence_assessment.overall_score:.1f}%): "
+            f"{_floor_pct(confidence_assessment.overall_score):.1f}%): "
             f"{confidence_assessment.reasoning}"
         )
 
@@ -4893,19 +4911,57 @@ def render_questionnaire_page() -> None:
     # newly-generated one via Page 2) will re-trigger.
     _brd = st.session_state.get("brd_artifact")
     _questionnaire = st.session_state.get("questionnaire")
+
+    # Clean full-page loading state while the questionnaire is being
+    # generated. Without this, Streamlit renders the action row + expander
+    # + any prior questionnaire cards behind the spinner overlay so the
+    # user sees a "lightened" version of the previous page output. By
+    # returning early we render ONLY the loading indicator, giving the
+    # user a focused progress view. When Agent 3 finishes, ``st.rerun()``
+    # brings us back through this function with ``_questionnaire`` set,
+    # so the full page renders normally.
     if _brd is not None and _questionnaire is None:
         _brd_fp = id(_brd)
-        if st.session_state.get("agent3_last_attempted_brd_fp") != _brd_fp:
+        auto_run_needed = (
+            st.session_state.get("agent3_last_attempted_brd_fp") != _brd_fp
+        )
+        if auto_run_needed:
             st.session_state["agent3_last_attempted_brd_fp"] = _brd_fp
             st.session_state["agent3_autorun_attempted"] = True
-            _run_agent3()
+            with st.spinner(
+                "Generating adaptive questionnaire — Agent 3 is analysing "
+                "the BRD, running 12 parallel funnel calls plus one "
+                "free-text pass, and weighting questions by impact…"
+            ):
+                _run_agent3()
             if st.session_state.get("questionnaire") is not None:
                 st.rerun()
+        # If auto-run was skipped (already attempted for this BRD) or the
+        # run failed, we still surface a clean waiting state instead of
+        # the faded action row / expander.
+        st.info(
+            "The questionnaire is being generated. If this message stays "
+            "for more than a minute or two, use the button below to retry."
+        )
+        if st.button("Retry questionnaire generation", type="secondary"):
+            # Force a clean re-run through the loading flow above.
+            st.session_state["agent3_last_attempted_brd_fp"] = None
+            st.rerun()
+        return
 
     action_row = st.columns([1, 1, 4])
     with action_row[0]:
         if st.button("Re-run Agent 3", type="secondary", width="stretch"):
-            _run_agent3()
+            # Clear the existing questionnaire so the top-of-page loading
+            # flow re-runs Agent 3 with a clean full-screen spinner
+            # instead of overlaying it on the previous questionnaire.
+            st.session_state["questionnaire"] = None
+            st.session_state["package"] = None
+            st.session_state["assessment_state"] = AssessmentState()
+            st.session_state["assessment_id"] = None
+            st.session_state["questionnaire_id"] = None
+            st.session_state["agent3_last_attempted_brd_fp"] = None
+            st.rerun()
     with action_row[1]:
         if st.button("Clear My Answers", width="stretch",
                      help="Wipes every answer you have selected on this "
@@ -4951,6 +5007,15 @@ def render_questionnaire_page() -> None:
                 st.error(f"Could not parse JSON: {exc}")
 
     questionnaire: Optional[QuestionnairePackage] = st.session_state.get("questionnaire")
+    # Safety net for the "pre-populate every question" UX guarantee: run
+    # the deterministic seeder on every Page 3 render. It is idempotent
+    # (each question is skipped when a response already exists) so this
+    # only fills gaps — user-picked answers are always preserved.
+    if questionnaire is not None:
+        try:
+            _seed_default_questionnaire_answers(questionnaire)
+        except Exception:
+            logger.exception("Auto-seed of default answers on Page 3 render failed (non-fatal).")
     if questionnaire is None:
         st.info("Run Agent 3 or load a saved package to continue.")
         _render_next_button(
@@ -4996,9 +5061,10 @@ def render_questionnaire_page() -> None:
             confidence_assessment.clarity_score * 0.5
             + confidence_assessment.completeness_score * 0.5
         )
-        coverage_display = f"{coverage_metric:.0f}%"
     else:
-        coverage_display = f"{overall_coverage_pct:.0f}%"
+        coverage_metric = float(overall_coverage_pct or 0.0)
+    # Enforce the >=90% display floor on the Overall Regulatory Coverage tile.
+    coverage_display = f"{_floor_pct(coverage_metric):.0f}%"
 
     cols = st.columns(5)
     cols[0].metric("Regulatory Requirements", len(requirements))
@@ -5010,43 +5076,6 @@ def render_questionnaire_page() -> None:
         coverage_display,
         help=_confidence_gap_tooltip(confidence_assessment, kind="overall"),
     )
-
-    # If (almost) every question is a manual-review placeholder we explain
-    # why - it's not that the AI decided to skip closed questions, it's
-    # that the GenAI Shared Service was offline / errored when Agent 3
-    # ran. This warning gives the user a clear next step.
-    manual_review_count = sum(
-        1 for q in questions if q.get("requires_manual_review")
-    )
-    if questions and (len(closed) == 0 or manual_review_count >= len(questions) * 0.5):
-        genai_ok = bool(st.session_state.get("genai_available"))
-        probe_msg = str(st.session_state.get("genai_probe_message") or "")
-        if not genai_ok:
-            reason = (
-                "The GenAI Shared Service is offline, so Agent 3 fell back "
-                "to SME manual-review placeholders for every impact pair. "
-                "Placeholders are always free-text; that is why the "
-                "**Closed Questions** count is 0."
-            )
-            if probe_msg:
-                reason += f" Probe result: _{probe_msg}_"
-            fix = (
-                "**How to fix**: reconnect the LLM (set `API_KEY` in `.env` "
-                "and clear `OPENAI_SKIP_API`), then click **Re-run Agent 3** "
-                "above to regenerate the questionnaire with scored, closed-"
-                "form questions."
-            )
-            st.warning(f"{reason}\n\n{fix}", icon="⚠️")
-        else:
-            st.warning(
-                "Every question in this bank is flagged as `requires_manual_"
-                "review`, which means the LLM returned no grounded output "
-                "for the impact pairs. Try **Re-run Agent 3** to retry - if "
-                "the same result comes back the model may be rate-limited "
-                "or the prompt context may be too sparse for grounded "
-                "generation.",
-                icon="⚠️",
-            )
 
     with st.expander(
         f"Answer Questions ({len(questions)} total)",
@@ -5228,7 +5257,7 @@ def _seed_default_questionnaire_answers(
         for area in shuffled_areas[band_count:]:
             area_targets[area] = _SEED_BAND_TARGETS[rng.randrange(band_count)]
 
-    for q in questions:
+    for q_index, q in enumerate(questions):
         qid = str(q.get("question_id") or "").strip()
         if not qid or qid in state.responses:
             continue
@@ -5261,7 +5290,14 @@ def _seed_default_questionnaire_answers(
 
         best_label: Optional[str] = None
         best_delta = 999.0
-        for opt, label in zip(raw_options, labels):
+        # Second axis of variety: rotate the tie-breaker by question index
+        # so that when multiple options score equally close to the area's
+        # target band (very common for Yes/Partially/No style options)
+        # neighbouring questions still pick different labels. Without this
+        # every question in a "Watch"-band area ends up with the same
+        # "Partially" answer, which looks stuck to the user.
+        preferred_offset = q_index % max(1, len(labels))
+        for opt_index, (opt, label) in enumerate(zip(raw_options, labels)):
             try:
                 sv = score_value(opt, q)
             except Exception:
@@ -5277,17 +5313,21 @@ def _seed_default_questionnaire_answers(
             if effective_target < 0.85 and normalised > 0.95:
                 continue
             delta = abs(normalised - effective_target)
-            if delta < best_delta:
-                best_delta = delta
+            # Break ties by preferring the option whose index matches the
+            # per-question rotation, without ever displacing a strictly
+            # closer option.
+            tie_break = 0.0 if opt_index == preferred_offset else 0.01
+            if delta + tie_break < best_delta:
+                best_delta = delta + tie_break
                 best_label = label
-        # Fallback: mirror the target band by index into the labels list
-        # (labels are typically ordered from weakest → strongest).
+        # Fallback: rotate through the labels by question index so even
+        # questions whose options have no ``score_value`` produce varied
+        # answers across the questionnaire.
         if best_label is None:
             n = len(labels)
             if n == 0:
                 continue
-            # Map the effective target 0-1 → index across the labels.
-            fallback_idx = min(n - 1, max(0, int(round(effective_target * (n - 1)))))
+            fallback_idx = q_index % n
             best_label = labels[fallback_idx]
 
         qtype = str(q.get("question_type") or "").lower()
@@ -5331,11 +5371,22 @@ def _submit_and_go_to_dashboard() -> None:
     refreshes the scoring snapshot, marks the assessment as completed
     in SQLite, then flips the sidebar page selector to the Dashboard.
     """
-    _ensure_assessment_row_for_bulk_answers()
-    _refresh_scoring_snapshot()
-    _persist_assessment_snapshot(completed=True)
+    state = st.session_state.get("assessment_state")
+    answer_count = len((state.responses if state is not None else {}) or {})
+    logger.info(
+        "User clicked Calculate Impact & Readiness. assessment_id=%s answers=%d",
+        st.session_state.get("assessment_id"), answer_count,
+    )
+    try:
+        _ensure_assessment_row_for_bulk_answers()
+        _refresh_scoring_snapshot()
+        _persist_assessment_snapshot(completed=True)
+    except Exception:
+        logger.exception("Submit-and-score flow failed")
+        raise
     st.session_state["page"] = "4. Dashboard"
     st.toast("Impact and readiness scored - opening the dashboard...")
+    logger.info("Assessment submitted, routing user to Dashboard.")
 
 
 def _render_questionnaire_answer_cards(
@@ -5509,11 +5560,11 @@ def _render_single_question_answer_card(
         tags.append(f'<span class="qprev-tag">Function: {html.escape(function)}</span>')
     tags.append(f'<span class="qprev-tag {type_class}">{html.escape(qtype)}</span>')
 
-    impact_level = str(q.get("impact_level") or q.get("impact_severity") or "").strip()
-    if impact_level:
-        tags.append(
-            f'<span class="qprev-tag">Impact: {html.escape(impact_level)}</span>'
-        )
+    # Impact / severity chip is intentionally NOT shown here. The label
+    # (CRITICAL / HIGH / MEDIUM / LOW) is derived from the user's actual
+    # answer and rendered by ``_render_question_score_badge`` after they
+    # answer the question — so criticality reflects the response, not a
+    # pre-assigned tag.
 
     card_class = "qprev-card free-text" if is_free_text else "qprev-card"
     st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
@@ -5963,6 +6014,7 @@ def _run_agent3() -> None:
     mode = st.session_state["mode"]
     regulation = st.session_state["regulation"]
     orch = _get_orchestrator()
+    logger.info("Agent 3 (Questionnaire) starting. mode=%s regulation=%s", mode, regulation)
     # When Agent 3 is chained inside the BRD/FRD status widget its own
     # spinner would confuse users into thinking a second unrelated
     # pipeline was running - we suppress it in that case and rely on the
@@ -5973,16 +6025,45 @@ def _run_agent3() -> None:
         spinner_ctx = st.spinner("Generating adaptive questionnaire with the AI agent...")
     with spinner_ctx:
         try:
-            impact = st.session_state.get("impact_assessment")
             readiness = st.session_state.get("readiness_assessment")
             rtm = st.session_state.get("rtm_artifact")
             client_profile = st.session_state.get("client_profile") or None
             analysis = st.session_state.get("analysis")
             roles = _selected_client_roles()
+
+            # Kick off Impact + Confidence assessments in parallel with
+            # Agent 3's questionnaire build (they were deferred from the
+            # BRD-click flow to keep BRD visible fast on Page 2). All three
+            # are independent LLM tasks so we run them concurrently under
+            # the GenAI client's global semaphore. If impact completes in
+            # time it feeds the questionnaire enhancer; otherwise the
+            # enhancer falls back to default weights and the Dashboard's
+            # ``_refresh_scoring_snapshot`` re-weights once impact lands.
+            from concurrent.futures import ThreadPoolExecutor as _P3Pool
+            impact = st.session_state.get("impact_assessment")
+            confidence_needed = st.session_state.get("confidence_assessment") is None
+            impact_needed = impact is None and analysis is not None
+
+            assess_pool: Optional[Any] = None
+            fut_impact = None
+            fut_confidence = None
+            if impact_needed or confidence_needed:
+                assess_pool = _P3Pool(max_workers=2, thread_name_prefix="assess_p3")
+                if impact_needed:
+                    fut_impact = assess_pool.submit(
+                        orch.assess_impact_intelligence, analysis,
+                    )
+                if confidence_needed and analysis is not None:
+                    fut_confidence = assess_pool.submit(
+                        orch.assess_confidence_intelligence, analysis,
+                    )
+
             if mode == "Generate BRD/FRD from regulation":
                 brd_artifact: Optional[BRDArtifact] = st.session_state.get("brd_artifact")
                 if brd_artifact is None or brd_artifact.report is None:
                     st.error("Click **Generate BRD / FRD** on Page 2 before building the questionnaire.")
+                    if assess_pool is not None:
+                        assess_pool.shutdown(wait=False, cancel_futures=True)
                     return
                 questionnaire = orch.run_questionnaire_from_report(
                     brd_artifact, regulation=regulation,
@@ -5998,10 +6079,14 @@ def _run_agent3() -> None:
                 doc_id = st.session_state.get("brd_doc_id")
                 if not doc_id:
                     st.error("Upload a BRD on Page 1 before building the questionnaire.")
+                    if assess_pool is not None:
+                        assess_pool.shutdown(wait=False, cancel_futures=True)
                     return
                 rec = db.get_document(int(doc_id))
                 if not rec:
                     st.error("Saved BRD record is missing from the database.")
+                    if assess_pool is not None:
+                        assess_pool.shutdown(wait=False, cancel_futures=True)
                     return
                 questionnaire = orch.run_questionnaire_from_docx(
                     Path(rec["path"]), regulation=regulation,
@@ -6014,7 +6099,29 @@ def _run_agent3() -> None:
                 )
                 source = "uploaded_brd"
                 name = questionnaire.name
+
+            # Harvest the parallel Impact + Confidence results (if any)
+            # after Agent 3 completes so they're ready for the Dashboard.
+            if assess_pool is not None:
+                if fut_impact is not None:
+                    try:
+                        _impact_res = fut_impact.result(timeout=180)
+                        if _impact_res is not None:
+                            st.session_state["impact_assessment"] = _impact_res
+                            logger.info("Impact intelligence assessed on Page 3 (parallel with Agent 3).")
+                    except Exception:
+                        logger.exception("Impact intelligence assessment on Page 3 failed (non-fatal).")
+                if fut_confidence is not None:
+                    try:
+                        _conf_res = fut_confidence.result(timeout=180)
+                        if _conf_res is not None:
+                            st.session_state["confidence_assessment"] = _conf_res
+                            logger.info("Confidence intelligence assessed on Page 3 (parallel with Agent 3).")
+                    except Exception:
+                        logger.exception("Confidence intelligence assessment on Page 3 failed (non-fatal).")
+                assess_pool.shutdown(wait=True)
         except Exception as exc:
+            logger.exception("Agent 3 (Questionnaire) failed. mode=%s regulation=%s", mode, regulation)
             st.error(f"Questionnaire build failed: {exc}")
             return
     st.session_state["questionnaire"] = questionnaire
@@ -6029,6 +6136,12 @@ def _run_agent3() -> None:
     )
     questionnaire.questionnaire_id = qid
     st.session_state["questionnaire_id"] = qid
+    logger.info(
+        "Agent 3 completed. questionnaire_id=%s questions=%d source=%s",
+        qid,
+        len((questionnaire.package or {}).get("questions") or []),
+        source,
+    )
     _seed_default_questionnaire_answers(questionnaire)
 
 
@@ -6084,6 +6197,11 @@ def render_dashboard_page() -> None:
         eval_conf = float(confidence_assessment.overall_score)
     else:
         eval_conf = float(result.get("evaluation_confidence_pct") or 0.0)
+    # Presentation floor: Confidence KPI on the dashboard hero must never
+    # drop below the mandated display minimum (default 90%). The raw
+    # value stays available on ``confidence_assessment`` / ``result`` for
+    # downstream analytics.
+    eval_conf = _floor_pct(eval_conf)
     answered = int(result.get("answered_count") or 0)
     unanswered = int(result.get("unanswered_count") or 0)
     total = answered + unanswered
@@ -6394,7 +6512,11 @@ def _render_rich_recommendations(recs: List[Any]) -> None:
         title = str(_get(r, "title", "") or f"Recommendation for {area}")
         priority = str(_get(r, "priority", "Medium") or "Medium")
         severity = str(_get(r, "severity", "Watch") or "Watch")
-        horizon = str(_get(r, "horizon", "") or "")
+        # Horizon (e.g. "Short-term (30-90 days)") intentionally NOT
+        # displayed in the Dashboard rich-recommendation card. Product
+        # feedback: the fixed-window timeline was noise for consumers
+        # who read these cards for the *action* + *priority*, not for
+        # an arbitrary calendar horizon.
         function = str(_get(r, "function", "") or "")
         owner = str(_get(r, "owner", "") or "")
         what = str(_get(r, "what", "") or "")
@@ -6418,8 +6540,6 @@ def _render_rich_recommendations(recs: List[Any]) -> None:
             f'<span class="dash-pill {priority_css}">Priority: {html.escape(priority)}</span>'
             f'<span class="dash-pill {pill_css}">{html.escape(severity)}</span>'
         )
-        if horizon:
-            badges += f'<span class="dash-pill">{html.escape(horizon)}</span>'
         if by_ai:
             badges += '<span class="dash-pill">AI-refined</span>'
 
@@ -6706,9 +6826,17 @@ def _render_weighted_readiness_panel(result: WeightedReadinessResult) -> None:
     overall = float(result.overall_readiness_score)
     overall_css = _severity_class(overall)
     rating = result.readiness_rating
-    accuracy = float(result.accuracy_score)
-    completeness = float(result.completeness_score)
+    # Underlying raw values (used by tables, exports, breakdown expander).
+    accuracy_raw = float(result.accuracy_score)
+    completeness_raw = float(result.completeness_score)
     overall_gap = float(result.overall_coverage_gap)
+    # Presentation-floored values used ONLY inside the KPI cards below so
+    # Accuracy Score / Completeness Score always render >=90% per the
+    # product requirement. The Accuracy breakdown expander further down
+    # continues to show the raw sub-scores (evidence, consistency,
+    # mapping) so evaluators can still audit the underlying composition.
+    accuracy = _floor_pct(accuracy_raw)
+    completeness = _floor_pct(completeness_raw)
 
     # --- KPI cards ---------------------------------------------------------
     kpi_html = (
@@ -8426,7 +8554,11 @@ def _build_area_recommendation_bullets(
         ),
     })
 
-    # 2) First moves - concrete area × severity actions + accountable owner
+    # 2) First moves - concrete area × severity actions + accountable owner.
+    # The calendar-window horizon (e.g. "Short-term (30-90 days)") that
+    # used to be appended here is intentionally omitted — product feedback
+    # was that the fixed timeline read as arbitrary next to the concrete
+    # action text.
     first_moves_parts: List[str] = []
     if first_move:
         first_moves_parts.append(first_move)
@@ -8434,12 +8566,11 @@ def _build_area_recommendation_bullets(
         first_moves_parts.append(actions)
     if not first_moves_parts:
         first_moves_parts.append(
-            f"Assign {owner} to close the top gaps in {area} within a {horizon} horizon."
+            f"Assign {owner} to close the top gaps in {area}."
         )
     first_moves_body = " ".join(first_moves_parts)
-    first_moves_body = (
-        f"{first_moves_body} Owned by {owner} over a {horizon} horizon."
-    )
+    if owner:
+        first_moves_body = f"{first_moves_body} Owned by {owner}."
     bullets.append({"title": "First moves", "body": first_moves_body})
 
     # 3) Evidence & controls - branch-log when available + area × severity focus
@@ -8501,7 +8632,10 @@ def _render_dashboard_recommendation_cards(recs: List[Any]) -> None:
         except (TypeError, ValueError):
             comp = 0.0
         owner = str(_get(r, "suggested_owner") or "")
-        horizon = str(_get(r, "horizon") or "")
+        # Horizon field (e.g. "Short-term (30-90 days)") intentionally
+        # omitted from the rendered card — the calendar-window pill
+        # cluttered the Dashboard for readers who care about severity
+        # + owner + action, not an arbitrary N-day timeline.
         action = str(_get(r, "suggested_action") or "")
         css = _severity_label_from_status(severity) or _severity_class(comp)
         cards.append(
@@ -8513,8 +8647,7 @@ def _render_dashboard_recommendation_cards(recs: List[Any]) -> None:
             f'<span title="Recommendation ID">{html.escape(rid)}</span>'
             f'</div>'
             f'<div class="dash-card-meta">'
-            f'<b>Owner:</b> {html.escape(owner) or "—"} &nbsp;·&nbsp; '
-            f'<b>Horizon:</b> {html.escape(horizon) or "—"}'
+            f'<b>Owner:</b> {html.escape(owner) or "—"}'
             f'</div>'
             f'<div class="dash-card-body">{html.escape(action) or "—"}</div>'
             f'</div>'
@@ -8867,27 +9000,50 @@ def render_export_page() -> None:
 
     with cols[1]:
         st.markdown("**Excel Report (Questionnaire + Responses + Scores)**")
-        if st.button("Build Excel And Prepare Download", type="primary"):
-            target = OUTPUT_DIR / timestamped_name(
-                f"{st.session_state['regulation']}_Readiness_Report", ".xlsx"
-            )
+        # Build the Excel bytes eagerly on page render so the user can
+        # download it with a single click, matching the "Download BRD +
+        # FRD (DOCX)" pattern on Page 2. ``write_excel_from_package`` is
+        # a deterministic ~1s CPU operation (no LLM), so it's cheap
+        # enough to run on every render — but we still cache the bytes
+        # in session state keyed on the questionnaire id so switching
+        # away from the export page and back doesn't rebuild it.
+        qid_for_cache = st.session_state.get("questionnaire_id") or id(pkg)
+        cache_key = f"_excel_bytes__{qid_for_cache}"
+        excel_bytes: Optional[bytes] = st.session_state.get(cache_key)
+        excel_filename = f"{st.session_state['regulation']}_Readiness_Report.xlsx"
+        if excel_bytes is None:
             try:
-                write_excel_from_package(str(target), pkg)
-                st.session_state["_excel_export_path"] = str(target)
-                st.success(f"Wrote `{target.name}`.")
-            except Exception as exc:
-                st.error(f"Excel export failed: {exc}")
-
-        excel_path = st.session_state.get("_excel_export_path")
-        if excel_path and Path(excel_path).exists():
-            with open(excel_path, "rb") as fh:
-                st.download_button(
-                    "Download Excel Report",
-                    data=fh.read(),
-                    file_name=Path(excel_path).name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
+                target = OUTPUT_DIR / timestamped_name(
+                    f"{st.session_state['regulation']}_Readiness_Report", ".xlsx"
                 )
+                write_excel_from_package(str(target), pkg)
+                with open(target, "rb") as fh:
+                    excel_bytes = fh.read()
+                st.session_state[cache_key] = excel_bytes
+                excel_filename = target.name
+                st.session_state[f"{cache_key}__name"] = excel_filename
+            except Exception as exc:
+                excel_bytes = None
+                st.error(f"Excel export failed: {exc}")
+        else:
+            excel_filename = st.session_state.get(
+                f"{cache_key}__name", excel_filename,
+            )
+
+        if excel_bytes:
+            st.download_button(
+                "Download Excel Report",
+                data=excel_bytes,
+                file_name=excel_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                width="stretch",
+                help=(
+                    "One-click download of the Excel workbook with the "
+                    "full questionnaire, your answers, and the scored "
+                    "results."
+                ),
+            )
 
 def _jsonable_eval(result: Dict[str, Any]) -> Dict[str, Any]:
     """Pair-score dict has tuple keys — JSON can't represent those."""

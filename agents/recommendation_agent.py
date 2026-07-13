@@ -31,7 +31,10 @@ Implementation strategy
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from models.workflow_models import (
     QuestionnairePackage,
@@ -100,6 +103,10 @@ class RecommendationAgent:
         roles = normalize_client_roles(client_roles) if client_roles else []
         if not roles and analysis is not None:
             roles = normalize_client_roles(getattr(analysis, "client_roles", None) or [])
+        logger.info(
+            "Agent 4 recommend() start. min_severity=%s top_n=%d enrich=%s roles=%s",
+            min_severity, top_n_requirements, enrich_with_genai, roles or None,
+        )
 
         # Scope the analysis to in-scope obligations without mutating the
         # caller's copy (persistence + UI still keep the full obligation
@@ -130,6 +137,9 @@ class RecommendationAgent:
                 )
                 used_genai = True
             except Exception:
+                logger.exception(
+                    "Agent 4: GenAI enrichment of recommendations FAILED (using deterministic drafts).",
+                )
                 used_genai = False
 
         rich = build_rich_recommendations(
@@ -167,7 +177,9 @@ class RecommendationAgent:
                 regulation=regulation,
             )
         except Exception:  # pragma: no cover - never block recs on eval bug
-            pass
+            logger.exception(
+                "Agent 4: recommendation evaluation loop FAILED (non-fatal).",
+            )
 
         return RecommendationResult(
             recommendations=list(recs),

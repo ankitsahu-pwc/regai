@@ -14,12 +14,15 @@ session and call these functions.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from .ai_branch_generator import LLMInvoker, generate_option_followups
 from .branch_registry import lookup_branch
@@ -183,10 +186,18 @@ def answered(q: Any, responses: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 def stable_dynamic_id(parent_id: str, suffix: str) -> str:
+    """Build a stable, traceable ID for a dynamic follow-up question.
+
+    Dynamic follow-ups share the ``Q-`` namespace with base questions so the
+    entire questionnaire reads as a single ``Q-0001, Q-0002, ...`` sequence
+    (with dynamic children pinned to their parent via the ``__suffix`` tail).
+    If the parent is itself a dynamic child (already has ``__``), we root back
+    to the original ``Q-XXXX`` ancestor so grand-children stay traceable.
+    """
     base = parent_id or "Q-0000"
-    if base.startswith("DQ-"):
-        base = base.split("__", 1)[0].replace("DQ-", "Q-")
-    return f"DQ-{base.replace('Q-', '')}__{suffix}"
+    if "__" in base:
+        base = base.split("__", 1)[0]
+    return f"{base}__{suffix}"
 
 
 def dynamic_depth(q: Any) -> int:
@@ -262,7 +273,8 @@ def materialize_branch_spec(
     """
     parent_id = parent.get("question_id", "Q-0000")
     base_qid = str(spec.get("question_id") or "BRANCH").strip() or "BRANCH"
-    namespaced_qid = f"DQ-{parent_id.replace('Q-', '').replace('DQ-', '')}__{base_qid}"
+    ancestor_id = parent_id.split("__", 1)[0] if "__" in parent_id else parent_id
+    namespaced_qid = f"{ancestor_id}__{base_qid}"
     options = spec.get("options") or ["Unknown"]
     rule_id = str(spec.get("branch_rule_id") or f"branch::{base_qid}")
     rationale = str(spec.get("rationale") or (
@@ -945,6 +957,11 @@ def evaluate(
     in the scoring loop so registry-driven follow-ups contribute to readiness.
     Each dynamic Q's answer is scored once (de-duplicated by question_id).
     """
+    logger.debug(
+        "scoring.evaluate() start. base=%d dynamic=%d responses=%d skipped=%d",
+        len(questions or []), len(state.dynamic_queue or []),
+        len(state.responses or {}), len(state.skipped_ids or set()),
+    )
     area_num: Dict[str, float] = defaultdict(float)
     area_den: Dict[str, float] = defaultdict(float)
     area_counts: Dict[str, int] = defaultdict(int)

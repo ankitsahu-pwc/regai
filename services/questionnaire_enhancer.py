@@ -32,6 +32,7 @@ severity / weight metadata and reorders the list.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Mapping, Optional
 
 from models.workflow_models import ImpactAssessment
@@ -41,6 +42,8 @@ from .severity import (
     from_label,
     weight_from_band,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _build_impact_severity_index(
@@ -165,7 +168,7 @@ def enhance_questionnaire_package(
     scoring_evaluation: Optional[Mapping[str, Any]] = None,
     regulation: str = "DORA",
 ) -> Dict[str, Any]:
-    """Decorate questions with impact severity + weights and reorder.
+    """Decorate questions with impact severity + weights (positional order preserved).
 
     Steps (no content is added or removed):
 
@@ -175,8 +178,14 @@ def enhance_questionnaire_package(
        ``impact_level`` / ``priority_rank`` and bump ``scoring_weight``
        to the impact-derived value (never lower — an AI-set weight wins
        when it is higher).
-    3. Sort questions by priority: highest severity first, then closed
-       before free-text, then by scoring weight, then by area.
+
+    Note: the historic severity-based reordering step was removed. Questions
+    keep the natural funnel order established by
+    :func:`_renumber_and_relink` / :func:`dedupe_and_resequence_questions`
+    (parent immediately followed by its static children, roots in generation
+    order). The severity metadata is still applied so the scoring engine and
+    weighted readiness continue to work, but the visible sequence is now
+    positional (``Q-0001, Q-0002, ...``) rather than criticality-driven.
 
     The input dict is mutated in place and also returned.
     """
@@ -218,16 +227,16 @@ def enhance_questionnaire_package(
         q["impact_weight"] = target_weight
         q["priority_rank"] = _severity_rank(severity)
 
-    def _sort_key(q: Mapping[str, Any]):
-        return (
-            -int(q.get("priority_rank", 2)),
-            1 if q.get("is_free_text") else 0,
-            -int(q.get("scoring_weight", 1)),
-            str(q.get("area", "")),
-            str(q.get("question_id", "")),
-        )
-
-    questions.sort(key=_sort_key)
+    # Severity-based reordering intentionally removed — the questionnaire is
+    # rendered in the natural funnel order (parent -> its children -> next
+    # parent -> its children -> free-text SME narratives at the end) so the
+    # sequential Q-0001, Q-0002... numbering is positional, not
+    # criticality-driven. Scoring still uses per-question ``priority_rank`` /
+    # ``impact_weight`` / ``scoring_weight`` metadata set above.
+    logger.info(
+        "Questionnaire enhanced. questions=%d areas=%d",
+        len(questions), len(severity_by_area),
+    )
     package["questions"] = questions
 
     meta = dict(package.get("metadata") or {})

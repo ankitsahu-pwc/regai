@@ -44,8 +44,11 @@ Design goals
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from agents import (
     BRDRTMAgent,
@@ -97,6 +100,10 @@ class RegulatoryWorkflowOrchestrator:
         self.brd_rtm_agent = BRDRTMAgent()
         self.questionnaire_agent = QuestionnaireAgent()
         self.recommendation_agent = RecommendationAgent(client=client)
+        logger.info(
+            "Orchestrator initialised. genai_client=%s",
+            "configured" if client is not None else "offline",
+        )
 
     # ------------------------------------------------------------------
     # Stage: Document Parser
@@ -105,7 +112,19 @@ class RegulatoryWorkflowOrchestrator:
     @staticmethod
     def parse_document(path: Path, *, kind: str = "regulation") -> ParsedDocument:
         """Read a PDF/DOCX from disk into a :class:`ParsedDocument`."""
-        return document_parser.parse_document(path, kind=kind)
+        logger.info("Parsing document. path=%s kind=%s", path, kind)
+        try:
+            parsed = document_parser.parse_document(path, kind=kind)
+        except Exception:
+            logger.exception("Document parse failed. path=%s kind=%s", path, kind)
+            raise
+        logger.info(
+            "Document parsed. path=%s pages=%s chars=%s",
+            path,
+            getattr(parsed, "page_count", None),
+            len(getattr(parsed, "text", "") or ""),
+        )
+        return parsed
 
     # ------------------------------------------------------------------
     # Stage: Agent 1 — Regulatory Analysis
@@ -125,18 +144,34 @@ class RegulatoryWorkflowOrchestrator:
         client_roles: Optional[Sequence[str]] = None,
         client_profile: Optional[Mapping[str, Any]] = None,
     ) -> RegulatoryAnalysis:
-        return self.regulatory_analysis_agent.analyze(
-            parsed_document=parsed_document,
-            regulation=regulation,
-            tier=tier,
-            status=status,
-            regulator_selection=regulator_selection,
-            consulting_selection=consulting_selection,
-            include_consulting_guidance=include_consulting_guidance,
-            intelligence_package=intelligence_package,
-            client_roles=client_roles,
-            client_profile=dict(client_profile) if client_profile else None,
+        logger.info(
+            "Agent 1 (Regulatory Analysis) invoked. regulation=%s tier=%s regulators=%s client_roles=%s parsed_doc=%s",
+            regulation, tier, list(regulator_selection or []) or None,
+            list(client_roles or []) or None,
+            "yes" if parsed_document is not None else "no",
         )
+        try:
+            result = self.regulatory_analysis_agent.analyze(
+                parsed_document=parsed_document,
+                regulation=regulation,
+                tier=tier,
+                status=status,
+                regulator_selection=regulator_selection,
+                consulting_selection=consulting_selection,
+                include_consulting_guidance=include_consulting_guidance,
+                intelligence_package=intelligence_package,
+                client_roles=client_roles,
+                client_profile=dict(client_profile) if client_profile else None,
+            )
+        except Exception:
+            logger.exception("Agent 1 (Regulatory Analysis) crashed. regulation=%s", regulation)
+            raise
+        logger.info(
+            "Agent 1 completed. obligations=%d requirements=%d",
+            len(getattr(result, "obligations", []) or []),
+            len(getattr(result, "requirements", []) or []),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Stage: Regulatory Intelligence Pipeline (Stage 1 + Stage 2)
@@ -176,11 +211,24 @@ class RegulatoryWorkflowOrchestrator:
         tier: Optional[str] = None,
     ) -> dict:
         """Return ``{"brd": BRDArtifact, "rtm": RTMArtifact}``."""
-        return self.brd_rtm_agent.build(
-            analysis,
-            docx_export_path=docx_export_path,
-            tier=tier,
+        logger.info("Agent 2 (BRD + RTM) invoked. tier=%s docx=%s", tier, docx_export_path)
+        try:
+            bundle = self.brd_rtm_agent.build(
+                analysis,
+                docx_export_path=docx_export_path,
+                tier=tier,
+            )
+        except Exception:
+            logger.exception("Agent 2 (BRD + RTM) crashed. tier=%s", tier)
+            raise
+        brd = bundle.get("brd") if isinstance(bundle, dict) else None
+        rtm = bundle.get("rtm") if isinstance(bundle, dict) else None
+        logger.info(
+            "Agent 2 completed. brd_requirements=%d rtm_rows=%d",
+            len(getattr(brd, "requirements", []) or []) if brd else 0,
+            len(getattr(rtm, "entries", []) or []) if rtm else 0,
         )
+        return bundle
 
     # ------------------------------------------------------------------
     # Stage: Agent 3 — Questionnaire Generation
@@ -213,14 +261,27 @@ class RegulatoryWorkflowOrchestrator:
         forwarded — when ``None``, the AI agent falls back to
         manual-review placeholders (no hardcoded templates).
         """
-        return self.questionnaire_agent.from_report(
-            brd, regulation=regulation, name=name,
-            impact=impact, readiness=readiness,
-            analysis=analysis, rtm=rtm,
-            client_roles=client_roles,
-            client_profile=dict(client_profile) if client_profile else None,
-            client=self.client,
+        logger.info(
+            "Agent 3 (Questionnaire) invoked from BRD report. regulation=%s client_roles=%s",
+            regulation, list(client_roles or []) or None,
         )
+        try:
+            pkg = self.questionnaire_agent.from_report(
+                brd, regulation=regulation, name=name,
+                impact=impact, readiness=readiness,
+                analysis=analysis, rtm=rtm,
+                client_roles=client_roles,
+                client_profile=dict(client_profile) if client_profile else None,
+                client=self.client,
+            )
+        except Exception:
+            logger.exception("Agent 3 (from report) crashed. regulation=%s", regulation)
+            raise
+        logger.info(
+            "Agent 3 completed. questions=%d",
+            len((pkg.package or {}).get("questions") or []),
+        )
+        return pkg
 
     def run_questionnaire_from_docx(
         self, path: Path, *, regulation: str = "DORA",
@@ -237,14 +298,27 @@ class RegulatoryWorkflowOrchestrator:
         See :meth:`run_questionnaire_from_report` for how the ``impact``
         and ``readiness`` assessments shape the AI generator's output.
         """
-        return self.questionnaire_agent.from_docx(
-            path, regulation=regulation, name=name,
-            impact=impact, readiness=readiness,
-            analysis=analysis, rtm=rtm,
-            client_roles=client_roles,
-            client_profile=dict(client_profile) if client_profile else None,
-            client=self.client,
+        logger.info(
+            "Agent 3 (Questionnaire) invoked from uploaded DOCX. path=%s regulation=%s",
+            path, regulation,
         )
+        try:
+            pkg = self.questionnaire_agent.from_docx(
+                path, regulation=regulation, name=name,
+                impact=impact, readiness=readiness,
+                analysis=analysis, rtm=rtm,
+                client_roles=client_roles,
+                client_profile=dict(client_profile) if client_profile else None,
+                client=self.client,
+            )
+        except Exception:
+            logger.exception("Agent 3 (from DOCX) crashed. path=%s regulation=%s", path, regulation)
+            raise
+        logger.info(
+            "Agent 3 (from DOCX) completed. questions=%d",
+            len((pkg.package or {}).get("questions") or []),
+        )
+        return pkg
 
     def load_questionnaire_package(
         self, package: Mapping[str, Any], *, source: str = "uploaded_json",
@@ -270,13 +344,26 @@ class RegulatoryWorkflowOrchestrator:
         package = questionnaire.package
         base_questions = list(package.get("questions") or [])
         active = applicable_base_questions(state, base_questions) + list(state.dynamic_queue)
-        evaluation = evaluate(active, state)
+        logger.debug(
+            "Rules engine invoked. base_questions=%d active=%d responses=%d dynamic_queue=%d",
+            len(base_questions), len(active), len(state.responses or {}), len(state.dynamic_queue or []),
+        )
+        try:
+            evaluation = evaluate(active, state)
+        except Exception:
+            logger.exception("Rules engine evaluate() crashed. active_questions=%d", len(active))
+            raise
 
         req_scores = evaluation.get("requirement_scores") or {}
         top_gaps = [
             {"requirement_id": rid, "compliance_pct": round(score, 1)}
             for rid, score in sorted(req_scores.items(), key=lambda kv: kv[1])[:10]
         ]
+        logger.info(
+            "Rules engine done. compliance=%.1f%% top_gap=%s",
+            float(evaluation.get("compliance_score_pct") or 0.0),
+            top_gaps[0]["requirement_id"] if top_gaps else None,
+        )
         return ScoringResult(evaluation=evaluation, top_gaps=top_gaps)
 
     # ------------------------------------------------------------------
@@ -295,16 +382,29 @@ class RegulatoryWorkflowOrchestrator:
         analysis: Optional[RegulatoryAnalysis] = None,
         client_roles: Optional[Sequence[str]] = None,
     ) -> RecommendationResult:
-        return self.recommendation_agent.recommend(
-            questionnaire,
-            scoring,
-            min_severity=min_severity,
-            top_n_requirements=top_n_requirements,
-            enrich_with_genai=enrich_with_genai,
-            branch_log=branch_log,
-            analysis=analysis,
-            client_roles=client_roles,
+        logger.info(
+            "Agent 4 (Recommendations) invoked. min_severity=%s top_n=%d enrich=%s",
+            min_severity, top_n_requirements, enrich_with_genai,
         )
+        try:
+            result = self.recommendation_agent.recommend(
+                questionnaire,
+                scoring,
+                min_severity=min_severity,
+                top_n_requirements=top_n_requirements,
+                enrich_with_genai=enrich_with_genai,
+                branch_log=branch_log,
+                analysis=analysis,
+                client_roles=client_roles,
+            )
+        except Exception:
+            logger.exception("Agent 4 (Recommendations) crashed.")
+            raise
+        logger.info(
+            "Agent 4 completed. recommendations=%d",
+            len(getattr(result, "recommendations", []) or []),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Stage: AI Assessment Intelligence

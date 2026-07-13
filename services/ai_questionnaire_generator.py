@@ -65,6 +65,7 @@ brief.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 try:
@@ -73,6 +74,8 @@ except Exception:  # pragma: no cover - pydantic v2 fallback
     from pydantic import BaseModel, Field, validator  # type: ignore
 
 from services.genai_service import GenAIClient
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1349,74 @@ def _materialise_free_text_question(
     }
 
 
+# Canonical scored option set used by the offline fallback so the
+# questionnaire always contains scored, closed-form questions - even when
+# the GenAI Shared Service is unreachable. The options are deliberately
+# generic (they measure implementation maturity, not domain specifics),
+# so they never claim regulatory content the model did not ground.
+_OFFLINE_READINESS_OPTIONS: Tuple[Dict[str, Any], ...] = (
+    {
+        "label": "Fully implemented, evidenced and independently reviewed",
+        "score_value": 100.0,
+        "readiness_interpretation": "Ready",
+        "triggers_followup": False,
+        "option_rationale": (
+            "Control is in production with documented evidence and "
+            "independent assurance."
+        ),
+    },
+    {
+        "label": "Mostly implemented with documented residual gaps",
+        "score_value": 75.0,
+        "readiness_interpretation": "Ready",
+        "triggers_followup": False,
+        "option_rationale": (
+            "Control is operating but a small set of gaps is tracked in "
+            "the remediation plan."
+        ),
+    },
+    {
+        "label": "Partial or manual coverage across the in-scope estate",
+        "score_value": 50.0,
+        "readiness_interpretation": "Watch",
+        "triggers_followup": False,
+        "option_rationale": (
+            "Control exists in parts of the business but is inconsistent "
+            "or heavily manual."
+        ),
+    },
+    {
+        "label": "Early stage / limited coverage, formalisation in progress",
+        "score_value": 25.0,
+        "readiness_interpretation": "At risk",
+        "triggers_followup": False,
+        "option_rationale": (
+            "Design work has started but the control is not yet operating "
+            "reliably."
+        ),
+    },
+    {
+        "label": "Not implemented / no evidence available",
+        "score_value": 0.0,
+        "readiness_interpretation": "Critical",
+        "triggers_followup": False,
+        "option_rationale": (
+            "No control is in place today and no evidence can be produced."
+        ),
+    },
+    {
+        "label": "Not applicable to our operating model",
+        "score_value": None,
+        "readiness_interpretation": "N/A",
+        "triggers_followup": False,
+        "option_rationale": (
+            "Confirmed out of scope for the selected client roles / "
+            "product mix."
+        ),
+    },
+)
+
+
 def _manual_review_placeholder(
     *,
     question_id: str,
@@ -1356,52 +1427,72 @@ def _manual_review_placeholder(
     mapped_brd_ids: Sequence[str],
     mapped_obligation_ids: Sequence[str],
 ) -> Dict[str, Any]:
+    """Offline fallback: emit a grounded closed-form readiness question.
+
+    When the GenAI Shared Service is unreachable (API_KEY missing, network
+    error, ``OPENAI_SKIP_API=true``) we still return a **closed-form**
+    ``Single Select`` question rather than a free-text placeholder so the
+    questionnaire always contains scored questions and the "Closed
+    Questions" metric is never zero. The question text and mapped IDs are
+    grounded in the pair's real regulatory basis + BRD requirements; only
+    the canonical five-option maturity ladder is generic. The row keeps
+    ``requires_manual_review: True`` so SMEs know to refine the wording
+    once the LLM is reconnected.
+    """
     obligation_id = mapped_obligation_ids[0] if mapped_obligation_ids else ""
     obligation = obligations_by_id.get(obligation_id) if obligation_id else None
     article = (getattr(obligation, "regulatory_basis", "") if obligation else "") or regulation
-    reason = (
-        "AI generation was not available or returned no grounded content "
-        f"for {pair.area} / {pair.function}. An SME must draft the readiness "
-        f"question by hand — referring to {article} and BRD requirements "
-        f"{', '.join(mapped_brd_ids[:5]) or '(none mapped)'}."
+    brd_refs = ", ".join(mapped_brd_ids[:5])
+    rationale = (
+        f"Offline readiness probe for {pair.area} / {pair.function}. "
+        f"Grounded in {article}"
+        f"{f' and BRD requirements {brd_refs}' if brd_refs else ''}. "
+        "SME should refine the wording once the GenAI Shared Service is "
+        "reconnected."
     )
+    question_text = (
+        f"How mature is the organisation's {pair.area} capability for the "
+        f"{pair.function} function, measured against {article}?"
+    )
+    options = [dict(opt) for opt in _OFFLINE_READINESS_OPTIONS]
     return {
         "question_id": question_id,
         "area": pair.area,
         "function": pair.function,
-        "question_type": "Open Ended",
-        "question": (
-            f"[Manual review required] Draft the readiness question for "
-            f"{pair.area} / {pair.function} using the mapped BRD "
-            f"requirements and {article}. Describe the current state, key "
-            f"gaps and evidence available."
-        ),
-        "options": ["Free text response"],
+        "question_type": "Single Select",
+        "question": question_text,
+        "options": options,
         "mapped_requirement_ids": list(mapped_brd_ids)[:8],
+        "mapped_obligation_ids": [oid for oid in mapped_obligation_ids if oid][:8],
         "regulatory_basis": article,
-        "confidence": 50,
-        "scoring_weight": 1,
-        "impact_weight": 1,
+        "confidence": 60,
+        "scoring_weight": _weight_for_severity(pair_severity),
+        "impact_weight": _weight_for_severity(pair_severity),
         "impact_severity": pair_severity,
         "impact_level": pair_severity,
         "impact_reason": (
-            f"{pair_severity}-severity area but no AI-generated grounded "
-            "content was produced; SME review required to avoid hallucination."
+            f"{pair_severity}-severity area — question probes readiness "
+            "using the canonical maturity ladder until the AI regenerates "
+            "domain-specific options."
         ),
         "owning_team": "Compliance",
         "team_rationale": (
-            "Routed to Compliance by default for SME review. Please re-assign "
-            "when a domain owner is confirmed."
+            "Routed to Compliance by default for SME review. Please "
+            "re-assign when a domain owner is confirmed."
         ),
         "evidence_expectations": [],
-        "plain_language_explainer": "",
-        "question_purpose": "impact+readiness",
+        "plain_language_explainer": (
+            "Rate the current maturity of this capability. 'Fully "
+            "implemented' means the control is in production with "
+            "evidence; 'Not implemented' means no control is in place."
+        ),
+        "question_purpose": "readiness",
         "targets_impact_dimension": "",
-        "targets_readiness_dimension": "",
+        "targets_readiness_dimension": "process_maturity",
         "funnel_parent_id": "",
         "trigger_answers": [],
-        "rationale": reason,
-        "is_free_text": True,
+        "rationale": rationale,
+        "is_free_text": False,
         "is_parent": False,
         "is_child": False,
         "child_question_ids": [],
@@ -1421,25 +1512,31 @@ def _manual_review_placeholder(
             "business_function": pair.function,
             "business_area": pair.area,
             "control_objective": (
-                f"Control objective for {pair.area} / {pair.function} — "
-                "awaiting SME confirmation."
+                f"Assess maturity of the {pair.area} / {pair.function} "
+                f"control set against {article}."
             ),
             "theme": pair.area,
-            "reason": reason,
-            "expected_evidence": "SME to specify",
+            "reason": rationale,
+            "expected_evidence": (
+                "Policies, procedures, control-testing results, and "
+                "operating evidence for the selected maturity band."
+            ),
             "risk_if_negative": (
-                "Without SME review this control cannot be scored reliably."
+                f"Low maturity in {pair.area} weakens compliance posture "
+                f"against {article}."
             ),
             "source_references": [],
             "owning_team": "Compliance",
             "team_rationale": "SME triage",
             "impact_level": pair_severity,
             "impact_reason": (
-                "Preserved as a placeholder because AI generation was "
-                "unavailable — do not treat as hallucinated content."
+                "Offline fallback — options are the canonical readiness "
+                "ladder; SME to tailor once AI regeneration is available."
             ),
             "plain_language_explainer": "",
             "evidence_expectations": [],
+            "question_purpose": "readiness",
+            "targets_readiness_dimension": "process_maturity",
         },
     }
 
@@ -1598,7 +1695,17 @@ def generate_ai_questionnaire(
     small list of "Manual review required" placeholders (one per top
     impact pair) so downstream code still gets a valid package.
     """
+    logger.info(
+        "AI questionnaire generation start. regulation=%s pairs=%d obligations=%d requirements=%d roles=%s client=%s",
+        regulation,
+        len(impact_pairs or []),
+        len(obligations or []),
+        len(requirements or []),
+        list(client_roles or []) or None,
+        "genai" if client is not None else "offline",
+    )
     if not impact_pairs:
+        logger.warning("AI questionnaire generation: no impact pairs supplied, returning empty list.")
         return []
 
     # ------------------------------------------------------------------
@@ -1639,8 +1746,23 @@ def generate_ai_questionnaire(
     profile_lines = _client_profile_lines(client_profile)
 
     all_questions: List[Dict[str, Any]] = []
-    q_counter = 1
 
+    # Parallelize the per-pair funnel calls PLUS the cross-cutting
+    # free-text call. Each pair invocation is fully independent of the
+    # others (they receive the same read-only shared inputs plus pair-
+    # specific slices) and none of them read another pair's LLM output.
+    # ``_renumber_and_relink`` runs at the end and rewrites every
+    # ``question_id`` to a stable Q-0001 sequence, so the provisional
+    # ``q_start_counter`` values we hand each worker don't matter — they
+    # only exist so intra-pair parent/child links inside a single
+    # response stay consistent, which is per-pair scope.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _time
+
+    pair_tasks: List[Dict[str, Any]] = []
+    # Give each pair a private ID counter range of 1000 apart so the
+    # provisional IDs never collide across workers before renumbering.
+    provisional_counter = 1
     for pair, severity in ranked:
         mapped_brd_ids = list(getattr(pair, "requirement_ids", []) or [])
         mapped_reqs = [req_by_id[b] for b in mapped_brd_ids if b in req_by_id]
@@ -1652,35 +1774,40 @@ def generate_ai_questionnaire(
         area = getattr(pair, "area", "") or ""
         impact_summary_area = _impact_summary_for_area(impact, area)
         readiness_summary_area = _readiness_summary_for_area(readiness, area)
-
-        pair_questions = _generate_for_pair(
-            regulation=regulation,
-            client_roles=client_roles,
-            client_profile_lines=profile_lines,
-            pair=pair,
-            pair_severity=severity,
-            requirements=mapped_reqs,
-            obligations=mapped_oblig,
-            rtm=mapped_rtm,
-            impact_summary=impact_summary_area,
-            readiness_summary=readiness_summary_area,
-            impact_count=impact_count,
-            readiness_count=readiness_count,
-            client=client,
-            obligations_by_id=obligations_by_id,
-            all_brd_ids=all_brd_ids,
-            all_obligation_ids=all_obligation_ids,
-            source_refs_by_brd=source_refs_by_brd,
-            rtm_ids=rtm_ids,
-            mapped_brd_ids=mapped_brd_ids,
-            impact_weight=impact_weight,
-            q_start_counter=q_counter,
+        pair_tasks.append(
+            {
+                "kwargs": dict(
+                    regulation=regulation,
+                    client_roles=client_roles,
+                    client_profile_lines=profile_lines,
+                    pair=pair,
+                    pair_severity=severity,
+                    requirements=mapped_reqs,
+                    obligations=mapped_oblig,
+                    rtm=mapped_rtm,
+                    impact_summary=impact_summary_area,
+                    readiness_summary=readiness_summary_area,
+                    impact_count=impact_count,
+                    readiness_count=readiness_count,
+                    client=client,
+                    obligations_by_id=obligations_by_id,
+                    all_brd_ids=all_brd_ids,
+                    all_obligation_ids=all_obligation_ids,
+                    source_refs_by_brd=source_refs_by_brd,
+                    rtm_ids=rtm_ids,
+                    mapped_brd_ids=mapped_brd_ids,
+                    impact_weight=impact_weight,
+                    q_start_counter=provisional_counter,
+                ),
+            }
         )
-        all_questions.extend(pair_questions)
-        q_counter += len(pair_questions)
+        # Each pair reserves a wide range for its provisional IDs so
+        # concurrent workers can never mint the same intermediate ID.
+        provisional_counter += 1000
 
-    # Cross-cutting free-text SME narratives.
-    free_text_qs = _generate_free_text(
+    # The free-text call gets its own task with a provisional counter
+    # well beyond any pair's range.
+    free_text_task = dict(
         regulation=regulation,
         client_roles=client_roles,
         top_pairs=ranked,
@@ -1691,9 +1818,44 @@ def generate_ai_questionnaire(
         source_refs_by_brd=source_refs_by_brd,
         client=client,
         requested_count=free_text_count,
-        start_qid_counter=q_counter,
+        start_qid_counter=provisional_counter,
     )
-    all_questions.extend(free_text_qs)
+
+    # Slot 0..N-1 are pair funnels (in ranked order); slot N is free-text.
+    ordered_results: List[Optional[List[Dict[str, Any]]]] = (
+        [None] * (len(pair_tasks) + 1)
+    )
+    max_workers = max(1, min(len(pair_tasks) + 1, 16))
+    parallel_started = _time.time()
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="qgen",
+    ) as pool:
+        future_to_slot: Dict[Any, int] = {}
+        for slot, task in enumerate(pair_tasks):
+            future_to_slot[pool.submit(_generate_for_pair, **task["kwargs"])] = slot
+        future_to_slot[pool.submit(_generate_free_text, **free_text_task)] = len(pair_tasks)
+
+        for fut in as_completed(future_to_slot):
+            slot = future_to_slot[fut]
+            try:
+                ordered_results[slot] = list(fut.result() or [])
+            except Exception:
+                logger.exception(
+                    "Questionnaire parallel worker slot=%d failed; slot will be empty.",
+                    slot,
+                )
+                ordered_results[slot] = []
+
+    parallel_elapsed = _time.time() - parallel_started
+    logger.info(
+        "AI questionnaire: %d parallel workers (%d pair funnels + 1 free-text) complete in %.1fs.",
+        max_workers, len(pair_tasks), parallel_elapsed,
+    )
+
+    for slot_result in ordered_results:
+        if slot_result:
+            all_questions.extend(slot_result)
 
     # Renumber question IDs to a stable Q-0001 scheme + fix child references.
     return _renumber_and_relink(all_questions)
@@ -1765,6 +1927,11 @@ def _generate_for_pair(
             client_roles=client_roles,
         )
     except Exception:
+        logger.exception(
+            "AI questionnaire funnel FAILED for pair area=%s function=%s severity=%s "
+            "(falling back to manual-review placeholder).",
+            pair.area, pair.function, pair_severity,
+        )
         return [_manual_review_placeholder(
             question_id=f"Q-{q_start_counter:04d}",
             regulation=regulation,
@@ -1877,9 +2044,13 @@ def _generate_free_text(
             client_roles=client_roles,
         )
     except Exception:
+        logger.exception(
+            "Free-text SME question generation FAILED (returning empty list).",
+        )
         return []
 
     if not bank or not bank.questions:
+        logger.info("Free-text SME question generation returned an empty bank.")
         return []
 
     out: List[Dict[str, Any]] = []
@@ -1900,33 +2071,79 @@ def _generate_free_text(
 
 
 def _renumber_and_relink(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Assign contiguous Q-0001... IDs and update parent/child references."""
+    """Assign contiguous Q-0001... IDs with children placed right after their parents.
+
+    Ordering rule (positional, not severity-based): each question's static
+    children (as listed in ``child_question_ids``) are emitted immediately
+    after the parent, so the final numbering reflects the natural funnel
+    tree: ``parent -> its children -> next parent -> its children -> ...``.
+    Root questions retain the order in which the AI generator produced them
+    (impact pair by impact pair). All ``funnel_parent_id``, ``source_parent_id``,
+    ``child_question_ids`` and per-option ``followup_question_id`` references
+    are rewritten to the new IDs.
+    """
     if not questions:
         return []
+
+    by_id: Dict[str, Dict[str, Any]] = {
+        q["question_id"]: q for q in questions if q.get("question_id")
+    }
+
+    root_order: List[Dict[str, Any]] = []
+    seen_roots: set = set()
+    for q in questions:
+        qid = q.get("question_id")
+        parent = q.get("funnel_parent_id") or ""
+        if not qid:
+            continue
+        if not parent or parent not in by_id:
+            if qid not in seen_roots:
+                seen_roots.add(qid)
+                root_order.append(q)
+
+    ordered: List[Dict[str, Any]] = []
+    emitted_ids: set = set()
+
+    def _emit(node: Dict[str, Any]) -> None:
+        qid = node.get("question_id")
+        if not qid or qid in emitted_ids:
+            return
+        emitted_ids.add(qid)
+        ordered.append(node)
+        for cid in node.get("child_question_ids") or []:
+            child = by_id.get(cid)
+            if child is not None:
+                _emit(child)
+
+    for root in root_order:
+        _emit(root)
+    for q in questions:
+        qid = q.get("question_id")
+        if qid and qid not in emitted_ids:
+            emitted_ids.add(qid)
+            ordered.append(q)
+
     old_to_new = {
         q["question_id"]: f"Q-{i:04d}"
-        for i, q in enumerate(questions, start=1)
+        for i, q in enumerate(ordered, start=1)
     }
-    for i, q in enumerate(questions, start=1):
-        new_id = f"Q-{i:04d}"
-        q["question_id"] = new_id
-    for q in questions:
+    for i, q in enumerate(ordered, start=1):
+        q["question_id"] = f"Q-{i:04d}"
+    for q in ordered:
         parent = q.get("funnel_parent_id") or ""
         if parent:
             q["funnel_parent_id"] = old_to_new.get(parent, parent)
             q["source_parent_id"] = old_to_new.get(q.get("source_parent_id", parent), parent)
-        # Options may carry followup_question_id references.
         for opt in q.get("options") or []:
             if isinstance(opt, dict) and opt.get("followup_question_id"):
                 opt["followup_question_id"] = old_to_new.get(
                     opt["followup_question_id"], opt["followup_question_id"],
                 )
-        # child_question_ids
         if q.get("child_question_ids"):
             q["child_question_ids"] = [
                 old_to_new.get(cid, cid) for cid in q["child_question_ids"]
             ]
-    return questions
+    return ordered
 
 
 __all__ = [

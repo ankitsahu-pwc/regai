@@ -30,7 +30,10 @@ engine's :func:`materialize_branch_spec` can consume them unchanged.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable, Dict, List, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 LLMInvoker = Callable[[str], str]
 
@@ -501,6 +504,10 @@ def generate_option_followups(
                 )
         except Exception:
             # Any error → transparent fallback to legacy / offline path.
+            logger.exception(
+                "AI branch generator (structured path) FAILED. parent=%s answer=%r (falling back to offline templates).",
+                parent.get("question_id"), selected_answer,
+            )
             llm_results = []
 
     # ---- Legacy: unstructured invoker (kept for backward compat) ----
@@ -510,6 +517,7 @@ def generate_option_followups(
                 from .guardrails import harden_instruction
                 hardened_system = harden_instruction(_LLM_SYSTEM_PROMPT)
             except Exception:  # pragma: no cover
+                logger.debug("Branch generator: guardrail hardening failed.", exc_info=True)
                 hardened_system = _LLM_SYSTEM_PROMPT
             prompt = (
                 hardened_system
@@ -519,6 +527,10 @@ def generate_option_followups(
             raw = llm_invoker(prompt) or ""
             llm_results = _parse_llm_response(raw)
         except Exception:
+            logger.exception(
+                "AI branch generator (legacy path) FAILED. parent=%s (falling back to offline templates).",
+                parent.get("question_id"),
+            )
             llm_results = []
 
     if llm_results:

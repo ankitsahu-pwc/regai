@@ -13,12 +13,15 @@ impacted area, impacted function, and the underlying BRD requirements.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .owner_registry import owner_for as _suggested_owner
 from .scoring_engine import cxo_status
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -189,6 +192,11 @@ def generate_recommendations(
     List[Recommendation]
         Sorted by severity descending, then compliance score ascending.
     """
+    logger.info(
+        "Generating recommendations. min_severity=%s top_n=%d evaluation_areas=%d",
+        min_severity, top_n_requirements,
+        len(evaluation.get("area_summary") or {}),
+    )
     severity_order = {"Critical": 0, "At risk": 1, "Watch": 2, "Ready": 3}
     min_rank = severity_order.get(min_severity, severity_order["Watch"])
 

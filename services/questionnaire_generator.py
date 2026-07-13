@@ -42,6 +42,7 @@ fabricates hardcoded questions.
 
 from __future__ import annotations
 
+import logging
 import os
 import re as _re
 from collections import Counter, defaultdict
@@ -50,6 +51,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from openpyxl import Workbook
+
+logger = logging.getLogger(__name__)
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -748,16 +751,63 @@ def dedupe_and_resequence_questions(questions: Sequence[Question]) -> List[Quest
         seen_area_kind_primary.add(area_kind_primary_key)
         kept.append(q)
 
+    # Positional (non-severity) ordering: place every static child right
+    # after its parent so the final Q-0001, Q-0002... numbering reflects the
+    # natural funnel tree rather than an impact-severity re-sort. Roots keep
+    # the order the AI produced them (impact pair by impact pair).
+    kept_by_id: Dict[str, Question] = {q.question_id: q for q in kept}
+    roots: List[Question] = []
+    seen_roots: set = set()
+    for q in kept:
+        parent = (q.funnel_parent_id or "").strip()
+        if not parent or parent not in kept_by_id:
+            if q.question_id not in seen_roots:
+                seen_roots.add(q.question_id)
+                roots.append(q)
+
+    ordered: List[Question] = []
+    emitted_ids: set = set()
+
+    def _emit(node: Question) -> None:
+        if node.question_id in emitted_ids:
+            return
+        emitted_ids.add(node.question_id)
+        ordered.append(node)
+        for cid in node.child_question_ids or []:
+            child = kept_by_id.get(cid)
+            if child is not None:
+                _emit(child)
+
+    for root in roots:
+        _emit(root)
+    for q in kept:
+        if q.question_id not in emitted_ids:
+            emitted_ids.add(q.question_id)
+            ordered.append(q)
+
     old_to_new: Dict[str, str] = {}
-    for idx, q in enumerate(kept, start=1):
+    for idx, q in enumerate(ordered, start=1):
         old_to_new[q.question_id] = f"Q-{idx:04d}"
-    for idx, q in enumerate(kept, start=1):
+    for idx, q in enumerate(ordered, start=1):
         q.question_id = f"Q-{idx:04d}"
+    for q in ordered:
         if q.funnel_parent_id:
-            q.funnel_parent_id = old_to_new.get(q.funnel_parent_id, "")
-            if not q.funnel_parent_id:
+            new_parent = old_to_new.get(q.funnel_parent_id, "")
+            q.funnel_parent_id = new_parent
+            if not new_parent:
                 q.trigger_answers = []
-    return kept
+        if getattr(q, "source_parent_id", ""):
+            q.source_parent_id = old_to_new.get(q.source_parent_id, q.source_parent_id)
+        if q.child_question_ids:
+            q.child_question_ids = [
+                old_to_new[cid] for cid in q.child_question_ids if cid in old_to_new
+            ]
+        for opt in q.options or []:
+            if isinstance(opt, dict) and opt.get("followup_question_id"):
+                opt["followup_question_id"] = old_to_new.get(
+                    opt["followup_question_id"], opt["followup_question_id"],
+                )
+    return ordered
 
 
 def generate_question_bank(
@@ -1427,7 +1477,14 @@ def _build_package(
     questions at the specific affected items and (b) target
     readiness-probing questions at the weakest maturity dimensions.
     """
+    logger.info(
+        "Building questionnaire package. regulation=%s requirements=%d obligations=%d roles=%s client=%s",
+        regulation, len(requirements), len(obligations or []),
+        list(client_roles or []) or None,
+        "genai" if client is not None else "offline",
+    )
     pairs = dedupe_impact_pairs(derive_impact_pairs(requirements, regulation))
+    logger.info("Impact pairs derived. total=%d (after dedup)", len(pairs))
     questions = generate_question_bank(
         requirements, pairs, regulation=regulation,
         obligations=obligations,
@@ -1440,6 +1497,10 @@ def _build_package(
         client=client,
     )
     overall, metrics = validate_and_score_package(requirements, pairs, questions)
+    logger.info(
+        "Questionnaire package assembled. questions=%d overall_confidence=%d",
+        len(questions), overall,
+    )
     return package_dict(regulation, requirements, pairs, questions, overall, metrics)
 
 

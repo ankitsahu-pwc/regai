@@ -32,9 +32,12 @@ Design principles
 from __future__ import annotations
 
 import json
+import logging
 from collections import defaultdict
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from pydantic import BaseModel, Field
@@ -1279,6 +1282,10 @@ def _enrich_with_genai(
     )
     if payload is None or not guardrail_report.ok:
         # Guardrails vetoed — return the deterministic draft untouched.
+        logger.warning(
+            "GenAI rich-recommendation rewrite vetoed. area=%s summary=%s",
+            rec.area, guardrail_report.summary() if guardrail_report else "n/a",
+        )
         return rec
 
     rec.title = str(payload.title or rec.title)
@@ -1336,6 +1343,12 @@ def build_rich_recommendations(
     silently to deterministic composition when the GenAI client is
     unavailable.
     """
+    logger.info(
+        "Building rich recommendations. enrich_with_genai=%s client=%s top_gaps=%d",
+        enrich_with_genai,
+        "genai" if client is not None else "offline",
+        len(top_gaps or []),
+    )
     regulation = getattr(analysis, "regulation", "") or ""
     area_summary = scoring_evaluation.get("area_summary") or {}
 

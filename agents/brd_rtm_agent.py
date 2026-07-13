@@ -30,9 +30,12 @@ Implementation strategy
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from models.workflow_models import (
     BRDArtifact,
@@ -75,6 +78,11 @@ class BRDRTMAgent:
         * every row carries per-role rationale strings, so exports quote why
           the requirement matters (or doesn't) for each institution type.
         """
+        logger.info(
+            "Agent 2 build() start. regulation=%s tier=%s obligations=%d docx=%s",
+            analysis.regulation, tier or analysis.tier,
+            len(analysis.obligations or []), docx_export_path,
+        )
         brd_artifact = self._wrap_brd(
             analysis, docx_export_path, tier or analysis.tier,
             regulation=analysis.regulation,
@@ -82,6 +90,10 @@ class BRDRTMAgent:
         rtm_artifact = self._build_rtm(
             analysis.obligations, analysis.brd_report,
             client_roles=analysis.client_roles,
+        )
+        logger.info(
+            "Agent 2 build() done. brd_source=%s rtm_rows=%d",
+            brd_artifact.source, len(rtm_artifact.entries or []),
         )
         return {"brd": brd_artifact, "rtm": rtm_artifact}
 
@@ -128,6 +140,7 @@ class BRDRTMAgent:
                     regulation=regulation,
                 )
             except Exception:
+                logger.exception("BRD DOCX export FAILED. path=%s", docx_export_path)
                 docx_path = None
         return BRDArtifact(
             report=report,

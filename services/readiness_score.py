@@ -46,9 +46,12 @@ the returned dataclass.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 from typing import (
     Any,
     Dict,
@@ -845,9 +848,17 @@ def compute_weighted_readiness(
     WeightedReadinessResult
         Full structured result. ``.as_dict()`` produces a JSON-safe copy.
     """
-    validate_weights(weights)
+    try:
+        validate_weights(weights)
+    except Exception:
+        logger.exception("Readiness weights failed validation. weights=%s", dict(weights or {}))
+        raise
     responses_map: Dict[str, Any] = (
         dict(responses) if responses is not None else _extract_responses(state)
+    )
+    logger.debug(
+        "compute_weighted_readiness. questions=%d responses=%d weights=%s",
+        len(questions or []), len(responses_map), list(weights.keys()),
     )
 
     # --- Group scores per area ------------------------------------------
@@ -986,7 +997,7 @@ def compute_weighted_readiness(
         })
     rec_input.sort(key=lambda r: (r["coverage_gap"], r["weight"]), reverse=True)
 
-    return WeightedReadinessResult(
+    result = WeightedReadinessResult(
         overall_readiness_score=overall_readiness,
         readiness_rating=readiness_rating(overall_readiness),
         overall_coverage_gap=overall_gap,
@@ -1006,6 +1017,11 @@ def compute_weighted_readiness(
         recommendations_input=rec_input,
         weights=dict(weights),
     )
+    logger.info(
+        "Weighted readiness computed. overall=%.1f rating=%s completeness=%.1f accuracy=%.1f",
+        overall_readiness, result.readiness_rating, completeness, accuracy_overall,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

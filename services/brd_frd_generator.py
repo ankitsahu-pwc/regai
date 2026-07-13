@@ -22,11 +22,14 @@ lifted verbatim where possible. The behavioural deltas are:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from docx import Document
+
+logger = logging.getLogger(__name__)
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -710,10 +713,15 @@ def generate_detailed_dora_brd(
         client = GenAIClient.try_create()
     if client is None:
         msg = "GenAI Shared Service not available; offline fallback will be used."
+        logger.warning("BRD generator: %s regulation=%s tier=%s", msg, regulation, tier)
         status(msg)
         return None, msg
 
-    status(f"Generating detailed {regulation} BRD/FRD for {tier} via PwC GenAI Shared Service (8 bundled calls).")
+    logger.info(
+        "BRD generator starting 8-call GenAI pipeline (PARALLEL). regulation=%s tier=%s context_chars=%d",
+        regulation, tier, len(context or ""),
+    )
+    status(f"Generating detailed {regulation} BRD/FRD for {tier} via PwC GenAI Shared Service (8 bundled calls in parallel).")
 
     standard_common = _standard_common(regulation)
     requirement_common = _requirement_common(regulation)
@@ -721,9 +729,15 @@ def generate_detailed_dora_brd(
     # Route every bundled call through :func:`safe_generate` so every
     # bundle inherits the shared anti-hallucination guardrails: hardened
     # prompt, meta-leakage scrubbing, citation cross-check against the
-    # regulatory corpus, and regulation / role-scope validation. When
-    # ``guardrail_reports`` is not None we append the per-bundle report
-    # so the UI can render the audit trail.
+    # regulatory corpus, and regulation / role-scope validation.
+    #
+    # NOTE (2026-07 parallelization): ``_gen`` no longer mutates the
+    # shared ``guardrail_reports`` list from inside the worker — that was
+    # racy under ThreadPoolExecutor. It returns ``(payload, report)`` and
+    # the main thread merges reports in bundle order after all 8 calls
+    # complete. Streamlit ``status`` writers are also thread-unsafe, so
+    # ``on_retry`` is set to ``None`` in the worker path — retry warnings
+    # still land in the log via ``services.genai_service``.
     from .guardrails import safe_generate
 
     def _gen(model, name, instruction, text_fields=()):
@@ -737,11 +751,9 @@ def generate_detailed_dora_brd(
             client_roles=list(client_roles or []),
             source_corpus=context,
             text_fields=text_fields,
-            on_retry=status,
+            on_retry=None,  # thread-safe: Streamlit writer skipped in workers
             prefer_generate_with_length_retry=True,
         )
-        if guardrail_reports is not None:
-            guardrail_reports.append(report)
         if payload is None:
             # ``safe_generate`` returned no payload — treat like a
             # generation error so the outer try / except catches it and
@@ -750,56 +762,112 @@ def generate_detailed_dora_brd(
                 f"BRD bundle '{name}' produced no valid LLM output "
                 f"(guardrail report: {report.summary()})."
             )
-        return payload
+        return payload, report
 
-    try:
-        front = _gen(
+    # Bundle spec: (attribute_name, model, component_label, instruction).
+    # ``attribute_name`` is the local variable we assign the payload to
+    # when building the final DoraDetailedBRD below.
+    _BUNDLE_SPECS = [
+        (
+            "front",
             FrontMatterBundle,
             "1-3. Executive Summary, Objectives, and Scope",
             standard_common + f" Cover purpose, {regulation} readiness, diagnostic cockpit approach, implementation outcomes, regulatory readiness, operational resilience, rule-driven diagnostics, evidence traceability, dashboard enablement, in-scope and out-of-scope boundaries, data scope, tooling scope, and Tier-2 proportionality.",
-        )
-
-        analysis = _gen(
+        ),
+        (
+            "analysis",
             AnalysisBundle,
             "4-6. Stakeholders, Current State Challenges, and Target State Overview",
             standard_common + " Cover management body, compliance, technology, cybersecurity, vendor management, BCM, legal, procurement, audit, data, analytics, business service owners, current gaps, fragmented inventories, third-party risk gaps, evidence metadata, dashboard gaps, target operating model, data model, workflow, rule engine, and target dashboards.",
-        )
-
-        process_business_requirements = _gen(
+        ),
+        (
+            "process_business_requirements",
             RequirementSection,
             "7.1 Process Requirements",
             requirement_common + f" Create 6 to 8 process requirements before deterministic enrichment. Cover the process obligations most material to {regulation} (for example: risk management, critical function mapping, incident classification/reporting, resilience testing, backup/recovery, vulnerability management, governance, third-party risk management, contract governance, exit planning, evidence governance, root cause analysis, and issue management) - adapt the set to the actual scope of {regulation}.",
-        )
-
-        data_business_requirements = _gen(
+        ),
+        (
+            "data_business_requirements",
             RequirementSection,
             "7.2 Data Requirements",
             requirement_common + f" Create 6 to 8 data requirements before deterministic enrichment. Cover the data-domain obligations most material to {regulation} (for example: asset inventory, service mapping, critical function mapping, incident lifecycle fields, vendor/register fields, evidence metadata, data quality, lineage, timestamps, control catalogue data, testing data, contract clause data, subcontractor data, KPI/KRI data, and privileged access data) - adapt to the actual scope of {regulation}.",
-        )
-
-        reporting_business_requirements = _gen(
+        ),
+        (
+            "reporting_business_requirements",
             RequirementSection,
             "7.3 Reporting Requirements",
             requirement_common + f" Create 6 to 8 reporting requirements before deterministic enrichment. Cover dashboards and management reporting that {regulation} implies (readiness, incident, vendor, control, testing, evidence, governance pack, executive reporting, aging views, testing outcomes, issue aging, data quality reporting, and drill-down traceability).",
-        )
-
-        solution = _gen(
+        ),
+        (
+            "solution",
             SolutionRequirementsBundle,
             "8 and 10. Functional and Non-Functional Requirements",
             requirement_common + " Functional requirements must cover ingestion, schema inference, mapping, rule engine, exception management, workflow, evidence repository, dashboarding, exports, audit trail, configuration, rule versioning, scoring, role-based access, dashboard filters, and integration hooks. Non-functional requirements must cover performance, scalability, security, auditability, availability, usability, configurability, maintainability, privacy, data protection, retention, interoperability, and reliability.",
-        )
-
-        governance = _gen(
+        ),
+        (
+            "governance",
             GovernanceBundle,
             "9 and 11-14. Controls, Assumptions, Dependencies, Risks, and Success Criteria",
             "Create a GovernanceBundle. The control_framework must include 6 to 8 lifecycle checkpoints across Identify, Protect, Detect, Respond, Recover, Govern, and Third-Party, plus 4 to 6 preventive controls, 4 to 6 detective controls, 4 to 6 corrective controls, 4 to 6 governance controls, and 4 to 6 tooling integration items. Assumptions, dependencies, and success criteria must each be detailed StandardSection objects. Risks must include 6 to 8 RiskItem rows covering data quality, inventory completeness, vendor register gaps, incident classification, over-engineering, SME availability, integration constraints, regulatory interpretation, and tooling constraints.",
-        )
-
-        closure = _gen(
+        ),
+        (
+            "closure",
             ClosureBundle,
             "15-16. Appendix and Workshop Delivery Plan",
             standard_common + " Appendix must include requirement catalogue, data dictionary, rule library, dashboard catalogue, glossary, evidence taxonomy, workshop templates, control mapping, traceability matrix, sample data templates, KPI/KRI dictionary, and control test scripts. Workshop delivery plan must include 5 to 6 phases such as preparation, rapid diagnostic, deep-dive analysis, requirements definition, target state/dashboard design, and build/iteration. Each phase needs duration, objectives, activities, and outputs. Include 4 to 6 success factors.",
+        ),
+    ]
+
+    try:
+        # Parallel BRD generation: submit all 8 bundles to a thread pool
+        # and wait for all to complete. GPT-5 on Azure serves parallel
+        # requests concurrently (single deployment, no per-tenant queue),
+        # so wall time collapses from sum(8 calls) to max(8 calls).
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as _time
+
+        payloads: dict = {}
+        reports_ordered: list = [None] * len(_BUNDLE_SPECS)
+        parallel_started = _time.time()
+        with ThreadPoolExecutor(
+            max_workers=len(_BUNDLE_SPECS),
+            thread_name_prefix="brd_bundle",
+        ) as pool:
+            future_to_spec = {
+                pool.submit(_gen, model, name, instruction): (idx, attr, name)
+                for idx, (attr, model, name, instruction) in enumerate(_BUNDLE_SPECS)
+            }
+            for fut in as_completed(future_to_spec):
+                idx, attr, name = future_to_spec[fut]
+                payload, report = fut.result()  # re-raises worker exceptions
+                payloads[attr] = payload
+                reports_ordered[idx] = report
+                logger.info("BRD bundle complete: %s", name)
+        parallel_elapsed = _time.time() - parallel_started
+        logger.info(
+            "BRD generator: all %d bundles complete in %.1fs (parallel).",
+            len(_BUNDLE_SPECS), parallel_elapsed,
         )
+        status(
+            f"All {len(_BUNDLE_SPECS)} BRD bundles generated in parallel "
+            f"({parallel_elapsed:.1f}s)."
+        )
+
+        # Merge guardrail reports on the main thread in bundle-spec order
+        # so downstream UI consumers see a stable ordering.
+        if guardrail_reports is not None:
+            for report in reports_ordered:
+                if report is not None:
+                    guardrail_reports.append(report)
+
+        front = payloads["front"]
+        analysis = payloads["analysis"]
+        process_business_requirements = payloads["process_business_requirements"]
+        data_business_requirements = payloads["data_business_requirements"]
+        reporting_business_requirements = payloads["reporting_business_requirements"]
+        solution = payloads["solution"]
+        governance = payloads["governance"]
+        closure = payloads["closure"]
 
         return (
             DoraDetailedBRD(
@@ -827,10 +895,12 @@ def generate_detailed_dora_brd(
 
     except APIConnectionError as e:
         reason = f"GenAI Shared Service unreachable: {e}"
+        logger.exception("BRD generator: APIConnectionError")
         status(reason)
         return None, reason
     except APITimeoutError as e:
         reason = f"GenAI Shared Service timeout: {e}"
+        logger.exception("BRD generator: APITimeoutError")
         status(reason)
         return None, reason
     except APIStatusError as e:
@@ -838,6 +908,7 @@ def generate_detailed_dora_brd(
             f"GenAI Shared Service status error "
             f"{getattr(e, 'status_code', 'unknown')}: {e}"
         )
+        logger.exception("BRD generator: APIStatusError status=%s", getattr(e, "status_code", "?"))
         status(reason)
         return None, reason
     except Exception as e:
@@ -846,6 +917,7 @@ def generate_detailed_dora_brd(
             reason = "GenAI Shared Service hit a length limit on one of the 8 bundled calls."
         else:
             reason = f"GenAI Shared Service generation failed: {type(e).__name__}: {e}"
+        logger.exception("BRD generator failed after bundle path: %s", type(e).__name__)
         status(reason)
         return None, reason
 
@@ -864,6 +936,7 @@ def generate_offline_fallback_brd(regulation: str = "DORA") -> DoraDetailedBRD:
     caller's regulation so the offline output no longer misattributes
     itself. See :func:`_relabel_for_regulation`.
     """
+    logger.info("Using offline deterministic BRD fallback. regulation=%s", regulation)
 
     def section(description, items):
         return StandardSection(
@@ -2012,8 +2085,14 @@ def build_brd_frd_report(
     )
     used_genai = report is not None
     if report is None:
+        logger.warning(
+            "BRD generator: GenAI failed, using offline fallback. reason=%s",
+            genai_failure_reason,
+        )
         status("Using deterministic offline fallback BRD content.")
         report = generate_offline_fallback_brd(regulation=regulation)
+    else:
+        logger.info("BRD generator: GenAI path succeeded, %d guardrail bundles.", len(guardrail_reports))
 
     report = ensure_minimum_detail(report, regulation=regulation)
     report = apply_confidence_floor(report)

@@ -38,7 +38,10 @@ not have to regenerate it.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from models.workflow_models import (
     Obligation,
@@ -160,6 +163,12 @@ class RegulatoryAnalysisAgent:
         roles = normalize_client_roles(client_roles) if client_roles else []
         profile = normalize_client_profile(client_profile) if client_profile else {}
         extra_context = parsed_document.text if parsed_document and not parsed_document.is_empty else None
+        logger.info(
+            "Agent 1 analyze() start. regulation=%s tier=%s roles=%s has_parsed_doc=%s regulators=%s",
+            regulation, tier, roles or None,
+            parsed_document is not None,
+            list(regulator_selection or []) or None,
+        )
         report, metadata = build_brd_frd_report(
             regulation=regulation,
             tier=tier,

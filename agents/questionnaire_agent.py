@@ -41,8 +41,11 @@ obligations / requirements — it never invents questionnaire content.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+
+logger = logging.getLogger(__name__)
 
 from models.workflow_models import (
     BRDArtifact,
@@ -134,12 +137,19 @@ class QuestionnaireAgent:
             )
         except Exception:
             # Enhancement is best-effort — never break the pipeline.
-            pass
+            logger.exception(
+                "Questionnaire enhancement failed (from_report, non-fatal). regulation=%s",
+                regulation,
+            )
 
         if roles:
             _apply_role_filter(package, analysis=analysis, client_roles=roles,
                                regulation=regulation)
 
+        logger.info(
+            "QuestionnaireAgent.from_report done. regulation=%s roles=%s questions=%d",
+            regulation, roles or None, len(package.get("questions") or []),
+        )
         return QuestionnairePackage(
             package=package,
             source="generated_brd",
@@ -184,12 +194,19 @@ class QuestionnaireAgent:
                 package, impact=impact, regulation=regulation,
             )
         except Exception:
-            pass
+            logger.exception(
+                "Questionnaire enhancement failed (from_docx, non-fatal). path=%s",
+                path,
+            )
 
         if roles:
             _apply_role_filter(package, analysis=analysis, client_roles=roles,
                                regulation=regulation)
 
+        logger.info(
+            "QuestionnaireAgent.from_docx done. path=%s roles=%s questions=%d",
+            path, roles or None, len(package.get("questions") or []),
+        )
         return QuestionnairePackage(
             package=package,
             source="uploaded_brd",
