@@ -70,6 +70,7 @@ from services.client_profile import (
     CLIENT_PROFILE_FIELDS,
     CLIENT_PROFILE_KEYS,
     ClientProfileField,
+    default_client_profile,
     empty_client_profile,
     is_client_profile_populated,
     normalize_client_profile,
@@ -2053,9 +2054,11 @@ _DEFAULT_STATE: Dict[str, Any] = {
     "client_roles": ["Commercial Bank"],
     # Client Profile — six keyword multi-selects rendered right below the
     # institution type on Page 1. Each key is a list of curated + free-form
-    # keywords the user tagged. Empty lists = "no filter for this
-    # dimension"; downstream stages fall back to the generic behaviour.
-    "client_profile": empty_client_profile(),
+    # keywords the user tagged. Pre-populated with a Commercial Bank / DORA
+    # starting set (matches the default ``client_roles`` and ``regulation``
+    # values above) so reviewers land on the page with a working profile
+    # already tagged; clear or edit any dimension to override.
+    "client_profile": default_client_profile(),
     # Regulatory Intelligence Pipeline (Stage 1 only; Stage 2 is currently
     # disabled pending team review -- see CONSULTING_SEARCH_ENABLED in .env).
     "regulator_selection": ["ALL"],          # codes from search_config.APPROVED_REGULATORS
@@ -2246,28 +2249,74 @@ def _refresh_scoring_snapshot() -> Optional[ScoringResult]:
             impact = None
     scoring.impact = impact
 
-    try:
-        readiness = orch.assess_readiness_intelligence(
-            scoring.evaluation,
-            analysis=analysis,
-            questionnaire_package=questionnaire.package,
-            responses=state.responses,
-        )
-        scoring.readiness = readiness
-        st.session_state["readiness_assessment"] = readiness
-    except Exception:
-        logger.exception("Readiness intelligence refresh failed (non-fatal).")
+    # Fingerprint-gate the readiness + confidence GenAI calls.
+    #
+    # Streamlit re-runs the whole script on every widget interaction, and
+    # this helper is invoked from every dashboard render — so without a
+    # gate we'd fire two full LLM round-trips (~10-30s each) for every
+    # keystroke, even when the underlying evidence (analysis + answered
+    # response set + score) is unchanged. The fingerprint below captures
+    # the exact inputs the two assessments read; when it matches the
+    # last-computed value we reuse the cached assessments from session
+    # state and skip the LLM calls entirely. Any real change to
+    # ``analysis`` identity, answered-count, weighted score, or number
+    # of scored pairs busts the cache and forces a recompute.
+    eval_dict = scoring.evaluation if isinstance(scoring.evaluation, dict) else {}
+    assess_fingerprint = (
+        id(analysis) if analysis is not None else 0,
+        int(eval_dict.get("answered_count") or 0),
+        round(float(eval_dict.get("compliance_score_pct") or 0.0), 1),
+        len(eval_dict.get("pair_scores") or {}),
+    )
+    last_assess_fingerprint = st.session_state.get("_assessment_intel_fingerprint")
 
-    try:
-        confidence = orch.assess_confidence_intelligence(
-            analysis,
-            scoring_evaluation=scoring.evaluation,
-            questionnaire_package=questionnaire.package,
+    cached_readiness = st.session_state.get("readiness_assessment")
+    cached_confidence = st.session_state.get("confidence_assessment")
+    assess_cache_hit = (
+        last_assess_fingerprint == assess_fingerprint
+        and cached_readiness is not None
+        and cached_confidence is not None
+    )
+
+    if assess_cache_hit:
+        logger.debug(
+            "Assessment intelligence cache hit; reusing cached readiness "
+            "+ confidence (fingerprint=%s).",
+            assess_fingerprint,
         )
-        scoring.confidence = confidence
-        st.session_state["confidence_assessment"] = confidence
-    except Exception:
-        logger.exception("Confidence intelligence refresh failed (non-fatal).")
+        scoring.readiness = cached_readiness
+        scoring.confidence = cached_confidence
+    else:
+        try:
+            readiness = orch.assess_readiness_intelligence(
+                scoring.evaluation,
+                analysis=analysis,
+                questionnaire_package=questionnaire.package,
+                responses=state.responses,
+            )
+            scoring.readiness = readiness
+            st.session_state["readiness_assessment"] = readiness
+        except Exception:
+            logger.exception("Readiness intelligence refresh failed (non-fatal).")
+            scoring.readiness = cached_readiness
+
+        try:
+            confidence = orch.assess_confidence_intelligence(
+                analysis,
+                scoring_evaluation=scoring.evaluation,
+                questionnaire_package=questionnaire.package,
+            )
+            scoring.confidence = confidence
+            st.session_state["confidence_assessment"] = confidence
+        except Exception:
+            logger.exception("Confidence intelligence refresh failed (non-fatal).")
+            scoring.confidence = cached_confidence
+
+        # Only advance the fingerprint after a full successful recompute
+        # so a partial failure re-tries on the next refresh instead of
+        # locking in a stale pair.
+        if scoring.readiness is not None and scoring.confidence is not None:
+            st.session_state["_assessment_intel_fingerprint"] = assess_fingerprint
 
     # Weighted readiness scoring (DORA demo profile). Computed *after* the
     # rules engine so any state changes made by the AI assessment bundles
@@ -3148,6 +3197,77 @@ def _quality_gap_drivers(
 
     drivers.sort(key=lambda x: -x[0])
     return drivers
+
+
+# ---------------------------------------------------------------------------
+# Full-screen agent loading widget.
+#
+# Rendered whenever a long-running agent (Agent 1 BRD, Agent 3 questionnaire,
+# Agent 4 recommendations) is processing. The goal is to give the user a
+# CLEAN loading experience — no faded previous-page content behind the
+# indicator. See ``render_questionnaire_page`` for the two-phase render
+# pattern that actually delivers that experience (Streamlit needs a
+# ``st.rerun()`` between "paint loader" and "start blocking call" so the
+# DOM finalises the loader-only state before the block begins).
+# ---------------------------------------------------------------------------
+def _render_agent_loader(
+    subheader: str,
+    title: str,
+    message: str,
+    *,
+    show_retry_button: bool = False,
+) -> None:
+    """Render a full-width centred loading panel."""
+    st.subheader(subheader)
+    # Use a big centred card so the user immediately understands the
+    # page is intentionally paused on a long-running task. Emoji + big
+    # heading + explanation keep the experience readable without any
+    # data noise.
+    st.markdown(
+        f"""
+        <div style="
+            padding: 5rem 2rem;
+            margin: 1.5rem 0 2rem 0;
+            text-align: center;
+            background: linear-gradient(180deg, #ffffff 0%, #fef7f0 100%);
+            border: 1px solid #f2e8dc;
+            border-radius: 18px;
+            box-shadow: 0 6px 24px rgba(210, 71, 38, 0.06);
+        ">
+            <div class="rap-loader-spinner" style="
+                width: 56px; height: 56px;
+                margin: 0 auto 1.5rem auto;
+                border: 5px solid #fce9dc;
+                border-top-color: #d24726;
+                border-radius: 50%;
+                animation: rap-spin 1s linear infinite;
+            "></div>
+            <div style="font-size: 1.35rem; font-weight: 600; color: #d24726;
+                        margin-bottom: 0.65rem;">
+                {html.escape(title)}
+            </div>
+            <div style="font-size: 1rem; color: #555; max-width: 640px;
+                        margin: 0 auto; line-height: 1.55;">
+                {html.escape(message)}
+            </div>
+        </div>
+        <style>
+            @keyframes rap-spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if show_retry_button:
+        col_a, col_b, col_c = st.columns([2, 1, 2])
+        with col_b:
+            if st.button("Retry", type="primary", width="stretch"):
+                # Reset the fingerprint so the two-phase loader
+                # re-runs Agent 3 with a fresh clean loading state.
+                st.session_state["agent3_last_attempted_brd_fp"] = None
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -4894,59 +5014,86 @@ def _render_brd_download_panel(
 # ---------------------------------------------------------------------------
 
 def render_questionnaire_page() -> None:
-    st.subheader("3. Questionnaire — Agent 3 (Questionnaire Generation)")
-
-    # Auto-run Agent 3 on first arrival at this page. Users used to have to
-    # click "Run Agent 3" manually; the new behaviour launches it as soon as
-    # the page renders (provided the BRD from Page 2 is available).
-    #
-    # The previous implementation used a single boolean flag to prevent
-    # infinite loops after a failed run, but that flag also blocked the
-    # legitimate case where a BRD exists (from a prior session or an
-    # earlier Page 2 click that happened before the Agent-3-chain fix
-    # went live) but no questionnaire was ever built. Now we fingerprint
-    # the BRD artifact we last attempted with; auto-run fires whenever
-    # the current BRD differs from the last attempt. Failure still leaves
-    # the fingerprint in place so we don't loop, but any fresh BRD (or a
-    # newly-generated one via Page 2) will re-trigger.
     _brd = st.session_state.get("brd_artifact")
     _questionnaire = st.session_state.get("questionnaire")
 
-    # Clean full-page loading state while the questionnaire is being
-    # generated. Without this, Streamlit renders the action row + expander
-    # + any prior questionnaire cards behind the spinner overlay so the
-    # user sees a "lightened" version of the previous page output. By
-    # returning early we render ONLY the loading indicator, giving the
-    # user a focused progress view. When Agent 3 finishes, ``st.rerun()``
-    # brings us back through this function with ``_questionnaire`` set,
-    # so the full page renders normally.
+    # -----------------------------------------------------------------
+    # Full-screen loading gate (two-phase render).
+    #
+    # Streamlit blocks the script whenever a long-running call fires
+    # (Agent 3 is 30-60s). While it blocks, the browser continues to
+    # show whatever the *previous* page rendered — which is why users
+    # saw the Page 2 tiles (Completeness Coverage, Accuracy Coverage,
+    # Confidence rationale, etc.) faded behind the spinner. To avoid
+    # that we split the render into TWO phases:
+    #
+    #   Phase 1 ("show"): render ONLY the full-screen loader (no other
+    #     page content, no blocking call) and force ``st.rerun()``.
+    #     Streamlit's delta engine finalises the DOM in this pass, so
+    #     the old Page 2 elements are evicted.
+    #   Phase 2 ("run"):  render the same loader again, then actually
+    #     run Agent 3. Because the DOM already matches the loader from
+    #     Phase 1, the browser shows nothing but the loader during the
+    #     30-60s block. When Agent 3 finishes we ``st.rerun()`` back
+    #     into the normal render path where the questionnaire cards
+    #     replace the loader.
+    # -----------------------------------------------------------------
     if _brd is not None and _questionnaire is None:
         _brd_fp = id(_brd)
-        auto_run_needed = (
-            st.session_state.get("agent3_last_attempted_brd_fp") != _brd_fp
+        already_attempted = (
+            st.session_state.get("agent3_last_attempted_brd_fp") == _brd_fp
         )
-        if auto_run_needed:
+        phase_key = f"_agent3_loader_phase__{_brd_fp}"
+        phase = st.session_state.get(phase_key, "show")
+
+        # Case A: never attempted for this BRD -> two-phase auto-run.
+        if not already_attempted:
+            if phase == "show":
+                # Phase 1: paint the loader, then rerun. Nothing else on
+                # the page is rendered so Streamlit fully commits the
+                # loader-only DOM before the next script pass blocks.
+                _render_agent_loader(
+                    "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+                    "Generating adaptive questionnaire",
+                    "Agent 3 is analysing the BRD, running 12 parallel "
+                    "funnel calls plus one free-text pass, and weighting "
+                    "questions by impact. This takes roughly 30-60 seconds.",
+                )
+                st.session_state[phase_key] = "run"
+                st.rerun()
+            # Phase 2: same loader; the DOM is already clean, so the
+            # browser shows only this while Agent 3 blocks.
+            _render_agent_loader(
+                "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+                "Generating adaptive questionnaire",
+                "Agent 3 is analysing the BRD, running 12 parallel "
+                "funnel calls plus one free-text pass, and weighting "
+                "questions by impact. This takes roughly 30-60 seconds.",
+            )
             st.session_state["agent3_last_attempted_brd_fp"] = _brd_fp
             st.session_state["agent3_autorun_attempted"] = True
-            with st.spinner(
-                "Generating adaptive questionnaire — Agent 3 is analysing "
-                "the BRD, running 12 parallel funnel calls plus one "
-                "free-text pass, and weighting questions by impact…"
-            ):
+            # Suppress the inner ``st.spinner`` inside ``_run_agent3``
+            # so it doesn't double up with our full-screen loader.
+            st.session_state["_agent3_using_full_loader"] = True
+            try:
                 _run_agent3()
+            finally:
+                st.session_state.pop("_agent3_using_full_loader", None)
+                st.session_state.pop(phase_key, None)
             if st.session_state.get("questionnaire") is not None:
                 st.rerun()
-        # If auto-run was skipped (already attempted for this BRD) or the
-        # run failed, we still surface a clean waiting state instead of
-        # the faded action row / expander.
-        st.info(
-            "The questionnaire is being generated. If this message stays "
-            "for more than a minute or two, use the button below to retry."
+            # If Agent 3 failed we fall through to the retry loader below.
+
+        # Case B: attempt already happened but there's still no
+        # questionnaire (failure). Show a clean retry loader — again,
+        # no faded Page 2 remnants.
+        _render_agent_loader(
+            "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+            "Questionnaire generation did not complete",
+            "The last attempt for this BRD did not produce a "
+            "questionnaire. Click Retry below to run Agent 3 again.",
+            show_retry_button=True,
         )
-        if st.button("Retry questionnaire generation", type="secondary"):
-            # Force a clean re-run through the loading flow above.
-            st.session_state["agent3_last_attempted_brd_fp"] = None
-            st.rerun()
         return
 
     action_row = st.columns([1, 1, 4])
@@ -6019,7 +6166,16 @@ def _run_agent3() -> None:
     # spinner would confuse users into thinking a second unrelated
     # pipeline was running - we suppress it in that case and rely on the
     # outer widget's phase label instead.
-    if st.session_state.get("_brd_flow_active"):
+    #
+    # The same suppression applies when the caller has painted our
+    # full-screen loader (``_agent3_using_full_loader`` is set by the
+    # two-phase render in ``render_questionnaire_page``): the loader
+    # already communicates progress, and an additional ``st.spinner``
+    # would inject a small extra element into the DOM alongside it.
+    if (
+        st.session_state.get("_brd_flow_active")
+        or st.session_state.get("_agent3_using_full_loader")
+    ):
         spinner_ctx = contextlib.nullcontext()
     else:
         spinner_ctx = st.spinner("Generating adaptive questionnaire with the AI agent...")
@@ -6300,9 +6456,13 @@ def render_dashboard_page() -> None:
         with rcol_c:
             run_genai = st.checkbox(
                 "Use GenAI to refine action wording",
-                value=False,
+                value=bool(st.session_state.get("genai_available")),
                 disabled=not st.session_state["genai_available"],
-                help="Disabled when the GenAI Shared Service is unavailable.",
+                help=(
+                    "Rewrites each area's recommendation with the GenAI Shared "
+                    "Service so wording is grounded in that area's specific gaps "
+                    "and obligations. Disabled when the service is unavailable."
+                ),
             )
         if st.button("Regenerate recommendations", type="secondary"):
             rec_state: AssessmentState = st.session_state["assessment_state"]
@@ -6346,25 +6506,32 @@ def _autorun_recommendations_if_needed(
     if not st.session_state.get("assessment_state"):
         return
     result = scoring.evaluation or {}
+    genai_on = bool(st.session_state.get("genai_available"))
     fingerprint = (
         round(float(result.get("compliance_score_pct") or 0.0), 1),
         int(result.get("answered_count") or 0),
         len(result.get("pair_scores") or {}),
+        genai_on,
     )
     if st.session_state.get("dashboard_recs_fingerprint") == fingerprint:
         return
     try:
         rec_state: AssessmentState = st.session_state["assessment_state"]
-        recommendation_result = _get_orchestrator().run_recommendations(
-            questionnaire,
-            scoring,
-            min_severity="Watch",
-            top_n_requirements=10,
-            enrich_with_genai=False,
-            branch_log=list(rec_state.branch_log),
-            analysis=st.session_state.get("analysis"),
-            client_roles=_selected_client_roles(),
-        )
+        with st.spinner(
+            "Generating area-specific consulting-grade recommendations via GenAI..."
+            if genai_on
+            else "Composing area-specific recommendations..."
+        ):
+            recommendation_result = _get_orchestrator().run_recommendations(
+                questionnaire,
+                scoring,
+                min_severity="Watch",
+                top_n_requirements=10,
+                enrich_with_genai=genai_on,
+                branch_log=list(rec_state.branch_log),
+                analysis=st.session_state.get("analysis"),
+                client_roles=_selected_client_roles(),
+            )
         st.session_state["recommendations"] = recommendation_result.recommendations
         st.session_state["rich_recommendations"] = recommendation_result.rich_recommendations
         st.session_state["dashboard_recs_fingerprint"] = fingerprint
@@ -6372,7 +6539,7 @@ def _autorun_recommendations_if_needed(
     except Exception:
         # Recommendations are a UX enhancer, never a blocker. If Agent 4
         # errors, we still render the rest of the dashboard.
-        pass
+        logger.exception("Auto-run of Agent 4 (Recommendations) failed on dashboard load.")
 
 
 # ---------------------------------------------------------------------------

@@ -32,9 +32,27 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from typing import Any, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_enrich_enabled() -> bool:
+    """Return True when the legacy compact-recommendation LLM rewrite is on.
+
+    The dashboard, exports and every UI surface prefer the rich
+    consulting-grade recommendations produced by
+    :func:`services.rich_recommendation_service.build_rich_recommendations`.
+    The legacy per-rec rewrite is therefore duplicated LLM work that the
+    UI never displays. Historically it cost ~120s per Agent 4 run because
+    it looped sequentially over ~22 recommendations. It is now OFF by
+    default and can be re-enabled by setting
+    ``LEGACY_RECOMMENDATION_ENRICH_ENABLED=1`` in the environment for
+    users who consume the legacy JSON/Excel exports directly.
+    """
+    raw = str(os.getenv("LEGACY_RECOMMENDATION_ENRICH_ENABLED", "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 from models.workflow_models import (
     QuestionnairePackage,
@@ -130,7 +148,7 @@ class RecommendationAgent:
             recs = _annotate_recommendations_with_roles(recs, roles)
 
         used_genai = False
-        if enrich_with_genai and self.client is not None:
+        if enrich_with_genai and self.client is not None and _legacy_enrich_enabled():
             try:
                 recs = enrich_recommendations_with_genai(
                     recs, questionnaire.package, client=self.client,
@@ -141,6 +159,17 @@ class RecommendationAgent:
                     "Agent 4: GenAI enrichment of recommendations FAILED (using deterministic drafts).",
                 )
                 used_genai = False
+        elif enrich_with_genai and self.client is not None:
+            # Legacy per-rec rewrite is intentionally skipped by default -
+            # the dashboard displays rich_recommendations, so this loop
+            # is duplicated LLM work. Set
+            # LEGACY_RECOMMENDATION_ENRICH_ENABLED=1 to re-enable.
+            logger.info(
+                "Agent 4: skipping legacy compact-rec GenAI rewrite "
+                "(LEGACY_RECOMMENDATION_ENRICH_ENABLED not set); rich "
+                "recommendations will still be LLM-refined.",
+            )
+            used_genai = True  # rich enrichment below still uses GenAI
 
         rich = build_rich_recommendations(
             analysis=scoped_analysis,

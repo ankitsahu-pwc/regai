@@ -21,9 +21,10 @@ from __future__ import annotations
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .search_config import (
     APPROVED_REGULATORS,
@@ -348,6 +349,21 @@ def fetch_official_regulations(
             "enabled":     bool,
         }
     """
+    # ------------------------------------------------------------------
+    # Short-circuit: TTL cache. This is only a wall-clock optimisation -
+    # exact same result payload is returned. Cache misses fall through
+    # to the normal path below.
+    # ------------------------------------------------------------------
+    cache_key = _cache_key(regulation, regulator_selection, max_results_per_query)
+    cached_payload = _cache_get(cache_key)
+    if cached_payload is not None:
+        status(
+            f"Stage 1 cache hit: reusing {len(cached_payload.get('results') or [])} "
+            f"result(s) for regulation=`{regulation}` regulators="
+            f"`{','.join(cache_key[1]) or 'ALL'}`."
+        )
+        return cached_payload
+
     diagnostics: List[str] = []
     errors: List[str] = []
     regulators = resolve_regulators(regulator_selection)
@@ -385,30 +401,69 @@ def fetch_official_regulations(
     queries: List[Dict[str, str]] = []
 
     # ------------------------------------------------------------------
-    # PRIMARY PATH: native per-regulator site search.
+    # PRIMARY PATH: native per-regulator site search (PARALLEL).
     #
     # Some corporate networks block / mangle every third-party search
     # engine that DDGS can route through. Each regulator's own site search
     # is on a reachable domain we already trust, so we always try this
     # first. The DDGS fallback below only runs for regulators that don't
     # have a native adapter, or to top up results when native is sparse.
+    #
+    # Each ``native_search`` call is a single independent HTTP request,
+    # so we fan them out across a small thread pool. Wall-clock time
+    # collapses from ``sum(per-regulator latency)`` to
+    # ``max(per-regulator latency)``, which is the dominant Page 1
+    # bottleneck when a user picks several regulators at once. Results
+    # are then merged back in the original regulator selection order so
+    # dedup / ranking / logs stay stable and deterministic.
     # ------------------------------------------------------------------
     timeout = search_timeout_seconds()
-    native_codes_used: List[str] = []
+    native_max_results = regulatory_max_results()
     native_started = time.monotonic()
-    for reg in regulators:
-        if reg.code not in native_supported_codes():
-            continue
-        native_codes_used.append(reg.code)
+
+    native_supported = set(native_supported_codes())
+    ordered_native_regs = [r for r in regulators if r.code in native_supported]
+    native_codes_used: List[str] = [r.code for r in ordered_native_regs]
+
+    per_reg_hits: Dict[str, List[Any]] = {}
+    per_reg_errors: Dict[str, str] = {}
+
+    def _run_one_native(reg: RegulatorSource) -> Tuple[str, List[Any], Optional[str]]:
         try:
-            native_hits = native_search(
-                reg.code, regulation, max_results=regulatory_max_results(), timeout=timeout
+            return (
+                reg.code,
+                list(native_search(
+                    reg.code, regulation,
+                    max_results=native_max_results, timeout=timeout,
+                ) or []),
+                None,
             )
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"native:{reg.code} -> {type(exc).__name__}: {exc}")
-            status(f"Stage 1 native search error for {reg.code}: {exc}")
+            return (reg.code, [], f"{type(exc).__name__}: {exc}")
+
+    if ordered_native_regs:
+        max_workers = max(
+            1, min(len(ordered_native_regs), _env_int("REGULATORY_NATIVE_WORKERS", 8)),
+        )
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="reg-native",
+        ) as pool:
+            for fut in as_completed(
+                {pool.submit(_run_one_native, r): r for r in ordered_native_regs}
+            ):
+                code, hits, err = fut.result()
+                per_reg_hits[code] = hits
+                if err is not None:
+                    per_reg_errors[code] = err
+
+    # Merge in original regulator order for deterministic dedup + ranking.
+    for reg in ordered_native_regs:
+        err = per_reg_errors.get(reg.code)
+        if err is not None:
+            errors.append(f"native:{reg.code} -> {err}")
+            status(f"Stage 1 native search error for {reg.code}: {err}")
             continue
-        for hit in native_hits:
+        for hit in per_reg_hits.get(reg.code, []):
             url = (hit.url or "").strip()
             if not url or url in seen_urls:
                 continue
@@ -444,9 +499,10 @@ def fetch_official_regulations(
 
     if native_codes_used:
         status(
-            f"Stage 1 native search complete: tried {len(native_codes_used)} "
-            f"regulator(s) ({', '.join(native_codes_used)}) -> "
-            f"{len(results)} hit(s) in {time.monotonic() - native_started:.1f}s."
+            f"Stage 1 native search complete (parallel x{len(native_codes_used)}): "
+            f"tried {len(native_codes_used)} regulator(s) "
+            f"({', '.join(native_codes_used)}) -> {len(results)} hit(s) "
+            f"in {time.monotonic() - native_started:.1f}s."
         )
 
     # Skip DDGS fallback if EITHER:
@@ -477,7 +533,7 @@ def fetch_official_regulations(
         )
         status(diagnostics[-1])
         results.sort(key=lambda r: r.confidence_score, reverse=True)
-        return {
+        payload = {
             "results": results,
             "regulators": payload_regulators,
             "diagnostics": diagnostics,
@@ -485,6 +541,8 @@ def fetch_official_regulations(
             "errors": errors,
             "enabled": True,
         }
+        _cache_put(cache_key, payload)
+        return payload
 
     # ------------------------------------------------------------------
     # FALLBACK PATH: DDGS (DuckDuckGo / Brave / etc.).
@@ -494,7 +552,7 @@ def fetch_official_regulations(
         diagnostics.append(msg)
         status(msg)
         results.sort(key=lambda r: r.confidence_score, reverse=True)
-        return {
+        payload = {
             "results": results,
             "regulators": payload_regulators,
             "diagnostics": diagnostics,
@@ -502,6 +560,8 @@ def fetch_official_regulations(
             "errors": errors,
             "enabled": True,
         }
+        _cache_put(cache_key, payload)
+        return payload
 
     queries = build_queries(regulation, regulators)
     if not queries:
@@ -635,7 +695,7 @@ def fetch_official_regulations(
     )
     status(diagnostics[-1])
 
-    return {
+    payload = {
         "results": results,
         "regulators": payload_regulators,
         "diagnostics": diagnostics,
@@ -643,10 +703,69 @@ def fetch_official_regulations(
         "errors": errors,
         "enabled": True,
     }
+    _cache_put(cache_key, payload)
+    return payload
 
 
 # Cache of code -> RegulatorSource used by ``fetch_official_regulations``.
 _REG_BY_CODE: Dict[str, RegulatorSource] = {r.code: r for r in APPROVED_REGULATORS}
+
+
+# ---------------------------------------------------------------------------
+# In-process TTL cache for Stage 1 responses.
+#
+# The Streamlit UI already dedupes repeat fetches within a single session
+# via a session-state fingerprint, but every fresh browser session (or a
+# reset of ``st.session_state``) triggers a new fetch. A tiny cache keyed
+# on ``(regulation, tuple(sorted(regulator_codes)), max_results_per_query)``
+# means the second user who requests the same slice inside the TTL gets
+# results instantly. Default TTL is 5 minutes (env override:
+# ``REGULATORY_SEARCH_CACHE_TTL_SECONDS``, set to 0 to disable).
+# ---------------------------------------------------------------------------
+_CACHE_TTL_SECONDS: int = _env_int("REGULATORY_SEARCH_CACHE_TTL_SECONDS", 300)
+_CACHE_MAX_ENTRIES: int = _env_int("REGULATORY_SEARCH_CACHE_MAX_ENTRIES", 64)
+_STAGE1_CACHE: Dict[Tuple[str, Tuple[str, ...], int], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _cache_key(
+    regulation: str,
+    regulator_selection: Optional[Sequence[str]],
+    max_results_per_query: Optional[int],
+) -> Tuple[str, Tuple[str, ...], int]:
+    """Stable cache key for a Stage 1 fetch."""
+    codes = tuple(sorted(str(c).upper() for c in (regulator_selection or ["ALL"])))
+    return (
+        str(regulation or "").strip().upper(),
+        codes,
+        int(max_results_per_query or 0),
+    )
+
+
+def _cache_get(key: Tuple[str, Tuple[str, ...], int]) -> Optional[Dict[str, Any]]:
+    if _CACHE_TTL_SECONDS <= 0:
+        return None
+    entry = _STAGE1_CACHE.get(key)
+    if entry is None:
+        return None
+    expires_at, payload = entry
+    if time.monotonic() > expires_at:
+        _STAGE1_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_put(key: Tuple[str, Tuple[str, ...], int], payload: Dict[str, Any]) -> None:
+    if _CACHE_TTL_SECONDS <= 0:
+        return
+    # Only cache "successful-ish" responses; skip empty error-only payloads
+    # so a transient network blip doesn't stick as the cached truth.
+    if not payload.get("results"):
+        return
+    if len(_STAGE1_CACHE) >= _CACHE_MAX_ENTRIES:
+        # Evict the oldest entry (fine for our tiny fixed cap).
+        oldest_key = min(_STAGE1_CACHE, key=lambda k: _STAGE1_CACHE[k][0])
+        _STAGE1_CACHE.pop(oldest_key, None)
+    _STAGE1_CACHE[key] = (time.monotonic() + _CACHE_TTL_SECONDS, payload)
 
 
 def _ddgs_text(query: str, *, backend: str, max_results: int, timeout: int) -> List[Dict[str, Any]]:

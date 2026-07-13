@@ -528,6 +528,35 @@ def empty_client_profile() -> Dict[str, List[str]]:
     return {field.key: [] for field in CLIENT_PROFILE_FIELDS}
 
 
+# Curated "reasonable starting point" for a Commercial Bank / DORA-focused
+# engagement. Every value below is an entry in the corresponding
+# ``*_OPTIONS`` catalog above, so the widgets render without any
+# free-form fallback. Kept small (2-6 keywords per dimension) so the
+# defaults act as a nudge, not a decision — reviewers can trim or extend
+# in one click on Page 1.
+_DEFAULT_PROFILE_SEED: Dict[str, List[str]] = {
+    "organization_profile": ["Group Entity"],
+    "business_lines": ["Retail Banking"],
+    "products_in_scope": ["Current Accounts"],
+    "countries_of_operation": ["European Union (EU)"],
+    "legal_entities": ["Public Limited Company"],
+    "vendor_third_parties": ["Cloud Service Provider (CSP)"],
+}
+
+
+def default_client_profile() -> Dict[str, List[str]]:
+    """Return a pre-populated profile for a Commercial Bank / DORA engagement.
+
+    Chosen to match ``_DEFAULT_STATE["client_roles"] == ["Commercial Bank"]``
+    and ``_DEFAULT_STATE["regulation"] == "DORA"`` in ``app.py``. Every
+    keyword is drawn from the curated catalog for its dimension, so no
+    free-form fallback is triggered. Downstream stages treat these as
+    genuine tags — reviewers should clear anything that does not fit
+    their client before running Agent 1.
+    """
+    return normalize_client_profile(_DEFAULT_PROFILE_SEED)
+
+
 def normalize_client_profile(
     profile: Optional[Mapping[str, Any]],
 ) -> Dict[str, List[str]]:
@@ -665,6 +694,7 @@ __all__ = [
     "client_profile_context_text",
     "client_profile_keyword_bag",
     "client_profile_prompt_block",
+    "default_client_profile",
     "empty_client_profile",
     "is_client_profile_populated",
     "normalize_client_profile",

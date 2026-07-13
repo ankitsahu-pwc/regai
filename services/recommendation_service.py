@@ -14,7 +14,10 @@ impacted area, impacted function, and the underlying BRD requirements.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -388,9 +391,9 @@ def enrich_recommendations_with_genai(
     from .guardrails import safe_generate
 
     regulation = str((package or {}).get("regulation") or "") or None
+    recs_list = list(recommendations)
 
-    enriched: List[Recommendation] = []
-    for rec in recommendations:
+    def _rewrite_one(rec: Recommendation) -> Recommendation:
         instruction = (
             "You are a regulatory compliance advisor. Rewrite the "
             "supplied action as one concise paragraph (60-100 words) "
@@ -405,29 +408,79 @@ def enrich_recommendations_with_genai(
             f"Function: {rec.function or '(unspecified)'}\n"
             f"Current action: {rec.suggested_action}\n"
         )
-        payload, report = safe_generate(
-            client,
-            _ActionRewritePayload,
-            f"Recommendation rewrite: {rec.area or rec.recommendation_id}",
-            instruction,
-            context,
-            regulation=regulation,
-            # No source corpus here — the rewrite is bounded to the
-            # existing deterministic action string, not to the source
-            # regulation text. Citation-ratio enforcement is disabled
-            # accordingly (min_citation_ratio=0) so a well-formed
-            # rewrite that happens to name-check an in-scope Article
-            # isn't rejected because the corpus is empty.
-            source_corpus="",
-            text_fields=("suggested_action",),
-            min_citation_ratio=0.0,
-        )
+        try:
+            payload, report = safe_generate(
+                client,
+                _ActionRewritePayload,
+                f"Recommendation rewrite: {rec.area or rec.recommendation_id}",
+                instruction,
+                context,
+                regulation=regulation,
+                # No source corpus here — the rewrite is bounded to the
+                # existing deterministic action string, not to the source
+                # regulation text. Citation-ratio enforcement is disabled
+                # accordingly (min_citation_ratio=0) so a well-formed
+                # rewrite that happens to name-check an in-scope Article
+                # isn't rejected because the corpus is empty.
+                source_corpus="",
+                text_fields=("suggested_action",),
+                min_citation_ratio=0.0,
+            )
+        except Exception:
+            logger.exception(
+                "Legacy recommendation rewrite crashed for %s (keeping deterministic action).",
+                rec.recommendation_id,
+            )
+            return rec
         if payload is not None and report.ok:
             rewritten = str(payload.suggested_action or "").strip()
             if rewritten:
                 rec.suggested_action = rewritten
-        enriched.append(rec)
-    return enriched
+        return rec
+
+    max_workers = _resolve_legacy_enrich_worker_count(len(recs_list))
+    if max_workers <= 1 or len(recs_list) == 1:
+        return [_rewrite_one(r) for r in recs_list]
+
+    t0 = time.perf_counter()
+    logger.info(
+        "Legacy GenAI recommendation enrichment. recs=%d max_workers=%d",
+        len(recs_list), max_workers,
+    )
+    slots: List[Optional[Recommendation]] = [None] * len(recs_list)
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="legacy-enrich") as pool:
+        futures = {pool.submit(_rewrite_one, r): i for i, r in enumerate(recs_list)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                slots[idx] = fut.result()
+            except Exception:
+                logger.exception(
+                    "Legacy recommendation enrichment future failed at index %d.", idx,
+                )
+                slots[idx] = recs_list[idx]
+    logger.info(
+        "Legacy GenAI recommendation enrichment done. recs=%d elapsed=%.2fs",
+        len(recs_list), time.perf_counter() - t0,
+    )
+    return [r if r is not None else recs_list[i] for i, r in enumerate(slots)]
+
+
+def _resolve_legacy_enrich_worker_count(rec_count: int) -> int:
+    """Pick a bounded thread-pool size for parallel legacy enrichment.
+
+    Reads ``LEGACY_RECOMMENDATION_ENRICH_WORKERS`` so ops can tune it
+    without a code change. Default of 8 is comfortably below the shared
+    service's burst ceiling while cutting the historical sequential
+    ~120s down to ~15s for a typical dashboard.
+    """
+    if rec_count <= 1:
+        return 1
+    try:
+        configured = int(os.getenv("LEGACY_RECOMMENDATION_ENRICH_WORKERS", "8"))
+    except ValueError:
+        configured = 8
+    return max(1, min(configured, rec_count))
 
 
 __all__ = [

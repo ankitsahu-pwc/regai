@@ -45,10 +45,33 @@ Design goals
 from __future__ import annotations
 
 import logging
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _stage_timer(stage: str, **context: Any) -> Iterator[Callable[[], float]]:
+    """Log start/finish/elapsed for a pipeline stage.
+
+    Yields a callable that returns the elapsed seconds so far, which the
+    caller can use to include timing in its own completion log line.
+    """
+    ctx = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
+    logger.info("[TIMER] %s START %s", stage, ctx)
+    t0 = time.perf_counter()
+    try:
+        yield lambda: time.perf_counter() - t0
+    except Exception:
+        elapsed = time.perf_counter() - t0
+        logger.info("[TIMER] %s FAILED elapsed=%.3fs %s", stage, elapsed, ctx)
+        raise
+    else:
+        elapsed = time.perf_counter() - t0
+        logger.info("[TIMER] %s DONE elapsed=%.3fs %s", stage, elapsed, ctx)
 
 from agents import (
     BRDRTMAgent,
@@ -113,11 +136,12 @@ class RegulatoryWorkflowOrchestrator:
     def parse_document(path: Path, *, kind: str = "regulation") -> ParsedDocument:
         """Read a PDF/DOCX from disk into a :class:`ParsedDocument`."""
         logger.info("Parsing document. path=%s kind=%s", path, kind)
-        try:
-            parsed = document_parser.parse_document(path, kind=kind)
-        except Exception:
-            logger.exception("Document parse failed. path=%s kind=%s", path, kind)
-            raise
+        with _stage_timer("DocumentParser", path=path, kind=kind):
+            try:
+                parsed = document_parser.parse_document(path, kind=kind)
+            except Exception:
+                logger.exception("Document parse failed. path=%s kind=%s", path, kind)
+                raise
         logger.info(
             "Document parsed. path=%s pages=%s chars=%s",
             path,
@@ -150,27 +174,29 @@ class RegulatoryWorkflowOrchestrator:
             list(client_roles or []) or None,
             "yes" if parsed_document is not None else "no",
         )
-        try:
-            result = self.regulatory_analysis_agent.analyze(
-                parsed_document=parsed_document,
-                regulation=regulation,
-                tier=tier,
-                status=status,
-                regulator_selection=regulator_selection,
-                consulting_selection=consulting_selection,
-                include_consulting_guidance=include_consulting_guidance,
-                intelligence_package=intelligence_package,
-                client_roles=client_roles,
-                client_profile=dict(client_profile) if client_profile else None,
+        with _stage_timer("Agent1_RegulatoryAnalysis", regulation=regulation, tier=tier) as elapsed:
+            try:
+                result = self.regulatory_analysis_agent.analyze(
+                    parsed_document=parsed_document,
+                    regulation=regulation,
+                    tier=tier,
+                    status=status,
+                    regulator_selection=regulator_selection,
+                    consulting_selection=consulting_selection,
+                    include_consulting_guidance=include_consulting_guidance,
+                    intelligence_package=intelligence_package,
+                    client_roles=client_roles,
+                    client_profile=dict(client_profile) if client_profile else None,
+                )
+            except Exception:
+                logger.exception("Agent 1 (Regulatory Analysis) crashed. regulation=%s", regulation)
+                raise
+            logger.info(
+                "Agent 1 completed. obligations=%d requirements=%d elapsed=%.3fs",
+                len(getattr(result, "obligations", []) or []),
+                len(getattr(result, "requirements", []) or []),
+                elapsed(),
             )
-        except Exception:
-            logger.exception("Agent 1 (Regulatory Analysis) crashed. regulation=%s", regulation)
-            raise
-        logger.info(
-            "Agent 1 completed. obligations=%d requirements=%d",
-            len(getattr(result, "obligations", []) or []),
-            len(getattr(result, "requirements", []) or []),
-        )
         return result
 
     # ------------------------------------------------------------------
@@ -212,22 +238,24 @@ class RegulatoryWorkflowOrchestrator:
     ) -> dict:
         """Return ``{"brd": BRDArtifact, "rtm": RTMArtifact}``."""
         logger.info("Agent 2 (BRD + RTM) invoked. tier=%s docx=%s", tier, docx_export_path)
-        try:
-            bundle = self.brd_rtm_agent.build(
-                analysis,
-                docx_export_path=docx_export_path,
-                tier=tier,
+        with _stage_timer("Agent2_BRD_RTM", tier=tier) as elapsed:
+            try:
+                bundle = self.brd_rtm_agent.build(
+                    analysis,
+                    docx_export_path=docx_export_path,
+                    tier=tier,
+                )
+            except Exception:
+                logger.exception("Agent 2 (BRD + RTM) crashed. tier=%s", tier)
+                raise
+            brd = bundle.get("brd") if isinstance(bundle, dict) else None
+            rtm = bundle.get("rtm") if isinstance(bundle, dict) else None
+            logger.info(
+                "Agent 2 completed. brd_requirements=%d rtm_rows=%d elapsed=%.3fs",
+                len(getattr(brd, "requirements", []) or []) if brd else 0,
+                len(getattr(rtm, "entries", []) or []) if rtm else 0,
+                elapsed(),
             )
-        except Exception:
-            logger.exception("Agent 2 (BRD + RTM) crashed. tier=%s", tier)
-            raise
-        brd = bundle.get("brd") if isinstance(bundle, dict) else None
-        rtm = bundle.get("rtm") if isinstance(bundle, dict) else None
-        logger.info(
-            "Agent 2 completed. brd_requirements=%d rtm_rows=%d",
-            len(getattr(brd, "requirements", []) or []) if brd else 0,
-            len(getattr(rtm, "entries", []) or []) if rtm else 0,
-        )
         return bundle
 
     # ------------------------------------------------------------------
@@ -265,22 +293,24 @@ class RegulatoryWorkflowOrchestrator:
             "Agent 3 (Questionnaire) invoked from BRD report. regulation=%s client_roles=%s",
             regulation, list(client_roles or []) or None,
         )
-        try:
-            pkg = self.questionnaire_agent.from_report(
-                brd, regulation=regulation, name=name,
-                impact=impact, readiness=readiness,
-                analysis=analysis, rtm=rtm,
-                client_roles=client_roles,
-                client_profile=dict(client_profile) if client_profile else None,
-                client=self.client,
+        with _stage_timer("Agent3_Questionnaire_fromReport", regulation=regulation) as elapsed:
+            try:
+                pkg = self.questionnaire_agent.from_report(
+                    brd, regulation=regulation, name=name,
+                    impact=impact, readiness=readiness,
+                    analysis=analysis, rtm=rtm,
+                    client_roles=client_roles,
+                    client_profile=dict(client_profile) if client_profile else None,
+                    client=self.client,
+                )
+            except Exception:
+                logger.exception("Agent 3 (from report) crashed. regulation=%s", regulation)
+                raise
+            logger.info(
+                "Agent 3 completed. questions=%d elapsed=%.3fs",
+                len((pkg.package or {}).get("questions") or []),
+                elapsed(),
             )
-        except Exception:
-            logger.exception("Agent 3 (from report) crashed. regulation=%s", regulation)
-            raise
-        logger.info(
-            "Agent 3 completed. questions=%d",
-            len((pkg.package or {}).get("questions") or []),
-        )
         return pkg
 
     def run_questionnaire_from_docx(
@@ -302,22 +332,24 @@ class RegulatoryWorkflowOrchestrator:
             "Agent 3 (Questionnaire) invoked from uploaded DOCX. path=%s regulation=%s",
             path, regulation,
         )
-        try:
-            pkg = self.questionnaire_agent.from_docx(
-                path, regulation=regulation, name=name,
-                impact=impact, readiness=readiness,
-                analysis=analysis, rtm=rtm,
-                client_roles=client_roles,
-                client_profile=dict(client_profile) if client_profile else None,
-                client=self.client,
+        with _stage_timer("Agent3_Questionnaire_fromDOCX", path=path, regulation=regulation) as elapsed:
+            try:
+                pkg = self.questionnaire_agent.from_docx(
+                    path, regulation=regulation, name=name,
+                    impact=impact, readiness=readiness,
+                    analysis=analysis, rtm=rtm,
+                    client_roles=client_roles,
+                    client_profile=dict(client_profile) if client_profile else None,
+                    client=self.client,
+                )
+            except Exception:
+                logger.exception("Agent 3 (from DOCX) crashed. path=%s regulation=%s", path, regulation)
+                raise
+            logger.info(
+                "Agent 3 (from DOCX) completed. questions=%d elapsed=%.3fs",
+                len((pkg.package or {}).get("questions") or []),
+                elapsed(),
             )
-        except Exception:
-            logger.exception("Agent 3 (from DOCX) crashed. path=%s regulation=%s", path, regulation)
-            raise
-        logger.info(
-            "Agent 3 (from DOCX) completed. questions=%d",
-            len((pkg.package or {}).get("questions") or []),
-        )
         return pkg
 
     def load_questionnaire_package(
@@ -348,22 +380,24 @@ class RegulatoryWorkflowOrchestrator:
             "Rules engine invoked. base_questions=%d active=%d responses=%d dynamic_queue=%d",
             len(base_questions), len(active), len(state.responses or {}), len(state.dynamic_queue or []),
         )
-        try:
-            evaluation = evaluate(active, state)
-        except Exception:
-            logger.exception("Rules engine evaluate() crashed. active_questions=%d", len(active))
-            raise
+        with _stage_timer("RulesEngine", active_questions=len(active)) as elapsed:
+            try:
+                evaluation = evaluate(active, state)
+            except Exception:
+                logger.exception("Rules engine evaluate() crashed. active_questions=%d", len(active))
+                raise
 
-        req_scores = evaluation.get("requirement_scores") or {}
-        top_gaps = [
-            {"requirement_id": rid, "compliance_pct": round(score, 1)}
-            for rid, score in sorted(req_scores.items(), key=lambda kv: kv[1])[:10]
-        ]
-        logger.info(
-            "Rules engine done. compliance=%.1f%% top_gap=%s",
-            float(evaluation.get("compliance_score_pct") or 0.0),
-            top_gaps[0]["requirement_id"] if top_gaps else None,
-        )
+            req_scores = evaluation.get("requirement_scores") or {}
+            top_gaps = [
+                {"requirement_id": rid, "compliance_pct": round(score, 1)}
+                for rid, score in sorted(req_scores.items(), key=lambda kv: kv[1])[:10]
+            ]
+            logger.info(
+                "Rules engine done. compliance=%.1f%% top_gap=%s elapsed=%.3fs",
+                float(evaluation.get("compliance_score_pct") or 0.0),
+                top_gaps[0]["requirement_id"] if top_gaps else None,
+                elapsed(),
+            )
         return ScoringResult(evaluation=evaluation, top_gaps=top_gaps)
 
     # ------------------------------------------------------------------
@@ -386,24 +420,29 @@ class RegulatoryWorkflowOrchestrator:
             "Agent 4 (Recommendations) invoked. min_severity=%s top_n=%d enrich=%s",
             min_severity, top_n_requirements, enrich_with_genai,
         )
-        try:
-            result = self.recommendation_agent.recommend(
-                questionnaire,
-                scoring,
-                min_severity=min_severity,
-                top_n_requirements=top_n_requirements,
-                enrich_with_genai=enrich_with_genai,
-                branch_log=branch_log,
-                analysis=analysis,
-                client_roles=client_roles,
+        with _stage_timer(
+            "Agent4_Recommendations",
+            min_severity=min_severity, top_n=top_n_requirements, enrich=enrich_with_genai,
+        ) as elapsed:
+            try:
+                result = self.recommendation_agent.recommend(
+                    questionnaire,
+                    scoring,
+                    min_severity=min_severity,
+                    top_n_requirements=top_n_requirements,
+                    enrich_with_genai=enrich_with_genai,
+                    branch_log=branch_log,
+                    analysis=analysis,
+                    client_roles=client_roles,
+                )
+            except Exception:
+                logger.exception("Agent 4 (Recommendations) crashed.")
+                raise
+            logger.info(
+                "Agent 4 completed. recommendations=%d elapsed=%.3fs",
+                len(getattr(result, "recommendations", []) or []),
+                elapsed(),
             )
-        except Exception:
-            logger.exception("Agent 4 (Recommendations) crashed.")
-            raise
-        logger.info(
-            "Agent 4 completed. recommendations=%d",
-            len(getattr(result, "recommendations", []) or []),
-        )
         return result
 
     # ------------------------------------------------------------------
@@ -477,30 +516,31 @@ class RegulatoryWorkflowOrchestrator:
         ``questionnaire`` keys. User responses, scoring and recommendations
         are handled separately because they need user interaction.
         """
-        analysis = self.run_regulatory_analysis(
-            parsed_document=parsed_document,
-            regulation=regulation,
-            tier=tier,
-            status=status,
-            regulator_selection=regulator_selection,
-            consulting_selection=consulting_selection,
-            include_consulting_guidance=include_consulting_guidance,
-            intelligence_package=intelligence_package,
-            client_roles=client_roles,
-            client_profile=client_profile,
-        )
-        bundle = self.run_brd_rtm(
-            analysis,
-            docx_export_path=docx_export_path,
-            tier=tier,
-        )
-        questionnaire = self.run_questionnaire_from_report(
-            bundle["brd"], regulation=regulation,
-            analysis=analysis,
-            rtm=bundle.get("rtm"),
-            client_roles=client_roles,
-            client_profile=client_profile,
-        )
+        with _stage_timer("FullPipeline_Agents1to3", regulation=regulation, tier=tier):
+            analysis = self.run_regulatory_analysis(
+                parsed_document=parsed_document,
+                regulation=regulation,
+                tier=tier,
+                status=status,
+                regulator_selection=regulator_selection,
+                consulting_selection=consulting_selection,
+                include_consulting_guidance=include_consulting_guidance,
+                intelligence_package=intelligence_package,
+                client_roles=client_roles,
+                client_profile=client_profile,
+            )
+            bundle = self.run_brd_rtm(
+                analysis,
+                docx_export_path=docx_export_path,
+                tier=tier,
+            )
+            questionnaire = self.run_questionnaire_from_report(
+                bundle["brd"], regulation=regulation,
+                analysis=analysis,
+                rtm=bundle.get("rtm"),
+                client_roles=client_roles,
+                client_profile=client_profile,
+            )
         return {
             "analysis": analysis,
             "brd": bundle["brd"],

@@ -66,7 +66,19 @@ brief.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+
+def _int_env(name: str, default: int) -> int:
+    """Return an integer env var with graceful fallback."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
 
 try:
     from pydantic.v1 import BaseModel, Field, validator
@@ -120,22 +132,60 @@ CANONICAL_QUESTION_PURPOSES: Tuple[str, ...] = (
     "impact+readiness",    # tests both simultaneously (e.g. maturity of an incident-response SLA)
 )
 
-# Maximum number of impact pairs to seed the AI generator with. This caps
-# prompt size and keeps generation predictable.
-DEFAULT_MAX_PAIRS = 12
+# Maximum number of impact pairs to seed the AI generator with. This is
+# the *context* cap - every pair in this window feeds the free-text SME
+# call as cross-cutting context, so lower-severity pairs still get
+# coverage even when they don't earn a dedicated pair funnel below.
+# Override via ``QUESTIONNAIRE_MAX_PAIRS`` in the environment.
+DEFAULT_MAX_PAIRS = _int_env("QUESTIONNAIRE_MAX_PAIRS", 10)
+# Maximum number of impact pairs that get their own dedicated LLM
+# funnel call. Every additional funnel is a separate LLM roundtrip
+# executed in parallel, so this cap directly bounds Agent 3's
+# concurrent LLM footprint and rate-limit exposure. The dropped pairs
+# (severity ranks below this cutoff) are NOT lost: they still ride the
+# free-text call above, so cross-cutting SME questions still cover
+# their area. Only the pair-specific closed-question funnel is skipped.
+# Default 6 cuts historical 12 -> 7 total LLM calls (6 funnels + 1
+# free-text) while keeping every top-severity area on its own funnel.
+# Override via ``QUESTIONNAIRE_MAX_PAIR_FUNNELS``.
+DEFAULT_MAX_PAIR_FUNNELS = _int_env("QUESTIONNAIRE_MAX_PAIR_FUNNELS", 6)
 # Number of AI-generated closed-question funnels to request per impact pair,
 # split by purpose so every high-impact area gets a guaranteed balance of
 # impact-probing AND readiness-probing questions (the manager-requested
 # "ask the most-required info to best assess impact AND readiness"
 # behaviour). Tuple is ``(impact_count, readiness_count)``.
+#
+# LLM latency scales with the number of tokens the model has to *emit*,
+# so per-pair depth is the single biggest lever on Agent 3 wall-clock.
+# Defaults trimmed to a lean set (max 3 parents for Critical pairs) so
+# the questionnaire lands in roughly half the previous time while still
+# guaranteeing impact + readiness coverage. Override via the
+# ``QUESTIONNAIRE_FUNNELS_<SEVERITY>_IMPACT`` /
+# ``QUESTIONNAIRE_FUNNELS_<SEVERITY>_READINESS`` env vars if a specific
+# engagement needs more depth.
 FUNNELS_PER_PAIR: Dict[str, Tuple[int, int]] = {
-    "Critical": (2, 3),   # 2 impact + 3 readiness = 5 parents (deep funnel)
-    "High":     (1, 2),   # 1 impact + 2 readiness = 3 parents
-    "Medium":   (1, 1),   # 1 impact + 1 readiness = 2 parents
-    "Low":      (0, 1),   # readiness only for Low-severity pairs
+    "Critical": (
+        _int_env("QUESTIONNAIRE_FUNNELS_CRITICAL_IMPACT", 1),
+        _int_env("QUESTIONNAIRE_FUNNELS_CRITICAL_READINESS", 2),
+    ),  # default 1 impact + 2 readiness = 3 parents (was 5)
+    "High": (
+        _int_env("QUESTIONNAIRE_FUNNELS_HIGH_IMPACT", 1),
+        _int_env("QUESTIONNAIRE_FUNNELS_HIGH_READINESS", 1),
+    ),  # default 1 impact + 1 readiness = 2 parents (was 3)
+    "Medium": (
+        _int_env("QUESTIONNAIRE_FUNNELS_MEDIUM_IMPACT", 1),
+        _int_env("QUESTIONNAIRE_FUNNELS_MEDIUM_READINESS", 1),
+    ),  # unchanged: 1 impact + 1 readiness
+    "Low": (
+        _int_env("QUESTIONNAIRE_FUNNELS_LOW_IMPACT", 0),
+        _int_env("QUESTIONNAIRE_FUNNELS_LOW_READINESS", 1),
+    ),  # unchanged: readiness only for Low-severity pairs
 }
-# Free-text SME-narrative prompts requested from the LLM.
-DEFAULT_FREE_TEXT_COUNT = 8
+# Free-text SME-narrative prompts requested from the LLM. Trimmed 8 -> 5
+# so the cross-cutting free-text call finishes closer to the pair-funnel
+# calls (previously frequently the slowest slot, which set the overall
+# wall-clock). Override via ``QUESTIONNAIRE_FREE_TEXT_COUNT``.
+DEFAULT_FREE_TEXT_COUNT = _int_env("QUESTIONNAIRE_FREE_TEXT_COUNT", 5)
 
 
 # ---------------------------------------------------------------------------
@@ -1679,6 +1729,7 @@ def generate_ai_questionnaire(
     source_refs_by_item: Optional[Mapping[str, List[Dict[str, Any]]]] = None,
     client: Optional[GenAIClient] = None,
     max_pairs: int = DEFAULT_MAX_PAIRS,
+    max_pair_funnels: int = DEFAULT_MAX_PAIR_FUNNELS,
     free_text_count: int = DEFAULT_FREE_TEXT_COUNT,
 ) -> List[Dict[str, Any]]:
     """Generate the full AI-driven questionnaire question list.
@@ -1733,8 +1784,23 @@ def generate_ai_questionnaire(
         if role_filtered:
             obligations = role_filtered
 
-    # Prioritise pairs by severity so the most-impacted areas are asked first.
+    # Prioritise pairs by severity so the most-impacted areas are asked
+    # first. ``ranked`` is the full context window (feeds the free-text
+    # SME call for cross-cutting coverage). ``funnel_pairs`` is the
+    # subset that gets its own dedicated per-pair LLM call — a strict
+    # top-N slice of ``ranked``. Splitting the two lets us cap
+    # concurrent LLM roundtrips without losing coverage of the lower-
+    # severity pairs (they still ride the free-text prompt).
     ranked = _prioritise_pairs(impact_pairs, impact, max_pairs=max_pairs)
+    effective_funnel_cap = max(1, min(max_pair_funnels or DEFAULT_MAX_PAIR_FUNNELS, len(ranked)))
+    funnel_pairs = ranked[:effective_funnel_cap]
+    if len(funnel_pairs) < len(ranked):
+        logger.info(
+            "Questionnaire funnel cap active: %d pair funnels + free-text "
+            "(context window = %d pairs). Extra %d pairs still feed the "
+            "free-text call for coverage.",
+            len(funnel_pairs), len(ranked), len(ranked) - len(funnel_pairs),
+        )
 
     req_by_id = {getattr(r, "normalized_id", ""): r for r in requirements or []}
     all_brd_ids = list(req_by_id.keys())
@@ -1763,7 +1829,7 @@ def generate_ai_questionnaire(
     # Give each pair a private ID counter range of 1000 apart so the
     # provisional IDs never collide across workers before renumbering.
     provisional_counter = 1
-    for pair, severity in ranked:
+    for pair, severity in funnel_pairs:
         mapped_brd_ids = list(getattr(pair, "requirement_ids", []) or [])
         mapped_reqs = [req_by_id[b] for b in mapped_brd_ids if b in req_by_id]
         mapped_oblig = _mapped_obligations_for_pair(pair, obligations, mapped_brd_ids)
@@ -1825,7 +1891,13 @@ def generate_ai_questionnaire(
     ordered_results: List[Optional[List[Dict[str, Any]]]] = (
         [None] * (len(pair_tasks) + 1)
     )
-    max_workers = max(1, min(len(pair_tasks) + 1, 16))
+    max_workers = max(
+        1,
+        min(
+            len(pair_tasks) + 1,
+            _int_env("QUESTIONNAIRE_MAX_WORKERS", 20),
+        ),
+    )
     parallel_started = _time.time()
     with ThreadPoolExecutor(
         max_workers=max_workers,
@@ -2157,6 +2229,7 @@ __all__ = [
     "CANONICAL_TEAMS",
     "DEFAULT_FREE_TEXT_COUNT",
     "DEFAULT_MAX_PAIRS",
+    "DEFAULT_MAX_PAIR_FUNNELS",
     "FUNNELS_PER_PAIR",
     "generate_ai_questionnaire",
 ]
