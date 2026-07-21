@@ -258,6 +258,137 @@ APPROVED_REGULATORS: List[RegulatorSource] = [
         description="Dutch central bank and prudential supervisor. Publishes Good Practices, guidance and Q&A.",
         publication_hints=("good practice", "Q&A", "guidance"),
     ),
+
+    # ---- India -------------------------------------------------------------
+    # Indian regulator cluster (banking, housing finance, real-estate,
+    # capital markets, AML/CFT, insolvency and competition). Priority
+    # (as documented for the Housing Finance / Mortgage lending scope):
+    #   RBI            *****
+    #   NHB            ****
+    #   State RERA     ****
+    #   MoHUA          ***
+    #   CERSAI         ***
+    #   DFS (MoF)      ***
+    #   SEBI           **
+    #   FIU-IND        **
+    #   IBBI           **
+    #   CCI            *
+    RegulatorSource(
+        code="RBI",
+        name="Reserve Bank of India",
+        jurisdiction="India",
+        website="https://www.rbi.org.in",
+        domains=("rbi.org.in",),
+        description="Prudential regulation of banks and HFCs, lending norms, provisioning, LTV, interest rates, risk weights.",
+        publication_hints=(
+            "master direction", "master circular", "notification",
+            "circular", "guidelines", "press release",
+        ),
+    ),
+    RegulatorSource(
+        code="NHB",
+        name="National Housing Bank",
+        jurisdiction="India",
+        website="https://www.nhb.org.in",
+        domains=("nhb.org.in",),
+        description="Supervises HFCs, refinance schemes, housing finance guidance and sector development.",
+        publication_hints=(
+            "policy circular", "guidelines", "notification",
+            "refinance scheme", "master circular",
+        ),
+    ),
+    RegulatorSource(
+        code="RERA",
+        name="State RERA Authorities",
+        jurisdiction="India",
+        website="https://rera.gov.in",
+        # ``RERA`` is state-scoped in India; we include the central
+        # portal plus the most active state authorities so the allow-list
+        # covers the majority of published orders / regulations. Missing
+        # states can be added incrementally.
+        domains=(
+            "rera.gov.in",
+            "maharera.mahaonline.gov.in",
+            "maharera.maharashtra.gov.in",
+            "up-rera.in",
+            "rera.karnataka.gov.in",
+            "rera.telangana.gov.in",
+            "gujrera.gujarat.gov.in",
+            "tnrera.in",
+            "haryanarera.gov.in",
+            "hprera.in",
+            "rera.rajasthan.gov.in",
+            "wbhira.in",
+            "rera.mp.gov.in",
+            "rera.kerala.gov.in",
+            "rera.odisha.gov.in",
+        ),
+        description="State-level regulation of real-estate projects, developer registration, escrow requirements and homebuyer protection.",
+        publication_hints=("order", "regulation", "circular", "notification"),
+    ),
+    RegulatorSource(
+        code="MOHUA",
+        name="Ministry of Housing & Urban Affairs",
+        jurisdiction="India",
+        website="https://mohua.gov.in",
+        domains=("mohua.gov.in", "pmaymis.gov.in", "pmay-urban.gov.in"),
+        description="Housing policies, PMAY and affordable housing schemes.",
+        publication_hints=("scheme guidelines", "notification", "circular", "office memorandum"),
+    ),
+    RegulatorSource(
+        code="CERSAI",
+        name="CERSAI",
+        jurisdiction="India",
+        website="https://www.cersai.org.in",
+        domains=("cersai.org.in",),
+        description="Central registry of mortgages / security interests under SARFAESI; critical for mortgage due diligence and fraud prevention.",
+        publication_hints=("notification", "circular", "user manual", "operating guidelines"),
+    ),
+    RegulatorSource(
+        code="DFS",
+        name="Department of Financial Services (Ministry of Finance)",
+        jurisdiction="India",
+        website="https://financialservices.gov.in",
+        domains=("financialservices.gov.in",),
+        description="Policy announcements affecting banks, HFCs and NHB (Ministry of Finance, Department of Financial Services).",
+        publication_hints=("office memorandum", "notification", "press release", "gazette notification"),
+    ),
+    RegulatorSource(
+        code="SEBI",
+        name="Securities and Exchange Board of India",
+        jurisdiction="India",
+        website="https://www.sebi.gov.in",
+        domains=("sebi.gov.in",),
+        description="REITs, mortgage-backed securities and listed HFC disclosures.",
+        publication_hints=("circular", "regulations", "master circular", "notification", "consultation paper"),
+    ),
+    RegulatorSource(
+        code="FIU_IND",
+        name="Financial Intelligence Unit - India",
+        jurisdiction="India",
+        website="https://fiuindia.gov.in",
+        domains=("fiuindia.gov.in",),
+        description="AML/CFT obligations for reporting entities including mortgage lenders.",
+        publication_hints=("guidelines", "advisory", "notification", "typology"),
+    ),
+    RegulatorSource(
+        code="IBBI",
+        name="Insolvency and Bankruptcy Board of India",
+        jurisdiction="India",
+        website="https://ibbi.gov.in",
+        domains=("ibbi.gov.in",),
+        description="Insolvency proceedings impacting developers and secured creditors.",
+        publication_hints=("regulations", "circular", "notification", "order"),
+    ),
+    RegulatorSource(
+        code="CCI",
+        name="Competition Commission of India",
+        jurisdiction="India",
+        website="https://www.cci.gov.in",
+        domains=("cci.gov.in",),
+        description="M&A and competition matters involving banks and HFCs.",
+        publication_hints=("regulations", "order", "notification", "guidance note"),
+    ),
 ]
 
 

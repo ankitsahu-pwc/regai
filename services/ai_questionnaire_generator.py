@@ -526,6 +526,59 @@ class AIFreeTextBank(BaseModel):
     questions: List[AIFreeTextQuestion] = Field(default_factory=list)
 
 
+class AIAnswerRefinement(BaseModel):
+    """LLM verdict on whether a user's free-text answer is detailed enough,
+    plus (when it is not) a follow-up question tailored to the missing detail.
+
+    Populated by :func:`evaluate_answer_and_generate_followup`. The UI on
+    Page 3 fires this evaluation whenever the user's free-text answer to a
+    parent question changes, so the follow-up (if any) is generated on demand
+    against the actual answer the reviewer just typed — not pre-baked at
+    questionnaire-build time.
+    """
+
+    needs_followup: bool = Field(
+        description=(
+            "True when the user's answer is missing detail that a regulator "
+            "or auditor would want to see (evidence, timelines, ownership, "
+            "coverage, exceptions, RTS/ITS references). False when the "
+            "answer is already specific and defensible."
+        )
+    )
+    followup_question: str = Field(
+        default="",
+        description=(
+            "The single most useful follow-up question that closes the gap. "
+            "Written in plain business English, ideally under 30 words. "
+            "Left empty when needs_followup is False."
+        ),
+    )
+    followup_reason: str = Field(
+        default="",
+        description=(
+            "One-sentence explanation of what was missing from the answer "
+            "and why this follow-up is being asked. Surfaced to the user so "
+            "the follow-up feels grounded, not arbitrary."
+        ),
+    )
+    followup_is_free_text: bool = Field(
+        default=True,
+        description=(
+            "True when the follow-up should also be answered in free text "
+            "(default — deepens the narrative). False when the missing "
+            "detail is best captured by a short, closed pick list; in that "
+            "case ``followup_options`` must contain 2-5 options."
+        ),
+    )
+    followup_options: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Short pick-list of answer options for the follow-up when "
+            "``followup_is_free_text`` is False. Ignored otherwise."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Context builders
 # ---------------------------------------------------------------------------
@@ -2218,7 +2271,186 @@ def _renumber_and_relink(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return ordered
 
 
+_ANSWER_REFINEMENT_SYSTEM_INSTRUCTION = (
+    "You are a senior regulatory compliance reviewer evaluating whether a "
+    "practitioner's answer to a compliance readiness question is detailed "
+    "enough for an internal audit / regulator conversation.\n\n"
+    "You will be shown: (1) the regulation label, (2) the question the "
+    "practitioner was asked, (3) the plain-English explainer for that "
+    "question, (4) the answer type (free-text narrative OR one/multiple "
+    "options selected from a pick list), and (5) the answer itself.\n\n"
+    "Decide whether the answer is already specific and defensible or "
+    "whether a single targeted follow-up would meaningfully improve the "
+    "evidence trail. Consider these dimensions when judging 'detailed "
+    "enough':\n"
+    "  * Concreteness — does it name specific controls / owners / systems "
+    "    / timelines rather than platitudes ('we are working on it')?\n"
+    "  * Evidence — does it reference documents, tickets, dashboards, "
+    "    reports, or audit outputs a reviewer could open?\n"
+    "  * Coverage — does it address the whole scope of the question, "
+    "    including exceptions and out-of-scope areas?\n"
+    "  * Regulatory anchor — does it tie back to specific RTS/ITS/article "
+    "    references when the question invited them?\n\n"
+    "Additional guidance for closed-selection answers (single or multi-"
+    "select from a pick list):\n"
+    "  * A selection of 'Yes / Fully implemented / Mature' typically "
+    "    still benefits from a follow-up that asks for the evidence "
+    "    reference (which document, which system, who owns it).\n"
+    "  * A selection of 'No / Not implemented / In progress / Partial' "
+    "    typically benefits from a follow-up on cause, timeline, "
+    "    compensating controls, or scope.\n"
+    "  * A selection of 'Not applicable' typically does NOT need a "
+    "    follow-up unless the answer would benefit from a brief "
+    "    justification.\n"
+    "  * Do not repeat the question — surface the specific *gap* the "
+    "    selection leaves.\n\n"
+    "If the answer is already specific and defensible on those dimensions, "
+    "set needs_followup=false and leave the follow-up fields empty — do "
+    "NOT invent a question just because you can. Only recommend a "
+    "follow-up when it will surface information the answer is genuinely "
+    "missing. Keep the follow-up short (under 30 words) and scoped to the "
+    "single most valuable gap."
+)
+
+
+def evaluate_answer_and_generate_followup(
+    client: Any,
+    *,
+    regulation: str,
+    parent_question: str,
+    parent_explainer: str,
+    parent_area: str,
+    parent_function: str,
+    user_answer: str,
+    client_roles: Optional[Sequence[str]] = None,
+    answer_kind: str = "free_text",
+    parent_options: Optional[Sequence[str]] = None,
+) -> Optional[AIAnswerRefinement]:
+    """Ask the LLM whether ``user_answer`` needs a follow-up and, if so,
+    produce one tailored to the missing detail.
+
+    Parameters
+    ----------
+    answer_kind
+        ``"free_text"`` (default) when the user typed a narrative answer,
+        ``"single_select"`` when they picked one option, or
+        ``"multi_select"`` when they picked one or more options from a
+        pick list. The LLM tailors its "detailed enough?" criteria to
+        the answer type (see the system instruction).
+    parent_options
+        The full list of answer options the practitioner was offered for
+        a closed question. Passed to the LLM so it can position the
+        user's selection against the full menu (e.g. picking "Partial"
+        out of ``["Yes / Full", "Partial", "No / None"]`` reads
+        differently than the same word on a Yes-only pick list). Ignored
+        for free-text answers.
+
+    Returns ``None`` when the LLM call fails or when the client is not
+    available — callers treat ``None`` as "assume the answer is fine, do
+    not surface a follow-up card". This mirrors the graceful-degradation
+    policy used elsewhere in the module.
+
+    The call is intentionally lightweight (single structured LLM roundtrip,
+    no chained calls). Callers on the UI side must cache the result per
+    ``(question_id, sha256(answer))`` so a rerun of the same answer does
+    not re-hit the LLM.
+    """
+    answer = (user_answer or "").strip()
+    if client is None or not answer:
+        return None
+
+    kind = (answer_kind or "free_text").strip().lower()
+    if kind not in ("free_text", "single_select", "multi_select"):
+        kind = "free_text"
+
+    prompt = (
+        f"Regulation: {regulation or 'the selected regulation'}\n"
+        f"Business area: {parent_area or '(unspecified)'}\n"
+        f"Business function: {parent_function or '(unspecified)'}\n\n"
+        f"Question asked to the practitioner:\n{parent_question.strip()}\n\n"
+    )
+    if parent_explainer.strip():
+        prompt += (
+            f"Plain-English explainer for that question (for your reference "
+            f"only — do not repeat it back):\n{parent_explainer.strip()}\n\n"
+        )
+
+    if kind == "free_text":
+        prompt += (
+            f"Answer type: free-text narrative.\n"
+            f"The practitioner's free-text answer:\n\"\"\"\n{answer}\n\"\"\"\n\n"
+        )
+    else:
+        options_block = ""
+        if parent_options:
+            options_block = "\n".join(f"  - {o}" for o in parent_options if o)
+        if options_block:
+            prompt += (
+                f"Answer type: {kind.replace('_', ' ')} from this pick list:\n"
+                f"{options_block}\n\n"
+            )
+        else:
+            prompt += f"Answer type: {kind.replace('_', ' ')}.\n\n"
+        prompt += (
+            f"The practitioner selected:\n\"\"\"\n{answer}\n\"\"\"\n\n"
+        )
+
+    prompt += (
+        "Evaluate the answer against the dimensions in the system "
+        "instruction. Populate the AIAnswerRefinement schema:\n"
+        "  * needs_followup — true only when a follow-up would meaningfully "
+        "    improve the evidence trail.\n"
+        "  * followup_question — single question in plain English, under "
+        "    30 words. Empty string when needs_followup is false.\n"
+        "  * followup_reason — one sentence stating what the answer was "
+        "    missing. Empty string when needs_followup is false.\n"
+        "  * followup_is_free_text — true by default; set false only when "
+        "    a short pick list will capture the missing detail better than "
+        "    a narrative reply.\n"
+        "  * followup_options — 2-5 short options when "
+        "    followup_is_free_text is false; empty list otherwise."
+    )
+
+    try:
+        result: AIAnswerRefinement = client.generate(
+            schema_model=AIAnswerRefinement,
+            component_name="Answer refinement: dynamic follow-up",
+            component_instruction=prompt,
+            context="",
+            system_instruction=_ANSWER_REFINEMENT_SYSTEM_INSTRUCTION,
+            regulation=regulation,
+            client_roles=list(client_roles or []),
+        )
+    except Exception:
+        logger.exception(
+            "Dynamic answer-refinement LLM call failed (returning None so "
+            "the UI treats the answer as detailed enough). regulation=%s "
+            "answer_chars=%d",
+            regulation, len(answer),
+        )
+        return None
+
+    if not isinstance(result, AIAnswerRefinement):
+        return None
+
+    if result.needs_followup and not result.followup_question.strip():
+        # Defensive: the LLM flagged a gap but did not populate the
+        # question. Treat as "no follow-up" so the UI does not render
+        # an empty card.
+        return None
+
+    if not result.followup_is_free_text and not result.followup_options:
+        # If the LLM said "closed follow-up" but did not provide options,
+        # fall back to free-text so the reviewer still sees a usable
+        # follow-up prompt.
+        result.followup_is_free_text = True
+        result.followup_options = []
+
+    return result
+
+
 __all__ = [
+    "AIAnswerRefinement",
     "AIFreeTextBank",
     "AIFreeTextQuestion",
     "AIOption",
@@ -2231,5 +2463,6 @@ __all__ = [
     "DEFAULT_MAX_PAIRS",
     "DEFAULT_MAX_PAIR_FUNNELS",
     "FUNNELS_PER_PAIR",
+    "evaluate_answer_and_generate_followup",
     "generate_ai_questionnaire",
 ]

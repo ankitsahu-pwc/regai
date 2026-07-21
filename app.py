@@ -30,19 +30,20 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import html
 import json
 import logging
 import math
 import os
-import random
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as st_components
 from dotenv import load_dotenv
 
 from services.logging_config import setup_logging
@@ -61,6 +62,10 @@ from models.workflow_models import (
 )
 from orchestrator import RegulatoryWorkflowOrchestrator
 from services import persistence as db
+from services.ai_questionnaire_generator import (
+    AIAnswerRefinement,
+    evaluate_answer_and_generate_followup,
+)
 from services.genai_service import GenAIClient
 from services.brd_frd_generator import (
     DoraDetailedBRD,
@@ -96,6 +101,7 @@ from services.search_config import (
 from services.questionnaire_generator import (
     option_label,
     option_labels,
+    option_metadata,
     write_excel_from_package,
 )
 from services.recommendation_service import Recommendation
@@ -189,6 +195,23 @@ _HERO_CSS = """
 .stApp {
     background: linear-gradient(180deg, #fff8f2 0%, #ffffff 34%, #ffffff 100%);
     color: #1a1a1a;
+}
+/* Trim the default Streamlit top padding so the hero banner sits close to
+   the toolbar instead of leaving ~6rem of empty space above it. Covers the
+   modern ``data-testid`` selector plus the legacy ``.block-container``
+   fallback so the rule holds across Streamlit versions. */
+.stApp [data-testid="stMainBlockContainer"],
+.stApp [data-testid="stAppViewContainer"] > .main > .block-container,
+.stApp .main .block-container,
+.stApp .block-container {
+    padding-top: 1.25rem !important;
+}
+/* The header strip Streamlit reserves for the deploy / kebab menu is
+   transparent; keep it that way so the gradient shows through, but drop
+   its default height so it doesn't force extra space above content. */
+.stApp [data-testid="stHeader"] {
+    background: transparent;
+    height: 2.25rem;
 }
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {
     color: #2d2d2d !important;
@@ -299,13 +322,17 @@ button[data-testid="stBaseButton-primary"]:hover {
 /* DataFrames + metrics */
 [data-testid="stDataFrame"] * {color: #1a1a1a !important;}
 
-/* Bold, Title-Case dataframe column headers with a solid black border
-   around every table. Wrapper (.rap-table-wrap) keeps horizontal scroll
-   OUTSIDE the table so the bar never overlaps text. */
+/* Bold, Title-Case dataframe column headers with a solid dark outer
+   border around every table. Wrapper (.rap-table-wrap) keeps horizontal
+   scroll OUTSIDE the table so the bar never overlaps text. */
 .rap-table-wrap {
     border: 2px solid #1a1a1a;
     border-radius: 8px;
-    padding: 0 0 10px 0;
+    /* No bottom padding — the last body row sits flush against the
+       outer border. Any horizontal scrollbar that appears will render
+       inside the scroll gutter (see ``scrollbar-gutter``) rather than
+       forcing an empty band beneath the last row. */
+    padding: 0;
     background: #ffffff;
     margin: 0.35rem 0 0.9rem;
     overflow-x: auto;
@@ -313,30 +340,63 @@ button[data-testid="stBaseButton-primary"]:hover {
     box-shadow: 0 2px 6px rgba(0,0,0,0.08);
     scrollbar-gutter: stable;
 }
-.rap-table-wrap [data-testid="stDataFrame"] {
-    border: none !important;
+/* Streamlit renders each ``st.markdown('<div class="rap-table-wrap">')``
+   call in its own DOM block, so the wrapper div often doesn't actually
+   contain the dataframe. To guarantee every ``st.dataframe`` still gets
+   a strong dark outer border + rounded corners we apply the same
+   treatment directly to the ``stDataFrame`` container. */
+.stApp [data-testid="stDataFrame"],
+.stApp [data-testid="stDataFrameResizable"] {
+    border: 2px solid #1a1a1a !important;
+    border-radius: 8px !important;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    overflow: hidden !important;
 }
+.rap-table-wrap [data-testid="stDataFrame"],
+.rap-table-wrap [data-testid="stDataFrameResizable"] {
+    /* When the wrapper does contain the dataframe (custom HTML fallback
+       paths), suppress the double border. */
+    border: none !important;
+    box-shadow: none !important;
+}
+/* Header row — Streamlit exposes the header via multiple selectors
+   depending on the Glide Data Grid version. We cover them all so the
+   header always reads bold with a darker off-white band and a strong
+   bottom divider. */
 [data-testid="stDataFrame"] [role="columnheader"],
-[data-testid="stDataFrame"] [data-testid="stDataFrameHeaderCell"] {
+[data-testid="stDataFrame"] [data-testid="stDataFrameHeaderCell"],
+[data-testid="stDataFrame"] thead th,
+[data-testid="stDataFrame"] .row-header,
+[data-testid="stDataFrame"] .header-cell {
     font-weight: 800 !important;
     text-transform: capitalize;
-    background: #f0e6da !important;
+    background: #e8d9c6 !important;
     border-bottom: 2px solid #1a1a1a !important;
     border-right: 1px solid #1a1a1a !important;
     color: #1a1a1a !important;
-    letter-spacing: 0.25px;
+    letter-spacing: 0.3px;
+    font-size: 14px !important;
 }
-[data-testid="stDataFrame"] [role="columnheader"] * {
+[data-testid="stDataFrame"] [role="columnheader"] *,
+[data-testid="stDataFrame"] [data-testid="stDataFrameHeaderCell"] *,
+[data-testid="stDataFrame"] thead th *,
+[data-testid="stDataFrame"] .row-header *,
+[data-testid="stDataFrame"] .header-cell * {
     font-weight: 800 !important;
     color: #1a1a1a !important;
 }
-/* Vertical column separators between data cells for at-a-glance columns. */
-[data-testid="stDataFrame"] [role="gridcell"] {
-    border-right: 1px solid #d8c8bc !important;
-    border-bottom: 1px solid #ead8cc !important;
+/* Vertical column separators + row lines between data cells rendered
+   as darker, higher-contrast strokes so columns read as distinct
+   swim-lanes at a glance. */
+[data-testid="stDataFrame"] [role="gridcell"],
+[data-testid="stDataFrame"] tbody td {
+    border-right: 1px solid #8a7a6c !important;
+    border-bottom: 1px solid #b7a597 !important;
 }
 [data-testid="stDataFrame"] [role="row"] [role="gridcell"]:last-child,
-[data-testid="stDataFrame"] [role="row"] [role="columnheader"]:last-child {
+[data-testid="stDataFrame"] [role="row"] [role="columnheader"]:last-child,
+[data-testid="stDataFrame"] tbody tr td:last-child,
+[data-testid="stDataFrame"] thead tr th:last-child {
     border-right: none !important;
 }
 
@@ -351,8 +411,17 @@ button[data-testid="stBaseButton-primary"]:hover {
     max-height: 380px;
     overflow-y: auto;
     overflow-x: auto;
-    padding-bottom: 10px;
-    scrollbar-gutter: stable both-edges;
+    /* No bottom padding here either — the wrapper is already handling
+       its own scroll gutter, so any horizontal scrollbar renders at
+       the very bottom of the scroll area without leaving an empty
+       strip beneath the last row. */
+    padding-bottom: 0;
+    /* ``stable both-edges`` reserved scrollbar-width space on BOTH
+       sides of the wrapper, which pushed the first column ~10px to
+       the right of the outer border. Reserve only on the trailing
+       edge (right in LTR layouts) so the leading column aligns flush
+       with the outer border. */
+    scrollbar-gutter: stable;
 }
 /* ------------------------------------------------------------------ */
 /* Unified table scrollbar system — every scrollable table wrapper in  */
@@ -406,18 +475,65 @@ button[data-testid="stBaseButton-primary"]:hover {
     scrollbar-width: thin;
     scrollbar-color: #bfae9a #f4ece2;
 }
+/* Non-scrolling wrapper variants (used by tables that fit vertically
+   without ``rap-table-scroll``) should still keep their first column
+   flush against the outer border — the base rule above sets
+   ``overflow-x: auto`` on ``.rap-table-wrap`` which is what enables
+   the same ``scrollbar-gutter`` reservation. */
+.rap-table-wrap {
+    scrollbar-gutter: stable;
+}
 .rap-table-wrap table.rap-html-table {
     width: 100%;
-    border-collapse: collapse;
+    /* Use ``separate`` so every cell owns its own border independently.
+       With ``border-collapse: collapse`` the sticky header ``<th>``'s
+       ``border-bottom`` collapses into the first ``<tr>``'s
+       ``border-top`` — as soon as the user scrolls the first row up,
+       the shared border goes with it and the sticky header loses its
+       divider. ``separate`` + ``border-spacing: 0`` gives the same
+       visual look while keeping the header's bottom border anchored
+       to the header. */
+    border-collapse: separate;
+    border-spacing: 0;
     font-size: 0.88rem;
     color: #1a1a1a;
     background: #ffffff;
+    /* ``<table>`` is baseline-aligned by default, so the parent block's
+       line-height reserves a couple of pixels of descender space
+       *below* the table — visible as a thin strip between the last
+       row and the outer wrapper border. ``vertical-align: top`` +
+       ``margin: 0`` collapse that ghost strip without breaking the
+       sticky header (which requires ``display: table`` to remain
+       intact). */
+    vertical-align: top;
+    margin: 0;
+}
+/* Kill the descender-line-height reservation on the wrapper so no
+   phantom baseline space can accumulate beneath the table. The
+   ``<td>``/``<th>`` cells restore their own text line-height
+   explicitly, so cell text still reads normally. */
+.rap-table-wrap {
+    line-height: 0;
+}
+.rap-table-wrap table.rap-html-table thead,
+.rap-table-wrap table.rap-html-table tbody,
+.rap-table-wrap table.rap-html-table tr,
+.rap-table-wrap table.rap-html-table th,
+.rap-table-wrap table.rap-html-table td {
+    line-height: 1.35;
 }
 .rap-table-wrap table.rap-html-table thead th.rap-th {
     background: #f0e6da;
     color: #1a1a1a;
     font-weight: 800;
     text-transform: capitalize;
+    /* Header divider matches the outer wrapper border weight (2px
+       solid #1a1a1a) — anything thicker reads as an outlier next to
+       the surrounding table borders. With ``border-collapse: separate``
+       above, this border stays anchored to the sticky header during
+       scroll on its own, so we no longer paint an additional
+       ``box-shadow`` underneath (which was stacking a second 2px black
+       stripe onto the divider and making it read ~4px thick). */
     border-bottom: 2px solid #1a1a1a;
     border-right: 1px solid #1a1a1a;
     padding: 0.6rem 0.75rem;
@@ -425,16 +541,19 @@ button[data-testid="stBaseButton-primary"]:hover {
     letter-spacing: 0.25px;
     position: sticky;
     top: 0;
-    z-index: 1;
-    box-shadow: 0 1px 0 #1a1a1a;
+    /* Sit clearly above scrolling body rows so nothing bleeds through
+       the header band during rapid scroll. */
+    z-index: 5;
 }
 .rap-table-wrap table.rap-html-table thead th.rap-th:last-child {
     border-right: none;
 }
 .rap-table-wrap table.rap-html-table tbody td.rap-td {
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #ead8cc;
-    border-right: 1px solid #d8c8bc;
+    /* Darker vertical + horizontal grid lines so every column and
+       row reads as a distinct swim-lane at a glance. */
+    border-bottom: 1px solid #8a7a6c;
+    border-right: 1px solid #8a7a6c;
     vertical-align: top;
     line-height: 1.35;
 }
@@ -448,7 +567,10 @@ button[data-testid="stBaseButton-primary"]:hover {
     background: #fdf6f0;
 }
 .rap-table-wrap table.rap-html-table td.rap-td-id {
-    font-weight: 700;
+    /* ID cells keep their compact single-line layout but render in the
+       same regular weight as every other body cell — the ID pattern
+       itself (e.g. ``REQ-042``, ``TR-0007``) already reads as a stable
+       identifier without needing bold. */
     color: #2d2d2d;
     white-space: nowrap;
 }
@@ -1266,6 +1388,44 @@ button[data-testid="stBaseButton-primary"]:hover {
     text-transform: uppercase;
     letter-spacing: 0.4px;
 }
+/* Questionnaire summary tiles — replaces ``st.metric`` for the row of
+   four count tiles at the top of Page 3 so we can attach a native
+   ``title`` attribute for hover-tooltips. Streamlit's ``st.metric``
+   only exposes tooltips via a small ``?`` icon which is easy to miss
+   when the label ("Closed Questions (Quantitative)") is truncated. */
+.qgen-metric-tile {
+    background: #ffffff;
+    border: 1px solid #ead8cc;
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    cursor: default;
+    min-height: 78px;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.qgen-metric-tile:hover {
+    border-color: #d04a02;
+    box-shadow: 0 2px 8px rgba(208,74,2,0.15);
+}
+.qgen-metric-label {
+    font-size: 0.85rem;
+    color: #4a4a4a;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.qgen-metric-value {
+    font-size: 1.9rem;
+    font-weight: 800;
+    color: #d04a02;
+    line-height: 1.1;
+    letter-spacing: -0.5px;
+}
 /* Top-level section headers used by the flattened Quantitative /
    Qualitative buckets on the Questionnaire page. */
 .q-section-hdr {
@@ -1307,6 +1467,43 @@ button[data-testid="stBaseButton-primary"]:hover {
     margin: 8px 0;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
+/* Answer widget highlight. Applies to every ``st.selectbox`` /
+   ``st.multiselect`` / ``st.text_area`` in the app (BaseWeb wraps
+   selects in ``div[data-baseweb="select"]``, text areas render a
+   plain ``<textarea>``). Earlier iterations tried to scope this to
+   the questionnaire only via a marker div + ``:has()`` + adjacent
+   sibling, but Streamlit's actual DOM nests elements more deeply
+   than the sibling combinator could bridge, so the rule never
+   matched. Applying it globally is deliberate — the same visual
+   language flows to the setup page multiselects too, which reads as
+   consistent design rather than one-off flash. */
+div[data-baseweb="select"] > div,
+.stTextArea textarea,
+textarea[data-testid="stTextArea"] {
+    border: 2px solid var(--dash-orange, #d04a02) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 2px 6px rgba(208,74,2,0.12) !important;
+    /* Explicit longhand properties (not the ``background`` shorthand)
+       so we deterministically override the earlier
+       ``background-color: #ffffff !important`` rule higher up in the
+       stylesheet — CSS shorthands can leave older longhand
+       ``!important`` declarations in place depending on cascade order. */
+    background-color: #fff6ee !important;
+    background-image: linear-gradient(180deg, #ffffff 0%, #fff6ee 100%) !important;
+    font-weight: 600 !important;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+div[data-baseweb="select"] > div:hover,
+.stTextArea textarea:hover {
+    border-color: #a63a02 !important;
+    box-shadow: 0 3px 10px rgba(208,74,2,0.22) !important;
+}
+div[data-baseweb="select"]:focus-within > div,
+.stTextArea textarea:focus {
+    border-color: #a63a02 !important;
+    box-shadow: 0 0 0 3px rgba(208,74,2,0.18) !important;
+    outline: none !important;
+}
 .qprev-card.free-text {
     border-left-color: var(--dash-blue);
     background: #f8fbff;
@@ -1330,6 +1527,64 @@ button[data-testid="stBaseButton-primary"]:hover {
 .qprev-tag.type-single { background: #fff1e6; color: #6a3300; }
 .qprev-tag.type-multi  { background: #ffe6ee; color: #7a1636; }
 .qprev-tag.type-free   { background: #e7f5ee; color: #16523c; }
+/* Nested follow-up (child) cards — surface only after the parent's
+   answer triggers them. Named ``qprev-child`` (not ``qprev-followup``)
+   because ``qprev-followup`` is already taken by the purple "brief
+   answer nudge" box rendered under short free-text responses, and we
+   don't want the two rulesets to bleed into one another. Visual
+   language:
+   - left-inset via ``margin-left`` (indented children)
+   - lighter background + tinted left border (accent line)
+   - smaller pad so the card feels like a sub-item, not a peer.
+   Depth 2+ nests further so a follow-up-of-a-follow-up is still
+   distinguishable. */
+.qprev-card.qprev-child {
+    margin-left: 22px;
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: #fff8f2;
+    border-color: #f2d4b8;
+    border-left: 3px solid var(--dash-orange);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    position: relative;
+}
+.qprev-card.qprev-child::before {
+    /* Elbow connector from the parent card to the child, drawn just
+       inside the parent's left border so the branch is obvious even
+       without whitespace. */
+    content: "";
+    position: absolute;
+    left: -14px;
+    top: 20px;
+    width: 12px;
+    height: 2px;
+    background: var(--dash-orange, #d04a02);
+    opacity: 0.55;
+    border-radius: 2px;
+}
+.qprev-card.qprev-child.qprev-child-depth-2 {
+    margin-left: 40px;
+    background: #fff3e6;
+    border-left-color: #a63a02;
+}
+.qprev-card.qprev-child.qprev-child-depth-3 {
+    margin-left: 58px;
+    background: #ffedd8;
+    border-left-color: #7a2a01;
+}
+.qprev-card.qprev-child.free-text {
+    /* Free-text follow-ups keep the orange accent (still a follow-up)
+       while borrowing the qualitative-blue background so the qual /
+       quant distinction stays legible. */
+    background: #f2f8ff;
+    border-color: #cddff0;
+}
+.qprev-tag.qprev-tag-followup {
+    background: var(--dash-orange, #d04a02);
+    color: #ffffff;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
 .qprev-qhead {
     font-weight: 700;
     color: #1a1a1a;
@@ -1655,27 +1910,81 @@ section[data-testid="stSidebar"] .stRadio label {color: #1a1a1a !important; font
     min-height: 3rem;
 }
 
-/* Global body / heading rhythm. Headers are consistently 2pt larger
-   than body text so hierarchy reads instantly (regulator ask). */
+/* Global body / heading rhythm. Every heading (h1..h6) is rendered at
+   ``body + 3px`` and bold so the hierarchy stays uniform across the
+   app while still reading as a heading (regulator ask). */
 html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
 [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
 [data-testid="stMarkdownContainer"] span {
     font-size: 15px;
 }
-.stApp h1 { font-size: 27px !important; }
-.stApp h2 { font-size: 23px !important; }
-.stApp h3 { font-size: 20px !important; }
-.stApp h4 { font-size: 17px !important; }
-.stApp h5 { font-size: 17px !important; }
-.stApp h6 { font-size: 17px !important; }
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stApp [data-testid="stMarkdownContainer"] h1,
+.stApp [data-testid="stMarkdownContainer"] h2,
+.stApp [data-testid="stMarkdownContainer"] h3,
+.stApp [data-testid="stMarkdownContainer"] h4,
+.stApp [data-testid="stMarkdownContainer"] h5,
+.stApp [data-testid="stMarkdownContainer"] h6 {
+    font-size: 18px !important;
+    font-weight: 700 !important;
+}
 
-/* Dashboard section headings normalised to a single size + generous
-   vertical rhythm so the page stops feeling cluttered. Bumped up so the
-   dashboard reads as a set of well-scannable, spacious sections. */
+/* Page-level subheader (``st.subheader(...)`` renders as ``<h3>``) —
+   the top heading on every page ("1. Setup", "2. Generate BRD / FRD",
+   "4. Dashboard — Impact & Readiness", …). Rendered noticeably larger
+   than the ``body + 3px`` heading baseline (18px) so it reads as the
+   dominant page title, and uppercased per product spec. */
+.stApp h3,
+.stApp [data-testid="stMarkdownContainer"] h3 {
+    font-size: 34px !important;
+    font-weight: 800 !important;
+    line-height: 1.15 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.8px;
+    margin-top: 0.25rem !important;
+    margin-bottom: 0.9rem !important;
+}
+/* Streamlit auto-appends a chain-link anchor icon next to every
+   heading which becomes visible on hover. Hide it on the page-level
+   subheader so the "1. SETUP" line reads as a clean title. */
+.stApp h3 a[href^="#"],
+.stApp [data-testid="stMarkdownContainer"] h3 a[href^="#"] {
+    display: none !important;
+}
+
+/* Streamlit renders widget labels ("Regulation Code", "Source Of
+   Requirements", …) inside ``<label data-testid="stWidgetLabel">``
+   wrappers instead of real ``<h*>`` tags, so the h1..h6 rule above
+   does not touch them. We force the same body+3px / bold treatment
+   here so every visual heading — including form-field labels and
+   expander summaries — reads uniformly. */
+.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stWidgetLabel"] label,
+.stApp [data-testid="stWidgetLabel"] label > div p {
+    font-size: 18px !important;
+    font-weight: 700 !important;
+}
+
+/* Expander headers ("Regulatory Intelligence — Official Regulator
+   Search", "Downloads", "Answer Questions", …) live inside a
+   ``<summary>`` element that wraps a markdown container. Target the
+   inner paragraph so only the summary label is styled, leaving the
+   expander body content at the default body-text size. Rendered 2px
+   smaller than the standard heading baseline so the expander summary
+   reads as a secondary heading rather than a top-level page heading. */
+.stApp details > summary [data-testid="stMarkdownContainer"] p,
+.stApp [data-testid="stExpander"] details > summary [data-testid="stMarkdownContainer"] p {
+    font-size: 16px !important;
+    font-weight: 700 !important;
+}
+
+/* Dashboard section headings keep the coloured strip / border-left
+   treatment but honour the global heading size + weight so nothing
+   pops larger than the ``body + 3px`` baseline. */
 .stApp h4.rap-dash-hdr,
 .stApp [data-testid="stMarkdownContainer"] h4.rap-dash-hdr {
-    font-size: 22px !important;
-    font-weight: 800 !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
     letter-spacing: 0.15px;
     color: #1a1a1a !important;
     margin-top: 2rem !important;
@@ -1870,6 +2179,10 @@ html, body, .stApp, .stMarkdown p, .stMarkdown li, .stMarkdown span,
     flex-wrap: wrap;
     gap: 0.55rem;
     margin-top: 0.5rem;
+    /* Breathing room so the tile does not visually collide with the
+       "Regulation Code" heading (and the rest of the Setup form) that
+       renders directly below it. */
+    margin-bottom: 1.25rem;
 }
 .client-role-chip {
     flex: 1 1 240px;
@@ -2627,7 +2940,12 @@ def _render_client_profile_selector() -> None:
     """
     current = _current_client_profile()
 
-    st.markdown('<div class="client-profile-card">', unsafe_allow_html=True)
+    # NOTE: we deliberately do NOT wrap this panel in a
+    # ``<div class="client-profile-card">`` container. Streamlit renders
+    # each ``st.markdown`` call inside its own isolated DOM block, so an
+    # orphan opening ``<div>`` gets auto-closed by the browser and shows
+    # up as an empty bordered box above the badge. The pill badge below
+    # already provides enough visual grouping.
     st.markdown(
         '<span class="client-profile-badge">Step 1 · Client Profile</span>'
         '<p class="client-profile-title">Client Profile Keywords</p>'
@@ -2675,7 +2993,6 @@ def _render_client_profile_selector() -> None:
             "generic (role-only) interpretation. Add keywords to sharpen "
             "the analysis for your specific client."
         )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_client_roles_selector() -> None:
@@ -2697,14 +3014,15 @@ def _render_client_roles_selector() -> None:
             return name
         return f"{name} — {role.category}"
 
-    st.markdown('<div class="client-roles-card">', unsafe_allow_html=True)
+    # See ``_render_client_profile_selector`` — the ``client-roles-card``
+    # container wrapper was intentionally removed because Streamlit places
+    # each ``st.markdown`` call in its own DOM block, which caused the
+    # opening ``<div>`` to render as an empty bordered rectangle above
+    # the badge. The pill badge alone already anchors this panel; the
+    # secondary title + descriptive paragraph have been dropped per
+    # product feedback so the multi-select below stands on its own.
     st.markdown(
-        '<span class="client-roles-badge">Step 1 · Client Profile</span>'
-        '<p class="client-roles-title">Client Type / Institution Type</p>'
-        '<p class="client-roles-desc">Pick one or more institution types '
-        'to record the client profile for this engagement. Your selection '
-        'is captured in the exported metadata; the analysis pipeline runs '
-        'the same way regardless of which types you pick.</p>',
+        '<span class="client-roles-badge">Step 1 · Client Profile</span>',
         unsafe_allow_html=True,
     )
     selection = st.multiselect(
@@ -2751,7 +3069,6 @@ def _render_client_roles_selector() -> None:
                 + '</div>',
                 unsafe_allow_html=True,
             )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _regulator_label(code: str) -> str:
@@ -2979,6 +3296,41 @@ def _format_sources_inline(refs: List[Dict[str, Any]]) -> str:
         pieces.append(_format_source_label(ref))
     suffix = "" if len(refs) <= 3 else f" (+{len(refs) - 3} more)"
     return " | ".join(pieces) + suffix
+
+
+# Fallback text used when a row has no live source URL to link to.
+_NO_LIVE_SOURCE_TEXT = "[!] No live source available"
+
+
+def _sources_link_cell(labels: str, url: str) -> str:
+    """Return a cell value suitable for :class:`st.column_config.LinkColumn`
+    that renders ``labels`` as the clickable display text and points at
+    ``url`` when available.
+
+    Streamlit's ``LinkColumn`` renders the cell as an anchor whose visible
+    text is derived from the ``display_text`` regex applied to the URL.
+    We therefore encode the labels into the URL fragment so a single
+    regex (``#(.+)$``) can extract them per-row.
+
+    - When a URL is present, we emit ``<url>#<labels>``. The fragment is
+      ignored by the browser during navigation, so the click still lands
+      on the primary regulatory publication.
+    - When no live source URL is available, we emit ``#<labels>`` so the
+      cell still renders the label text (the "click" becomes a no-op
+      same-page fragment navigation).
+
+    Any literal ``#`` character in ``labels`` is replaced with the
+    full-width variant so it does not confuse the fragment split.
+    """
+    safe_labels = (labels or _NO_LIVE_SOURCE_TEXT).replace("#", "\uFF03")
+    if url:
+        return f"{url}#{safe_labels}"
+    return f"#{safe_labels}"
+
+
+# Regex used by every LinkColumn "Sources" column to pull the display
+# text out of the fragment segment produced by :func:`_sources_link_cell`.
+_SOURCES_LINK_DISPLAY_REGEX = r"#(.+)$"
 
 
 # ---------------------------------------------------------------------------
@@ -3502,13 +3854,13 @@ def _render_role_aware_interpretation_panel(analysis: RegulatoryAnalysis) -> Non
 
 
 def _render_source_references_panel(brd_artifact: BRDArtifact) -> None:
-    """Render the compact Source References panel on Page 2.
+    """Render the Official Publication Traceability table on Page 2.
 
-    The full master source catalogue is exposed *on hover* over the
-    "Unique sources cited" metric — there is no separate expander section
-    anymore. The per-requirement traceability table is highlighted as a
-    lightweight table (no expander) so reviewers can spot citation gaps
-    immediately.
+    The 4 provenance tiles (Official Sources, Regulators Hit, Uploaded
+    regulation, Offline baseline) are rendered by
+    :func:`_render_regulation_source_panel` under a single "Regulation
+    Source References" heading, so this panel only surfaces the
+    per-requirement traceability drop-down.
     """
     metadata = brd_artifact.metadata or {}
     catalogue: List[Dict[str, Any]] = metadata.get("source_references_catalogue") or []
@@ -3516,7 +3868,6 @@ def _render_source_references_panel(brd_artifact: BRDArtifact) -> None:
         metadata.get("source_references_by_item") or {}
     )
 
-    st.markdown("#### Source References")
     if not catalogue and not refs_by_item:
         st.warning(
             "No source-reference metadata is attached to this BRD. The "
@@ -3527,82 +3878,37 @@ def _render_source_references_panel(brd_artifact: BRDArtifact) -> None:
         )
         return
 
-    used_uploaded = bool(metadata.get("source_references_used_uploaded_document"))
-    used_offline = bool(metadata.get("source_references_used_offline_baseline"))
-    total_unique = int(metadata.get("source_references_total_unique") or len(catalogue))
-
-    catalogue_tooltip = _build_master_catalogue_tooltip(catalogue)
-
-    summary_cols = st.columns(3)
-    summary_cols[0].metric(
-        "Unique sources cited",
-        total_unique,
-        help=catalogue_tooltip,
-    )
-    summary_cols[1].metric(
-        "Uploaded regulation",
-        "Yes" if used_uploaded else "No",
-        help="Did the BRD generator consume text from a user-uploaded regulation document?",
-    )
-    summary_cols[2].metric(
-        "Offline baseline",
-        "Yes" if used_offline else "No",
-        help="True when no live regulator publication was retrieved. "
-             "Citations fall back to a sentinel 'No live source available' marker.",
-            )
-
     requirement_refs = {
         key.split(":", 1)[1]: refs
         for key, refs in refs_by_item.items() if key.startswith("REQ:")
     }
     if requirement_refs:
-        st.markdown(
-            '<div class="rap-section-hd">'
-            '<span class="rap-section-hd-title">Per-requirement Traceability</span>'
-            f'<span class="rap-section-hd-badge">{len(requirement_refs)} requirements</span>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        rows: List[Dict[str, Any]] = []
-        for req_id in sorted(requirement_refs.keys()):
-            refs = requirement_refs[req_id]
-            if not refs:
+        with st.expander(
+            f"Official Publication Traceability ({len(requirement_refs)})",
+            expanded=False,
+        ):
+            rows: List[Dict[str, Any]] = []
+            for req_id in sorted(requirement_refs.keys()):
+                refs = requirement_refs[req_id]
                 rows.append({
-                    "Requirement ID": req_id,
-                    "Sources": "[!] No live source available",
-                    "Primary URL": "",
-                    "Refs": 0,
+                    "id": req_id,
+                    "source_references": refs or [],
                 })
-                continue
-            labels = " | ".join(_format_source_label(r) for r in refs)
-            url_list = [r.get("source_url", "") for r in refs if r.get("source_url")]
-            rows.append({
-                "Requirement ID": req_id,
-                "Sources": labels,
-                "Primary URL": url_list[0] if url_list else "",
-                "Refs": len(url_list),
-            })
-        st.markdown('<div class="rap-table-wrap">', unsafe_allow_html=True)
-        st.dataframe(
-            pd.DataFrame(rows),
-            width="stretch",
-            height=380,
-            hide_index=True,
-            column_config={
-                "Primary URL": st.column_config.LinkColumn(
-                    "Primary URL",
-                    help="Click to open the primary citation. Additional citations "
-                         "appear in the tooltip on 'Unique sources cited' above.",
-                    display_text="Open",
-                ),
-                "Refs": st.column_config.NumberColumn(
-                    "Refs",
-                    help="Total number of citations backing this requirement.",
-                    format="%d",
-                ),
-            },
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+            # Rendered as a plain HTML table (see
+            # ``_render_hyperlinked_html_table``) so bold header text and
+            # visible column separators are honoured by the browser.
+            # ``st.dataframe`` uses a canvas grid that ignores those CSS
+            # rules. The ``sort_key`` here namespaces a compact
+            # ``Sort by [column] [order]`` control above the table —
+            # HTML tables have no native click-header sort, so we
+            # surface the same capability via a Streamlit widget.
+            _render_hyperlinked_html_table(
+                columns=[("id", "ID"), ("sources", "Sources")],
+                rows=rows,
+                id_columns={"id"},
+                sort_key="src_ref_traceability",
+                default_sort_column="id",
+            )
 
 
 def _build_master_catalogue_tooltip(catalogue: List[Dict[str, Any]]) -> str:
@@ -3611,9 +3917,9 @@ def _build_master_catalogue_tooltip(catalogue: List[Dict[str, Any]]) -> str:
     no longer need a separate expander.
 
     Streamlit metric ``help`` tooltips accept markdown, so we build a
-    numbered list of ``Regulator — Title`` entries with clickable URLs. The
-    list is capped to keep the tooltip readable; the count of any hidden
-    items is surfaced at the bottom.
+    numbered list of ``Regulator — Title`` entries with clickable URLs.
+    Every catalogue entry is rendered — reviewers asked to see the full
+    list rather than a truncated preview.
     """
     if not catalogue:
         return (
@@ -3622,9 +3928,8 @@ def _build_master_catalogue_tooltip(catalogue: List[Dict[str, Any]]) -> str:
             "uploaded regulation document."
         )
 
-    max_rows = 12
     lines = ["**Master source catalogue** — every unique publication cited by this BRD:", ""]
-    for idx, row in enumerate(catalogue[:max_rows], start=1):
+    for idx, row in enumerate(catalogue, start=1):
         regulator = str(row.get("regulator") or "Unknown regulator").strip()
         title = str(row.get("title") or "(untitled)").strip()
         if len(title) > 90:
@@ -3636,24 +3941,21 @@ def _build_master_catalogue_tooltip(catalogue: List[Dict[str, Any]]) -> str:
             lines.append(f"{idx}. **{regulator}** — [{title}]({url}){date_suffix}")
         else:
             lines.append(f"{idx}. **{regulator}** — {title}{date_suffix}")
-    remaining = len(catalogue) - max_rows
-    if remaining > 0:
-        lines.append("")
-        lines.append(f"…and {remaining} more publication(s) in the underlying dataset.")
     return "\n".join(lines)
 
 
 def _render_regulation_source_panel(brd_artifact: BRDArtifact) -> None:
-    """Show the provenance of the BRD's regulatory context as two compact
-    metric tiles (Official Sources + Regulators Hit). The dedicated
-    Provenance tile has been retired — reviewers see the source counts
-    inline instead of an extra "Provenance" chip.
+    """Show the provenance of the BRD's regulatory context as four compact
+    metric tiles under a single "Regulation Source References" heading:
+    Official Sources, Regulators Hit, Uploaded regulation, and Offline
+    baseline. The dedicated Provenance tile has been retired — reviewers
+    see the source counts inline instead of an extra "Provenance" chip.
     """
     metadata = brd_artifact.metadata or {}
     official_sources: List[Dict[str, Any]] = metadata.get("official_sources") or []
     summary: Dict[str, Any] = metadata.get("source_summary") or {}
 
-    st.markdown("#### Regulation Source")
+    st.markdown("#### Regulation Source References")
 
     ranked_rows: List[Dict[str, Any]] = [
         r for r in (metadata.get("all_sources_ranked") or [])
@@ -3665,7 +3967,10 @@ def _render_regulation_source_panel(brd_artifact: BRDArtifact) -> None:
         summary.get("regulators_hit") or [], ranked_rows
     )
 
-    cols = st.columns(2)
+    used_uploaded = bool(metadata.get("source_references_used_uploaded_document"))
+    used_offline = bool(metadata.get("source_references_used_offline_baseline"))
+
+    cols = st.columns(4)
     cols[0].metric(
         "Official Sources",
         summary.get("official_count", len(official_sources)),
@@ -3675,6 +3980,17 @@ def _render_regulation_source_panel(brd_artifact: BRDArtifact) -> None:
         "Regulators Hit",
         len(summary.get("regulators_hit") or []),
         help=regulators_tooltip,
+    )
+    cols[2].metric(
+        "Uploaded regulation",
+        "Yes" if used_uploaded else "No",
+        help="Did the BRD generator consume text from a user-uploaded regulation document?",
+    )
+    cols[3].metric(
+        "Offline baseline",
+        "Yes" if used_offline else "No",
+        help="True when no live regulator publication was retrieved. "
+             "Citations fall back to a sentinel 'No live source available' marker.",
     )
 
 
@@ -3690,13 +4006,12 @@ def _build_official_sources_tooltip(ranked_rows: List[Dict[str, Any]]) -> str:
             "regulation document."
         )
 
-    max_rows = 10
     lines = [
         "**Approved-source publications used by Agent 1** "
         f"({len(ranked_rows)} total):",
         "",
     ]
-    for idx, row in enumerate(ranked_rows[:max_rows], start=1):
+    for idx, row in enumerate(ranked_rows, start=1):
         regulator = str(row.get("regulator") or "Unknown regulator").strip()
         title = str(row.get("title") or "(untitled)").strip()
         if len(title) > 90:
@@ -3708,10 +4023,6 @@ def _build_official_sources_tooltip(ranked_rows: List[Dict[str, Any]]) -> str:
             lines.append(f"{idx}. **{regulator}** — [{title}]({url}){date_suffix}")
         else:
             lines.append(f"{idx}. **{regulator}** — {title}{date_suffix}")
-    remaining = len(ranked_rows) - max_rows
-    if remaining > 0:
-        lines.append("")
-        lines.append(f"…and {remaining} more publication(s).")
     return "\n".join(lines)
 
 
@@ -3994,15 +4305,34 @@ def _render_optional_regulation_card() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
     if reg_file is not None:
-        saved = save_upload(reg_file, UPLOAD_DIR)
-        doc_id = db.save_document(
-            name=reg_file.name, kind="regulation", path=str(saved),
-            mime=getattr(reg_file, "type", None),
-            size_bytes=saved.stat().st_size,
-            regulation=st.session_state["regulation"],
-        )
-        st.session_state["regulation_doc_id"] = doc_id
-        st.session_state["regulation_doc_name"] = reg_file.name
+        # ``st.file_uploader`` keeps the uploaded file in the widget across
+        # reruns until the user clears it, so ``reg_file is not None`` is
+        # true on every rerun after the initial drop. The file_id (a
+        # stable UUID Streamlit assigns to each newly-selected file) is
+        # our de-dup key so we save + record the document exactly once
+        # per fresh drop instead of writing a new DB row on every rerun.
+        #
+        # NOTE: the upload widget is intentionally passive. It only
+        # persists the file and records it on session_state; it does
+        # NOT flip the mode, navigate to another page, or trigger BRD
+        # generation. The reviewer stays in control of the workflow -
+        # BRD generation is driven exclusively by the "Generate BRD /
+        # FRD" button on Page 2, which then decides whether to run a
+        # live regulator search, consume this uploaded document, or
+        # both, based on the mode radio and the presence of the
+        # uploaded artefacts.
+        file_id = getattr(reg_file, "file_id", None) or f"{reg_file.name}:{reg_file.size}"
+        if st.session_state.get("_last_reg_upload_id") != file_id:
+            saved = save_upload(reg_file, UPLOAD_DIR)
+            doc_id = db.save_document(
+                name=reg_file.name, kind="regulation", path=str(saved),
+                mime=getattr(reg_file, "type", None),
+                size_bytes=saved.stat().st_size,
+                regulation=st.session_state["regulation"],
+            )
+            st.session_state["regulation_doc_id"] = doc_id
+            st.session_state["regulation_doc_name"] = reg_file.name
+            st.session_state["_last_reg_upload_id"] = file_id
 
 
 def render_setup_page() -> None:
@@ -4014,14 +4344,11 @@ def render_setup_page() -> None:
     # selected institution type(s), not against a generic FS baseline.
     _render_client_roles_selector()
 
-    # STEP 1b: Client Profile keyword multi-selects (organization profile,
-    # business lines, products in scope, countries of operation, legal
-    # entities, vendor & third parties). Rendered as CV-style keyword
-    # pickers — curated seed catalogs with free-form entries. Every
-    # keyword is threaded through Agent 1, the BRD prompt, the RTM,
-    # questionnaire and recommendations so the interpretation is scoped
-    # to the actual client (not a generic FS baseline).
-    _render_client_profile_selector()
+    # STEP 1b (Client Profile keyword multi-selects) has been removed from
+    # the Setup page. The underlying ``client_profile`` session_state
+    # bundle still flows through Agent 1 / BRD / RTM / questionnaire /
+    # recommendations — it just defaults to an empty keyword bag until
+    # we surface the picker again on another page.
 
     left, right = st.columns([2, 1], gap="large")
 
@@ -4057,16 +4384,34 @@ def render_setup_page() -> None:
 
             target_path: Optional[Path] = None
             if brd_file is not None:
-                target_path = save_upload(brd_file, UPLOAD_DIR)
-                doc_id = db.save_document(
-                    name=brd_file.name, kind="brd", path=str(target_path),
-                    mime=getattr(brd_file, "type", None),
-                    size_bytes=target_path.stat().st_size,
-                    regulation=st.session_state["regulation"],
+                # Same de-dup contract as the regulation upload: the
+                # file lingers in the widget across reruns, so persist
+                # once per fresh drop using the ``file_id`` UUID.
+                #
+                # NOTE: this upload is also intentionally passive. It
+                # only saves the file and records the document; it does
+                # NOT trigger parsing, Agent 3, or a page change. The
+                # reviewer explicitly clicks "Generate BRD / FRD" on
+                # Page 2 (which under the "Use existing BRD/FRD" mode
+                # calls ``_run_agent2_for_uploaded_brd`` to parse the
+                # DOCX and chain the questionnaire build) so BRD
+                # generation stays a deliberate user action.
+                brd_file_id = (
+                    getattr(brd_file, "file_id", None)
+                    or f"{brd_file.name}:{brd_file.size}"
                 )
-                st.session_state["brd_doc_id"] = doc_id
-                st.session_state["brd_source"] = "uploaded"
-                st.success(f"Saved BRD `{brd_file.name}` (ID = {doc_id}).")
+                if st.session_state.get("_last_brd_upload_id") != brd_file_id:
+                    target_path = save_upload(brd_file, UPLOAD_DIR)
+                    doc_id = db.save_document(
+                        name=brd_file.name, kind="brd", path=str(target_path),
+                        mime=getattr(brd_file, "type", None),
+                        size_bytes=target_path.stat().st_size,
+                        regulation=st.session_state["regulation"],
+                    )
+                    st.session_state["brd_doc_id"] = doc_id
+                    st.session_state["brd_source"] = "uploaded"
+                    st.session_state["_last_brd_upload_id"] = brd_file_id
+                    st.success(f"Saved BRD `{brd_file.name}` (ID = {doc_id}).")
             elif use_sample:
                 sample = SAMPLE_DIR / "DORA_Tier2_Detailed_DetailedBRDFRD.docx"
                 if not sample.exists():
@@ -4166,6 +4511,38 @@ def _run_agent1_and_agent2_with_status() -> None:
                 logger.exception("Regulation document parse failed. name=%s", reg.get("name"))
                 st.warning(f"Could not parse regulation document `{reg['name']}`: {exc}")
 
+    # Choose the ``RegulatoryIntelligencePackage`` handed to Agent 1.
+    #
+    # There are two cases:
+    #
+    # 1. Page 1 has a cached package whose fingerprint (regulation +
+    #    regulator selection) still matches the current session. This
+    #    is the package that already populated the "Retrieved Regulator
+    #    Sources" table on Page 1 — reusing it here means the Official
+    #    Sources / Regulators Hit tiles on Page 2 mirror what the user
+    #    already saw on Page 1, and Agent 1 does not repeat the live
+    #    HTTP search.
+    #
+    # 2. No cached package matches. We pass ``None`` so the downstream
+    #    stage performs a fresh live regulator search. An uploaded
+    #    regulation document (if any) is still threaded through as
+    #    ``parsed_document`` -> Agent 1 -> ``build_brd_frd_report`` so
+    #    its text lands in the prompt as *additional* context — the
+    #    live search is never skipped just because a document was
+    #    uploaded.
+    intelligence_package: Optional[RegulatoryIntelligencePackage] = _fresh_intelligence_package()
+    if intelligence_package is not None:
+        logger.info(
+            "Reusing cached Page-1 intelligence package. official_results=%d",
+            len(getattr(intelligence_package, "official_results", []) or []),
+        )
+    elif parsed_doc is not None and not parsed_doc.is_empty:
+        logger.info(
+            "Uploaded regulation document present and no cached Page-1 package; "
+            "running live regulator search and using the document as *additional* "
+            "prompt context (not as a replacement for the live search)."
+        )
+
     # Single st.status widget spans Agent 1 -> Agent 2 -> Agent 3 so the
     # user always sees a phase label that matches what is actually running.
     # Previously the outer spinner showed "Processing..." during Agents
@@ -4186,7 +4563,7 @@ def _run_agent1_and_agent2_with_status() -> None:
                 regulator_selection=_selected_regulator_codes(),
                 consulting_selection=None,
                 include_consulting_guidance=False,
-                intelligence_package=_fresh_intelligence_package(),
+                intelligence_package=intelligence_package,
                 client_roles=_selected_client_roles(),
                 client_profile=_current_client_profile(),
             )
@@ -4266,23 +4643,40 @@ def _run_agent1_and_agent2_with_status() -> None:
     st.session_state["_brd_flow_active"] = False
 
 
-def _run_agent2_for_uploaded_brd() -> None:
-    """Parse an uploaded BRD into requirements via the existing parser path."""
+def _parse_uploaded_brd_requirements() -> Optional[int]:
+    """Deterministically parse the uploaded BRD DOCX and persist its
+    requirement rows to SQLite.
+
+    This is the lightweight, LLM-free portion of Agent 2 for the
+    "Use existing BRD/FRD" path. It does not touch Agent 3, does not
+    hit the GenAI service, and does not modify the questionnaire
+    session state - it simply extracts requirement tables from the
+    uploaded document and records them so downstream pages can render
+    them.
+
+    Returns
+    -------
+    ``None`` if the parse could not be attempted (no upload / missing
+    file / DB record gone). Otherwise the number of requirements
+    saved (may be ``0`` when the DOCX has no recognisable requirement
+    table). Failures inside the parser surface via ``st.error`` and
+    return ``None`` so the caller can back off cleanly.
+    """
     doc_id = st.session_state.get("brd_doc_id")
     if not doc_id:
-        st.warning("Upload a BRD/FRD DOCX on Page 1 first.")
-        return
+        return None
     rec = db.get_document(int(doc_id))
     if not rec:
         st.error("BRD document record is missing from the database.")
-        return
+        return None
     path = Path(rec["path"])
     if not path.exists():
         st.error(f"Saved BRD file is missing on disk: {path}")
-        return
+        return None
     from services.questionnaire_generator import (
         derive_impact_pairs,
         read_docx_requirements,
+        read_docx_via_ai_classifier,
     )
     try:
         # ``DocxSource`` in ``utils.docx_parser`` is a type alias
@@ -4291,7 +4685,27 @@ def _run_agent2_for_uploaded_brd() -> None:
         reqs = read_docx_requirements(str(path))
     except Exception as exc:
         st.error(f"Failed to parse BRD: {exc}")
-        return
+        return None
+
+    # Two-tier parse (mirrors ``build_questionnaire_package``): when the
+    # strict table parser found nothing, ask the AI classifier to
+    # structure the free-form BRD text. This lets us show the reviewer
+    # the recovered requirements on Page 2 (and persist them to
+    # SQLite) before Agent 3 is even invoked — otherwise the page would
+    # show a "no requirements found" warning even though the pipeline
+    # can actually recover them via the LLM.
+    if not reqs:
+        client = _genai_client()
+        if client is not None:
+            with st.spinner("AI-classifying free-form BRD content..."):
+                ai_reqs, _ai_obls = read_docx_via_ai_classifier(
+                    str(path),
+                    st.session_state.get("regulation") or "",
+                    client,
+                )
+            if ai_reqs:
+                reqs = ai_reqs
+
     pairs = derive_impact_pairs(reqs, st.session_state["regulation"])
     area_lookup: Dict[str, List[str]] = {}
     function_lookup: Dict[str, List[str]] = {}
@@ -4312,11 +4726,30 @@ def _run_agent2_for_uploaded_brd() -> None:
             for r in reqs
         ],
     )
-    st.success(f"Parsed {len(reqs)} requirements from `{path.name}`.")
+    return len(reqs)
+
+
+def _run_agent2_for_uploaded_brd() -> None:
+    """Parse an uploaded BRD + chain Agent 3 in one shot.
+
+    Retained for callers that want the full "click one button and end
+    up with a questionnaire" behaviour. Page 2's auto-parse path uses
+    :func:`_parse_uploaded_brd_requirements` directly so it can skip
+    the Agent 3 chain (that step belongs to Page 3).
+    """
+    doc_id = st.session_state.get("brd_doc_id")
+    if not doc_id:
+        st.warning("Upload a BRD/FRD DOCX on Page 1 first.")
+        return
+    count = _parse_uploaded_brd_requirements()
+    if count is None:
+        return
+    rec = db.get_document(int(doc_id))
+    if rec:
+        st.success(f"Parsed {count} requirements from `{Path(rec['path']).name}`.")
     # Chain Agent 3 so parsing an uploaded BRD/FRD also produces the
-    # questionnaire in the same click - the user should not have to hop
-    # to Page 3 and press another button. The auto-run guard on Page 3
-    # is set so opening the page later never triggers a duplicate build.
+    # questionnaire. The auto-run guard on Page 3 is set so opening the
+    # page later never triggers a duplicate build.
     st.session_state["questionnaire"] = None
     st.session_state["package"] = None
     st.session_state["assessment_state"] = AssessmentState()
@@ -4356,43 +4789,85 @@ def render_brd_page() -> None:
     st.subheader("2. Generate BRD / FRD")
     mode = st.session_state["mode"]
 
+    # Contract (2026-07): BRD generation is triggered EXCLUSIVELY by the
+    # "Generate BRD / FRD" button below - never as a side-effect of an
+    # upload on Page 1. This keeps all four workflows possible:
+    #   1. live HTTP for regulation + generate BRD
+    #   2. upload regulation + generate BRD (live regulator search
+    #      still runs; the uploaded document is threaded in as extra
+    #      prompt context via ``parsed_document`` — see
+    #      ``_run_agent1_and_agent2_with_status``)
+    #   3. live HTTP for regulation + upload BRD (parse the uploaded
+    #      BRD when the user clicks Generate in "Use existing BRD/FRD"
+    #      mode)
+    #   4. upload regulation + upload BRD
+    # The reviewer chooses their combination via the mode radio and the
+    # two upload widgets on Page 1, then arrives here and clicks
+    # Generate to actually run the pipeline.
+
     if mode == "Use existing BRD/FRD":
         doc_id_existing = st.session_state.get("brd_doc_id")
+
+        # The "Generate BRD / FRD" call-to-action is intentionally NOT
+        # rendered on this branch. When the reviewer uploads their own
+        # BRD/FRD there is nothing to *generate* - the document already
+        # exists. The old CTA doubled as a "parse the DOCX" trigger,
+        # which was misleading (the label promised generation while the
+        # click actually just read requirement tables). The parse step
+        # is deterministic and fast (no LLM), so we run it silently the
+        # first time this page renders with a fresh upload and surface
+        # the parsed requirement table directly.
         reqs_existing = (
             db.list_requirements(int(doc_id_existing)) if doc_id_existing else []
         )
-        # Hide the "Generate BRD / FRD" CTA once requirements have been
-        # extracted; otherwise the button lingers below the parsed table
-        # and invites accidental re-parses.
-        if not reqs_existing:
-            if doc_id_existing:
-                cta_help = "Read requirement tables from the DOCX uploaded on Page 1."
-            else:
-                cta_help = (
-                    "Disabled: no BRD/FRD DOCX uploaded yet. Go back to "
-                    "Page 1 and either upload a BRD/FRD, load the bundled "
-                    "sample, or switch 'Source Of Requirements' to "
-                    "'Generate BRD/FRD from regulation'."
-                )
-            if _render_step2_cta(
-                "Generate BRD / FRD",
-                on_click_help=cta_help,
-                disabled=not doc_id_existing,
-                key="step2_generate_from_upload",
-            ):
-                _run_agent2_for_uploaded_brd()
-                # Force a rerun so the just-rendered CTA disappears now
-                # that the parsed table sits below it.
-                new_reqs = (
-                    db.list_requirements(int(doc_id_existing)) if doc_id_existing else []
-                )
-                if new_reqs:
+        # Session-state guard: the deterministic BRD parser saves ZERO
+        # rows to SQLite whenever the DOCX has no recognisable requirement
+        # tables. Without this guard we would loop forever — the "no rows
+        # in DB" condition (``not reqs_existing``) would stay true after
+        # every save, the ``st.rerun()`` below would fire again, and
+        # Page 2 would never render past the spinner. The marker is
+        # keyed to ``doc_id`` so re-uploading a *new* BRD (different
+        # doc_id) forces a fresh parse attempt.
+        parse_marker_key = (
+            f"_brd_parsed_doc_{doc_id_existing}" if doc_id_existing else None
+        )
+        already_parsed = bool(
+            parse_marker_key and st.session_state.get(parse_marker_key)
+        )
+        if (
+            doc_id_existing
+            and not reqs_existing
+            and not already_parsed
+        ):
+            with st.spinner("Reading uploaded BRD / FRD..."):
+                parsed_count = _parse_uploaded_brd_requirements()
+            if parsed_count is not None:
+                # Record that we've attempted the parse for this doc_id
+                # regardless of the outcome (0 rows or 500 rows). The
+                # warning branch below still fires when the parse yielded
+                # nothing usable — the marker only stops the loop.
+                st.session_state[parse_marker_key] = True
+                if parsed_count > 0:
+                    # Only rerun when we actually persisted rows — that is
+                    # the case where the next paint needs a fresh DB read
+                    # to populate the requirements expander. When
+                    # parsed_count == 0 there is nothing new for the
+                    # subsequent render to pick up, and a rerun would only
+                    # re-enter this branch on every rerun (see the loop
+                    # bug this comment guards against).
                     st.rerun()
-        doc_id = st.session_state.get("brd_doc_id")
+
         reqs_ready = False
-        if doc_id:
-            reqs = db.list_requirements(int(doc_id))
+        if doc_id_existing:
+            reqs = db.list_requirements(int(doc_id_existing))
             if reqs:
+                doc_rec = db.get_document(int(doc_id_existing)) or {}
+                doc_name = doc_rec.get("name") or "uploaded document"
+                st.success(
+                    f"Loaded **{len(reqs)}** requirement(s) from "
+                    f"`{doc_name}`. No BRD generation needed - the "
+                    "uploaded document is the source of truth."
+                )
                 with st.expander(
                     f"Parsed BRD Requirements ({len(reqs)})",
                     expanded=False,
@@ -4400,7 +4875,37 @@ def render_brd_page() -> None:
                     _render_parsed_requirements(reqs)
                 reqs_ready = True
             else:
-                st.info("Click **Generate BRD / FRD** to extract requirements.")
+                # ``_parse_uploaded_brd_requirements`` ran and returned
+                # zero rows, or the parser could not identify any
+                # requirement tables inside the DOCX.
+                st.warning(
+                    "The uploaded document did not yield any requirement "
+                    "rows. Confirm the DOCX includes a standard "
+                    "requirements table (ID / Category / Requirement / "
+                    "Detailed Requirement / <Regulation> Alignment / "
+                    "Priority / Acceptance Criteria columns), then either "
+                    "click Retry Parse below or re-upload on Page 1."
+                )
+                # Retry button: the session-state guard above stops the
+                # rerun loop when a parse yields zero rows, but it also
+                # prevents an *implicit* re-parse if the underlying parser
+                # gets fixed / relaxed while the same DOCX is still
+                # attached. Clearing the marker + rerunning gives the
+                # reviewer an in-page way to re-attempt the parse without
+                # going back to Page 1.
+                if st.button(
+                    "Retry Parse",
+                    key=f"retry_parse_brd_{doc_id_existing}",
+                    help=(
+                        "Re-runs the requirement-table extractor against "
+                        "the currently attached BRD DOCX. Useful when the "
+                        "parser rules have been updated or when the "
+                        "previous attempt hit a transient error."
+                    ),
+                ):
+                    if parse_marker_key:
+                        st.session_state.pop(parse_marker_key, None)
+                    st.rerun()
         else:
             st.warning(
                 "No BRD/FRD DOCX uploaded yet. Go back to **Page 1** and "
@@ -4411,7 +4916,10 @@ def render_brd_page() -> None:
         _render_next_button(
             "2. Generate BRD / FRD",
             disabled=not reqs_ready,
-            help_text="Generate the BRD / FRD first." if not reqs_ready else None,
+            help_text=(
+                "Upload a BRD/FRD DOCX on Page 1 first."
+                if not reqs_ready else None
+            ),
         )
         return
 
@@ -4511,13 +5019,6 @@ def render_brd_page() -> None:
         help="Number of discrete obligations identified by Agent 1 "
              "(Regulatory Analysis).",
     )
-    if confidence_assessment is not None and confidence_assessment.reasoning:
-        conf_source = "AI-generated" if confidence_assessment.generated_by_ai else "evidence-driven"
-        st.caption(
-            f"**Confidence rationale** ({conf_source}, overall "
-            f"{_floor_pct(confidence_assessment.overall_score):.1f}%): "
-            f"{confidence_assessment.reasoning}"
-        )
 
     # Surface a clear reason whenever GenAI was configured but the run still
     # fell back to the deterministic offline content. The "Used GenAI" tile
@@ -4540,121 +5041,98 @@ def render_brd_page() -> None:
     _render_regulation_source_panel(brd_artifact)
     _render_source_references_panel(brd_artifact)
 
-    # Client Role-Aware Regulatory Interpretation panel. Rendered before the
-    # obligation table so reviewers understand the scope filter that has
-    # been applied to every downstream artefact (BRD, RTM, questionnaire,
-    # recommendations, dashboard).
-    #
-    # NOTE: The anti-hallucination guardrail layer is intentionally NOT
-    # surfaced in the UI. Guardrails still run on every LLM call and
-    # every extracted obligation, and any critical finding forces the
-    # deterministic fallback so no hallucinated content ever reaches the
-    # user — but the audit trail is kept in ``analysis.metadata`` for
-    # exports / audit only.
-    _render_role_aware_interpretation_panel(analysis)
-
     # Regulatory Obligations preview - the cited source(s) are included per
     # row so reviewers can validate traceability without leaving Page 2.
     # Rows are grouped by Area then sorted by Theme + Title so obligations
-    # touching the same business area sit adjacent to each other; users can
-    # still click any column header in the rendered dataframe to re-sort.
+    # touching the same business area sit adjacent to each other. Rendered
+    # as an HTML table (see ``_render_hyperlinked_html_table``) so column
+    # borders and header bold are honoured; column-header sort is
+    # therefore not available here — rows are pre-sorted at build time.
     obl_expander = st.expander(
         f"Regulatory Obligations ({len(analysis.obligations)})",
         expanded=False,
     )
-    obl_rows = []
-    for o in analysis.obligations[:50]:
+    obl_rows: List[Dict[str, Any]] = []
+    # Render every obligation — the wrapping expander is already
+    # collapsed by default and the table itself scrolls inside its
+    # ``max-height`` window, so surfacing all rows keeps the reviewer
+    # in-page instead of pushing them into the JSON export.
+    for o in analysis.obligations:
         refs = list(getattr(o, "source_references", []) or [])
-        primary_url = next((r.get("source_url", "") for r in refs if r.get("source_url")), "")
         obl_rows.append({
-            "ID": o.obligation_id,
-            "Theme": o.theme,
-            "Title": (o.title[:100] + "...") if len(o.title) > 100 else o.title,
-            "Area": o.impacted_area,
-            "Function": o.impacted_function,
-            "Sources": _format_sources_inline(refs),
-            "Primary URL": primary_url,
+            "id": o.obligation_id,
+            "theme": o.theme,
+            "title": (o.title[:100] + "...") if len(o.title) > 100 else o.title,
+            "area": o.impacted_area,
+            "function": o.impacted_function,
+            "source_references": refs,
+            "sources": _format_sources_inline(refs),
         })
-    obl_df = pd.DataFrame(obl_rows)
-    if not obl_df.empty:
-        obl_df = obl_df.sort_values(
-            by=["Area", "Theme", "Title"], kind="mergesort", na_position="last"
-        ).reset_index(drop=True)
+    # The Sort widget rendered by ``_render_hyperlinked_html_table``
+    # decides the on-screen ordering. Default the table to Area so the
+    # Default the table to Obligation ID ascending so the on-screen
+    # order matches the natural numbering (OBL-001, OBL-002, ...) users
+    # cite in remediation tickets. Reviewers can still click any other
+    # header (Theme / Title / Area / Function / Sources) to re-sort.
     with obl_expander:
-        st.markdown('<div class="rap-table-wrap">', unsafe_allow_html=True)
-        st.dataframe(
-            obl_df,
-            width="stretch",
-            height=380,
-            hide_index=True,
-            column_config={
-                "Theme": st.column_config.TextColumn(
-                    "Theme",
-                    help="Click the column header to sort obligations by theme.",
-                ),
-                "Title": st.column_config.TextColumn(
-                    "Title",
-                    help="Click the column header to sort obligations by title.",
-                ),
-                "Area": st.column_config.TextColumn(
-                    "Area",
-                    help="Business area impacted. Rows are pre-grouped by area so the "
-                         "same-area obligations sit together.",
-                ),
-                "Primary URL": st.column_config.LinkColumn(
-                    "Primary URL",
-                    help="Click to open the primary regulatory citation for this obligation.",
-                    display_text="Open",
-                ),
-            },
+        _render_hyperlinked_html_table(
+            columns=[
+                ("id", "ID"),
+                ("theme", "Theme"),
+                ("title", "Title"),
+                ("area", "Area"),
+                ("function", "Function"),
+                ("sources", "Sources"),
+            ],
+            rows=obl_rows,
+            id_columns={"id"},
+            sort_key="regulatory_obligations",
+            default_sort_column="id",
+            default_sort_ascending=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-    if len(analysis.obligations) > 50:
-        st.caption(f"Showing first 50 of {len(analysis.obligations)} obligations.")
 
-    # Resource Traceability Matrix preview
+    # Resource Traceability Matrix preview — HTML-rendered for the same
+    # reasons as the Regulatory Obligations table above.
     if rtm_artifact is not None and rtm_artifact.entries:
         rtm_expander = st.expander(
             f"Resource Traceability Matrix ({len(rtm_artifact.entries)})",
             expanded=False,
         )
-        rtm_rows = []
-        for e in rtm_artifact.entries[:50]:
+        rtm_rows: List[Dict[str, Any]] = []
+        # Render every traceability row — the outer expander is
+        # collapsed by default and the table scrolls inside its own
+        # window, so the reviewer can browse the full matrix without
+        # jumping into the JSON export.
+        for e in rtm_artifact.entries:
             refs = list(getattr(e, "source_references", []) or [])
-            primary_url = next((r.get("source_url", "") for r in refs if r.get("source_url")), "")
             rtm_rows.append({
-                "Trace ID": e.traceability_id,
-                "Obligation": e.obligation_id,
-                "BR ID": e.business_requirement_id,
-                "FR ID": e.functional_requirement_id or "—",
-                "Area": e.impacted_area,
-                "Function": e.impacted_function,
-                "Obligation Evidence": e.evidence_required,
-                "Sources": _format_sources_inline(refs),
-                "Primary URL": primary_url,
+                "trace_id": e.traceability_id,
+                "obligation": e.obligation_id,
+                "br_id": e.business_requirement_id,
+                "area": e.impacted_area,
+                "function": e.impacted_function,
+                "source_references": refs,
+                "sources": _format_sources_inline(refs),
             })
         with rtm_expander:
-            st.markdown('<div class="rap-table-wrap">', unsafe_allow_html=True)
-            st.dataframe(
-                pd.DataFrame(rtm_rows),
-                width="stretch",
-                height=380,
-                hide_index=True,
-                column_config={
-                    "Primary URL": st.column_config.LinkColumn(
-                        "Primary URL",
-                        help="Click to open the primary regulatory citation for this "
-                             "Resource Traceability Matrix row.",
-                        display_text="Open",
-                    ),
-                },
+            # ID-style columns (Trace ID / Obligation / BR ID) are
+            # intentionally left as regular ``rap-td`` cells so they
+            # render in the same weight as the neighbouring Area /
+            # Function text — the row identifiers already stand out
+            # visually because they follow a fixed ``TR-####`` shape.
+            _render_hyperlinked_html_table(
+                columns=[
+                    ("trace_id", "Trace ID"),
+                    ("obligation", "Obligation"),
+                    ("br_id", "BR ID"),
+                    ("area", "Area"),
+                    ("function", "Function"),
+                    ("sources", "Sources"),
+                ],
+                rows=rtm_rows,
+                sort_key="rtm_matrix",
+                default_sort_column="trace_id",
             )
-            st.markdown("</div>", unsafe_allow_html=True)
-        if len(rtm_artifact.entries) > 50:
-                st.caption(
-                    f"Showing first 50 of {len(rtm_artifact.entries)} Resource "
-                    "Traceability Matrix rows."
-                )
 
     # BRD requirements table (for parity with the previous UI)
     from services.questionnaire_generator import (
@@ -4786,6 +5264,320 @@ def _sources_cell_html(refs: List[Dict[str, Any]], fallback_text: str) -> str:
         tail = f'<span class="rap-src-more">+{remaining} more</span>'
 
     return '<span class="rap-src-sep"> | </span>'.join(pieces) + tail
+
+
+_SORTABLE_TABLE_CSS = """
+* { box-sizing: border-box; }
+html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+    color: #1a1a1a;
+}
+.rap-table-wrap {
+    border: 2px solid #1a1a1a;
+    border-radius: 8px;
+    padding: 0;
+    background: #ffffff;
+    margin: 0.25rem 0 0.4rem;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    overflow: auto;
+    max-height: 380px;
+    scrollbar-gutter: stable;
+    line-height: 0;
+}
+.rap-table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }
+.rap-table-wrap::-webkit-scrollbar-track { background: #f4ece2; border-radius: 8px; }
+.rap-table-wrap::-webkit-scrollbar-thumb {
+    background: #bfae9a;
+    border-radius: 8px;
+    border: 2px solid #f4ece2;
+}
+.rap-table-wrap::-webkit-scrollbar-thumb:hover { background: #a0895f; }
+table.rap-html-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.88rem;
+    color: #1a1a1a;
+    background: #ffffff;
+    vertical-align: top;
+    margin: 0;
+    line-height: 1.35;
+}
+table.rap-html-table thead th.rap-th {
+    background: #f0e6da;
+    color: #1a1a1a;
+    font-weight: 800;
+    text-transform: capitalize;
+    border-bottom: 2px solid #1a1a1a;
+    border-right: 1px solid #1a1a1a;
+    padding: 0.6rem 0.75rem;
+    text-align: left;
+    letter-spacing: 0.25px;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+table.rap-html-table thead th.rap-th:last-child { border-right: none; }
+table.rap-html-table thead th.rap-th:hover { background: #e9d9c3; }
+table.rap-html-table thead th.rap-th .rap-th-sort {
+    display: inline-block;
+    margin-left: 6px;
+    font-size: 0.85em;
+    color: #8a7a6c;
+    font-weight: 700;
+}
+table.rap-html-table thead th.rap-th.active .rap-th-sort { color: #1a1a1a; }
+table.rap-html-table tbody td.rap-td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid #8a7a6c;
+    border-right: 1px solid #8a7a6c;
+    vertical-align: top;
+    line-height: 1.35;
+}
+table.rap-html-table tbody td.rap-td:last-child { border-right: none; }
+table.rap-html-table tbody tr:last-child td.rap-td { border-bottom: none; }
+table.rap-html-table tbody tr:hover td.rap-td { background: #fdf6f0; }
+table.rap-html-table td.rap-td-id {
+    color: #2d2d2d;
+    white-space: nowrap;
+}
+table.rap-html-table td.rap-td-src { min-width: 220px; }
+table.rap-html-table a.rap-src-link {
+    color: #d04a02;
+    text-decoration: none;
+    font-weight: 600;
+}
+table.rap-html-table a.rap-src-link:hover { text-decoration: underline; }
+table.rap-html-table .rap-src-plain { color: #4a4a4a; }
+table.rap-html-table .rap-src-plain.rap-src-none {
+    color: #8a8a8a;
+    font-style: italic;
+}
+table.rap-html-table .rap-src-sep { color: #b6b6b6; margin: 0 2px; }
+table.rap-html-table .rap-src-more {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: #ead8cc;
+    color: #6a3300;
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+"""
+
+
+_SORTABLE_TABLE_JS = """
+(function() {
+    const table = document.querySelector('table.rap-html-table');
+    if (!table) { return; }
+    const tbody = table.querySelector('tbody');
+    const headers = Array.from(table.querySelectorAll('thead th.rap-th'));
+
+    let currentKey = table.dataset.defaultSortKey || headers[0].dataset.key;
+    let currentDir = (table.dataset.defaultSortDir || 'asc') === 'desc' ? 'desc' : 'asc';
+
+    function keyIndex(key) {
+        return headers.findIndex(h => h.dataset.key === key);
+    }
+
+    function applySort() {
+        const idx = keyIndex(currentKey);
+        if (idx < 0) { return; }
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort((a, b) => {
+            const av = (a.cells[idx].dataset.sortValue || '').trim();
+            const bv = (b.cells[idx].dataset.sortValue || '').trim();
+            if (!av && bv) return 1;
+            if (av && !bv) return -1;
+            const cmp = av.localeCompare(bv, undefined, {
+                numeric: true, sensitivity: 'base'
+            });
+            return currentDir === 'asc' ? cmp : -cmp;
+        });
+        const frag = document.createDocumentFragment();
+        rows.forEach(r => frag.appendChild(r));
+        tbody.appendChild(frag);
+        updateHeaders();
+    }
+
+    function updateHeaders() {
+        headers.forEach(h => {
+            const icon = h.querySelector('.rap-th-sort');
+            if (!icon) { return; }
+            if (h.dataset.key === currentKey) {
+                icon.textContent = currentDir === 'asc' ? '\\u2191' : '\\u2193';
+                h.classList.add('active');
+            } else {
+                icon.textContent = '\\u2195';
+                h.classList.remove('active');
+            }
+        });
+    }
+
+    headers.forEach(h => {
+        h.addEventListener('click', () => {
+            if (h.dataset.key === currentKey) {
+                currentDir = currentDir === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentKey = h.dataset.key;
+                currentDir = 'asc';
+            }
+            applySort();
+        });
+    });
+
+    applySort();
+})();
+"""
+
+
+def _sort_value_for_cell(row: Dict[str, Any], key: str) -> str:
+    """Return a plain-string sort key for a single table cell.
+
+    The value is emitted on the ``<td data-sort-value>`` attribute
+    and read by the client-side sort JS. Sources are represented by
+    the first citation's title (or its URL as a last resort) so the
+    hyperlink column still sorts intuitively.
+    """
+    if key == "sources":
+        refs = row.get("source_references") or []
+        if isinstance(refs, list) and refs:
+            first = refs[0] if isinstance(refs[0], dict) else {}
+            label = str(first.get("title") or first.get("source_url") or "")
+        else:
+            label = str(row.get("sources") or "")
+    else:
+        raw = row.get(key)
+        label = "" if raw is None else str(raw)
+    return label.strip().lower()
+
+
+def _render_hyperlinked_html_table(
+    columns: List[Tuple[str, str]],
+    rows: List[Dict[str, Any]],
+    *,
+    id_columns: Optional[Set[str]] = None,
+    max_height: int = 380,
+    sort_key: Optional[str] = None,
+    default_sort_column: Optional[str] = None,
+    default_sort_ascending: bool = True,
+) -> None:
+    """Render a data table as plain HTML using the ``.rap-html-table`` style.
+
+    Streamlit's ``st.dataframe`` renders through Glide Data Grid on a
+    ``<canvas>`` element, which means bolded header text and column
+    borders cannot be styled with CSS. To surface both a proper header
+    row and visible column separators we emit a plain HTML table
+    matched to the ``.rap-html-table`` pattern already used by the
+    Parsed BRD Requirements renderer.
+
+    ``columns`` is a list of ``(row_key, header_label)`` tuples. Any row
+    key of ``"sources"`` is treated specially: the row must carry a
+    ``source_references`` list of ``{title, source_url, ...}`` dicts,
+    which is rendered as an inline list of ``<a>`` links via
+    :func:`_sources_cell_html`. ``id_columns`` receives the ``rap-td-id``
+    class (monospaced-looking, no wrap) so ID columns stay compact.
+
+    When ``sort_key`` is provided the table is emitted through
+    :func:`streamlit.components.v1.html` (a sandboxed iframe) with
+    embedded JavaScript that reorders ``<tr>`` elements on click. Each
+    header shows an up/down arrow indicating the current sort — the
+    same UX Glide Data Grid used to give the ``st.dataframe`` version.
+    ``sort_key`` itself is only used to key the iframe (Streamlit uses
+    the ``key`` argument to reconcile component instances across
+    reruns); the sort state lives entirely in the iframe's JS.
+    """
+    id_columns = id_columns or set()
+    sortable = sort_key is not None
+
+    def _cell_html_for(row: Dict[str, Any], key: str) -> str:
+        if key == "sources":
+            refs = list(row.get("source_references") or [])
+            fallback = str(row.get("sources") or "")
+            return _sources_cell_html(refs, fallback)
+        raw = row.get(key)
+        return html.escape("" if raw is None else str(raw))
+
+    body_rows: List[str] = []
+    for row in rows:
+        cells: List[str] = []
+        for key, _label in columns:
+            css_class = (
+                "rap-td rap-td-src" if key == "sources"
+                else "rap-td rap-td-id" if key in id_columns
+                else "rap-td"
+            )
+            cell_html = _cell_html_for(row, key)
+            if sortable:
+                sort_val = html.escape(_sort_value_for_cell(row, key), quote=True)
+                cells.append(
+                    f'<td class="{css_class}" data-sort-value="{sort_val}">{cell_html}</td>'
+                )
+            else:
+                cells.append(f'<td class="{css_class}">{cell_html}</td>')
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    if not sortable:
+        header_html = (
+            "<thead><tr>"
+            + "".join(
+                f'<th class="rap-th">{html.escape(str(label))}</th>'
+                for _, label in columns
+            )
+            + "</tr></thead>"
+        )
+        st.markdown(
+            f'<div class="rap-table-wrap rap-table-scroll" style="max-height:{max_height}px;">'
+            '<table class="rap-html-table">'
+            f'{header_html}'
+            f'<tbody>{"".join(body_rows)}</tbody>'
+            "</table>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Sortable path — full iframe with embedded CSS + click-header JS.
+    header_cells = []
+    for key, label in columns:
+        header_cells.append(
+            f'<th class="rap-th" data-key="{html.escape(key, quote=True)}">'
+            f'{html.escape(str(label))}'
+            '<span class="rap-th-sort">\u2195</span>'
+            "</th>"
+        )
+    header_html = "<thead><tr>" + "".join(header_cells) + "</tr></thead>"
+
+    default_key = default_sort_column or columns[0][0]
+    default_dir = "asc" if default_sort_ascending else "desc"
+    iframe_body = (
+        "<!doctype html><html><head><meta charset=\"utf-8\"/>"
+        f"<style>{_SORTABLE_TABLE_CSS}</style>"
+        "</head><body>"
+        f'<div class="rap-table-wrap" style="max-height:{max_height}px;">'
+        f'<table class="rap-html-table" '
+        f'data-default-sort-key="{html.escape(default_key, quote=True)}" '
+        f'data-default-sort-dir="{html.escape(default_dir, quote=True)}">'
+        f'{header_html}'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        "</table></div>"
+        f"<script>{_SORTABLE_TABLE_JS}</script>"
+        "</body></html>"
+    )
+    # Iframe height = wrapper cap + a little breathing room for the
+    # outer border, box-shadow and its own scrollbar gutter. If we set
+    # the iframe shorter than the wrapper, the wrapper is truncated;
+    # if we set it taller, the extra space appears as blank strip
+    # below the table.
+    st_components.html(iframe_body, height=max_height + 20, scrolling=False)
 
 
 def _render_parsed_requirements_html(reqs: List[Dict[str, Any]]) -> None:
@@ -4931,82 +5723,92 @@ def _render_brd_download_panel(
     with st.expander("Downloads", expanded=False):
         st.caption(
             "All BRD / FRD, requirements, obligations and Resource "
-            "Traceability Matrix exports for this run."
+            "Traceability Matrix exports for this run. Click any heading "
+            "below to reveal its download option."
         )
 
-        st.markdown("**Combined BRD + FRD (DOCX)**")
-        docx_path = _build_or_get_brd_docx(brd_artifact)
-        if docx_path and docx_path.exists():
-            with open(docx_path, "rb") as fh:
+        # Streamlit does not support nested ``st.expander`` calls, so each
+        # section is disclosed via a ``st.toggle`` — the download button
+        # only renders when the toggle for that section is switched on.
+
+        if st.toggle("Combined BRD + FRD (DOCX)", key="dl_toggle_brd_docx"):
+            docx_path = _build_or_get_brd_docx(brd_artifact)
+            if docx_path and docx_path.exists():
+                with open(docx_path, "rb") as fh:
+                    st.download_button(
+                        "Download BRD + FRD (DOCX)",
+                        data=fh.read(),
+                        file_name=docx_path.name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        width="stretch",
+                    )
+            else:
+                st.caption("Combined DOCX not yet generated for this run.")
+
+        if st.toggle("Structured Report (JSON)", key="dl_toggle_report_json"):
+            try:
+                report_json = brd_artifact.report.model_dump_json(indent=2).encode("utf-8")
                 st.download_button(
-                    "Download BRD + FRD (DOCX)",
-                    data=fh.read(),
-                    file_name=docx_path.name,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "Download BRD + FRD (JSON)",
+                    data=report_json,
+                    file_name=f"{stem_base}_BRD_FRD_report.json",
+                    mime="application/json",
                     width="stretch",
                 )
+            except Exception as exc:
+                st.warning(f"JSON dump failed: {exc}")
 
-        st.markdown("**Structured Report (JSON)**")
-        try:
-            report_json = brd_artifact.report.model_dump_json(indent=2).encode("utf-8")
+        if st.toggle("Requirements (CSV)", key="dl_toggle_requirements_csv"):
+            try:
+                csv_bytes = _requirements_csv(
+                    brd_artifact.report,
+                    (brd_artifact.metadata or {}).get("source_references_by_item"),
+                )
+                st.download_button(
+                    "Download Requirements CSV",
+                    data=csv_bytes,
+                    file_name=f"{stem_base}_requirements.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+            except Exception as exc:
+                st.warning(f"CSV export failed: {exc}")
+
+        if st.toggle("Regulatory Obligations (JSON)", key="dl_toggle_obligations_json"):
+            obligations_payload = [asdict(o) if is_dataclass(o) else dict(o)
+                                   for o in analysis.obligations]
             st.download_button(
-                "Download BRD + FRD (JSON)",
-                data=report_json,
-                file_name=f"{stem_base}_BRD_FRD_report.json",
+                "Download Obligations JSON",
+                data=json.dumps(obligations_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{stem_base}_obligations.json",
                 mime="application/json",
                 width="stretch",
             )
-        except Exception as exc:
-            st.warning(f"JSON dump failed: {exc}")
 
-        st.markdown("**Requirements (CSV)**")
-        try:
-            csv_bytes = _requirements_csv(
-                brd_artifact.report,
-                (brd_artifact.metadata or {}).get("source_references_by_item"),
-            )
-            st.download_button(
-                "Download Requirements CSV",
-                data=csv_bytes,
-                file_name=f"{stem_base}_requirements.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        except Exception as exc:
-            st.warning(f"CSV export failed: {exc}")
-
-        st.markdown("**Regulatory Obligations (JSON)**")
-        obligations_payload = [asdict(o) if is_dataclass(o) else dict(o)
-                               for o in analysis.obligations]
-        st.download_button(
-            "Download Obligations JSON",
-            data=json.dumps(obligations_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name=f"{stem_base}_obligations.json",
-            mime="application/json",
-            width="stretch",
-        )
-
-        st.markdown("**Resource Traceability Matrix (JSON / CSV)**")
-        if rtm_artifact is not None and rtm_artifact.entries:
-            rtm_payload = [asdict(e) for e in rtm_artifact.entries]
-            st.download_button(
-                "Download Resource Traceability Matrix (JSON)",
-                data=json.dumps(rtm_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name=f"{stem_base}_RTM.json",
-                mime="application/json",
-                width="stretch",
-            )
-            st.download_button(
-                "Download Resource Traceability Matrix (CSV)",
-                data=_rtm_csv(rtm_artifact),
-                file_name=f"{stem_base}_RTM.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        else:
-            st.caption(
-                "Resource Traceability Matrix not available — re-run Agents 1 + 2."
-            )
+        if st.toggle(
+            "Resource Traceability Matrix (JSON / CSV)",
+            key="dl_toggle_rtm",
+        ):
+            if rtm_artifact is not None and rtm_artifact.entries:
+                rtm_payload = [asdict(e) for e in rtm_artifact.entries]
+                st.download_button(
+                    "Download Resource Traceability Matrix (JSON)",
+                    data=json.dumps(rtm_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                    file_name=f"{stem_base}_RTM.json",
+                    mime="application/json",
+                    width="stretch",
+                )
+                st.download_button(
+                    "Download Resource Traceability Matrix (CSV)",
+                    data=_rtm_csv(rtm_artifact),
+                    file_name=f"{stem_base}_RTM.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+            else:
+                st.caption(
+                    "Resource Traceability Matrix not available — re-run Agents 1 + 2."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -5016,6 +5818,8 @@ def _render_brd_download_panel(
 def render_questionnaire_page() -> None:
     _brd = st.session_state.get("brd_artifact")
     _questionnaire = st.session_state.get("questionnaire")
+    _mode = st.session_state.get("mode")
+    _brd_doc_id = st.session_state.get("brd_doc_id")
 
     # -----------------------------------------------------------------
     # Full-screen loading gate (two-phase render).
@@ -5038,8 +5842,30 @@ def render_questionnaire_page() -> None:
     #     into the normal render path where the questionnaire cards
     #     replace the loader.
     # -----------------------------------------------------------------
-    if _brd is not None and _questionnaire is None:
-        _brd_fp = id(_brd)
+    #
+    # Two auto-run triggers, one gate:
+    #
+    #   * ``brd_artifact`` is set  -> the "Generate BRD/FRD from
+    #     regulation" flow just produced an in-memory Pydantic BRD.
+    #     Fingerprint is the object id so a *new* BRD object (fresh
+    #     run) re-arms the gate.
+    #   * ``brd_doc_id`` is set    -> the "Use existing BRD/FRD" flow
+    #     uploaded a DOCX and Page 2 stored its DB row id. There is no
+    #     in-memory Pydantic report in this flow, so ``brd_artifact``
+    #     stays ``None`` — historically that meant Agent 3 never
+    #     auto-fired on Page 3 and the user was stuck on "Run Agent 3
+    #     or load a saved package to continue" with no obvious action.
+    #     Fingerprint is a synthetic ``upload_<doc_id>`` string so a
+    #     *different* uploaded file (different doc_id) re-arms the
+    #     gate, but re-visiting Page 3 with the same file does not
+    #     duplicate the run.
+    _auto_can_fire = (_brd is not None) or (
+        _mode == "Use existing BRD/FRD" and bool(_brd_doc_id)
+    )
+    if _auto_can_fire and _questionnaire is None:
+        _brd_fp = (
+            id(_brd) if _brd is not None else f"upload_{_brd_doc_id}"
+        )
         already_attempted = (
             st.session_state.get("agent3_last_attempted_brd_fp") == _brd_fp
         )
@@ -5053,7 +5879,7 @@ def render_questionnaire_page() -> None:
                 # the page is rendered so Streamlit fully commits the
                 # loader-only DOM before the next script pass blocks.
                 _render_agent_loader(
-                    "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+                    "3. QUESTIONNAIRE GENERATION",
                     "Generating adaptive questionnaire",
                     "Agent 3 is analysing the BRD, running 12 parallel "
                     "funnel calls plus one free-text pass, and weighting "
@@ -5064,7 +5890,7 @@ def render_questionnaire_page() -> None:
             # Phase 2: same loader; the DOM is already clean, so the
             # browser shows only this while Agent 3 blocks.
             _render_agent_loader(
-                "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+                "3. QUESTIONNAIRE GENERATION",
                 "Generating adaptive questionnaire",
                 "Agent 3 is analysing the BRD, running 12 parallel "
                 "funnel calls plus one free-text pass, and weighting "
@@ -5080,21 +5906,38 @@ def render_questionnaire_page() -> None:
             finally:
                 st.session_state.pop("_agent3_using_full_loader", None)
                 st.session_state.pop(phase_key, None)
-            if st.session_state.get("questionnaire") is not None:
-                st.rerun()
-            # If Agent 3 failed we fall through to the retry loader below.
+            # Whether Agent 3 succeeded or failed, force a rerun so the
+            # next render pass starts with a clean DOM. Without this the
+            # Phase 2 "Generating adaptive questionnaire" loader that we
+            # already painted above stays visible AND the fall-through
+            # code below paints a second loader ("did not complete"),
+            # producing the doubled-loader effect the user reported.
+            # After the rerun ``agent3_last_attempted_brd_fp`` already
+            # equals ``_brd_fp`` (set on line above) so ``already_attempted``
+            # will be True and the next pass either shows the questionnaire
+            # (success) or Case B's retry loader alone (failure).
+            st.rerun()
 
         # Case B: attempt already happened but there's still no
         # questionnaire (failure). Show a clean retry loader — again,
         # no faded Page 2 remnants.
         _render_agent_loader(
-            "3. Questionnaire — Agent 3 (Questionnaire Generation)",
+            "3. QUESTIONNAIRE GENERATION",
             "Questionnaire generation did not complete",
             "The last attempt for this BRD did not produce a "
             "questionnaire. Click Retry below to run Agent 3 again.",
             show_retry_button=True,
         )
         return
+
+    # Persistent page heading — matches the ``st.subheader("N. …")``
+    # pattern used by every other page (Setup, Generate BRD/FRD,
+    # Dashboard, Gap Identification, Export). The heading is placed
+    # *after* the loader gate on purpose: while Agent 3 is running the
+    # full-screen loader already announces "3. QUESTIONNAIRE
+    # GENERATION" on its own, so rendering the subheader up top too
+    # would duplicate the label above the spinner.
+    st.subheader("3. Questionnaire Generation")
 
     action_row = st.columns([1, 1, 4])
     with action_row[0]:
@@ -5115,11 +5958,11 @@ def render_questionnaire_page() -> None:
                           "page. Does not delete the questionnaire itself."):
             _clear_questionnaire_answers()
             st.rerun()
-    with action_row[2]:
-        st.caption(
-            "Review the questions below and click **Calculate Impact & "
-            "Readiness** when you're ready to see the scored results."
-        )
+
+    st.caption(
+        "Review the questions below and click **Calculate Impact & "
+        "Readiness** when you're ready to see the scored results."
+    )
 
     with st.expander("Load From Saved Package JSON", expanded=False):
         uploaded = st.file_uploader(
@@ -5149,20 +5992,18 @@ def render_questionnaire_page() -> None:
                         regulation=st.session_state["regulation"],
                     )
                     st.session_state["questionnaire_id"] = qid
-                    _seed_default_questionnaire_answers(questionnaire)
             except Exception as exc:
                 st.error(f"Could not parse JSON: {exc}")
 
     questionnaire: Optional[QuestionnairePackage] = st.session_state.get("questionnaire")
-    # Safety net for the "pre-populate every question" UX guarantee: run
-    # the deterministic seeder on every Page 3 render. It is idempotent
-    # (each question is skipped when a response already exists) so this
-    # only fills gaps — user-picked answers are always preserved.
-    if questionnaire is not None:
-        try:
-            _seed_default_questionnaire_answers(questionnaire)
-        except Exception:
-            logger.exception("Auto-seed of default answers on Page 3 render failed (non-fatal).")
+    # Pre-populated demo answers have been removed by design: every
+    # closed / free-text question now renders EMPTY on first paint and
+    # only records a response once the reviewer picks (or types) it.
+    # This also means follow-up (``is_child``) questions never surface
+    # from a seeded value - they appear only after a real user answer on
+    # the parent question triggers them via
+    # :func:`_get_triggered_followup_ids`, which reads live
+    # ``state.responses`` on every rerun.
     if questionnaire is None:
         st.info("Run Agent 3 or load a saved package to continue.")
         _render_next_button(
@@ -5175,54 +6016,56 @@ def render_questionnaire_page() -> None:
     pkg = questionnaire.package
     meta = pkg.get("metadata") or {}
     questions = list(pkg.get("questions") or [])
-    closed = [q for q in questions if not q.get("is_free_text")]
-    free_text = [q for q in questions if q.get("is_free_text")]
+    # Hide unscoreable closed questions (every option tagged N/A) from
+    # both the top-of-page tile counts and the questionnaire itself.
+    # Keeping the same filter here as inside
+    # ``_render_questionnaire_answer_cards`` guarantees the tile
+    # numbers match what the reviewer actually sees on the page.
+    questions = [q for q in questions if not _is_question_unscoreable(q)]
+    # Tile counts reflect only the top-level questions the reviewer sees
+    # on first render. Children (``is_child=True``) surface as inline
+    # follow-ups under their parents when a triggering option is picked
+    # — counting them here would overstate the visible workload.
+    visible_questions = [q for q in questions if not q.get("is_child")]
+    closed = [q for q in visible_questions if not q.get("is_free_text")]
+    free_text = [q for q in visible_questions if q.get("is_free_text")]
     requirements = list(pkg.get("requirements") or [])
 
-    raw_coverage = (
-        meta.get("coverage_pct")
-        if meta.get("coverage_pct") is not None
-        else meta.get("requirement_coverage_pct", 0)
-    )
-    try:
-        overall_coverage_pct = float(raw_coverage or 0)
-    except (TypeError, ValueError):
-        overall_coverage_pct = 0.0
-    # The regulator-facing "Overall Coverage" metric represents how much of
-    # the BRD requirement surface Agent 3 successfully mapped to a scored
-    # question. For a healthy Agent 3 run this lands in the 92-99% band; we
-    # floor at 91% so a slightly sparse mapping never renders below the
-    # regulator-approved "green" threshold.
-    overall_coverage_pct = max(91.0, min(99.9, overall_coverage_pct or 95.0))
-
     analysis: Optional[RegulatoryAnalysis] = st.session_state.get("analysis")
-    obligation_count = len(analysis.obligations) if analysis else 0
-
-    # Overall Regulatory Coverage is now driven off the dynamic confidence
-    # assessment (clarity + completeness) rather than a fixed string. When the
-    # assessment isn't yet available we surface the package's own coverage
-    # metric which itself is computed from BRD-to-question mapping density.
-    confidence_assessment = st.session_state.get("confidence_assessment")
-    if confidence_assessment is not None:
-        coverage_metric = (
-            confidence_assessment.clarity_score * 0.5
-            + confidence_assessment.completeness_score * 0.5
-        )
+    # Prefer Agent 1's authoritative :class:`RegulatoryAnalysis` when it
+    # exists (the "Generate BRD/FRD from regulation" flow). Otherwise
+    # fall back to the obligations embedded in the questionnaire
+    # package itself — this is the AI classifier's output in the
+    # "Use existing BRD/FRD" upload flow, where Agent 1 is skipped and
+    # the classifier is the only source of obligations.
+    if analysis and getattr(analysis, "obligations", None):
+        obligation_count = len(analysis.obligations)
     else:
-        coverage_metric = float(overall_coverage_pct or 0.0)
-    # Enforce the >=90% display floor on the Overall Regulatory Coverage tile.
-    coverage_display = f"{_floor_pct(coverage_metric):.0f}%"
+        obligation_count = len(pkg.get("obligations") or [])
 
-    cols = st.columns(5)
-    cols[0].metric("Regulatory Requirements", len(requirements))
-    cols[1].metric("Obligation Reqs", obligation_count)
-    cols[2].metric("Closed Questions (Quantitative)", len(closed))
-    cols[3].metric("Free Text Questions (Qualitative)", len(free_text))
-    cols[4].metric(
-        "Overall Regulatory Coverage",
-        coverage_display,
-        help=_confidence_gap_tooltip(confidence_assessment, kind="overall"),
-    )
+    # Custom HTML tiles (instead of ``st.metric``) so we can attach a
+    # native ``title`` attribute to the whole tile — Streamlit's
+    # built-in ``help`` param on ``st.metric`` only wires a tooltip to
+    # the tiny ``?`` icon, which is easy to miss on the truncated
+    # ("Closed Questions (Quantitati…") labels. With ``title`` on the
+    # tile wrapper the browser shows the full label whenever the
+    # cursor lands anywhere on the tile.
+    tile_defs = [
+        ("Regulatory Requirements", len(requirements)),
+        ("Obligation Reqs", obligation_count),
+        ("Closed Questions (Quantitative)", len(closed)),
+        ("Free Text Questions (Qualitative)", len(free_text)),
+    ]
+    cols = st.columns(4)
+    for col, (label, value) in zip(cols, tile_defs):
+        safe_label = html.escape(str(label))
+        col.markdown(
+            f'<div class="qgen-metric-tile" title="{safe_label}">'
+            f'<div class="qgen-metric-label">{safe_label}</div>'
+            f'<div class="qgen-metric-value">{html.escape(str(value))}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     with st.expander(
         f"Answer Questions ({len(questions)} total)",
@@ -5278,214 +6121,15 @@ def _clear_questionnaire_answers() -> None:
     _persist_assessment_snapshot()
 
 
-# Seed target scores for the four severity bands used on the dashboard.
-# Critical / At risk / Watch / Ready. Values chosen so per-area averages
-# actually cross the readiness ladder (< 25% / 25-50% / 50-75% / >= 75%)
-# even after the scoring engine's per-question averaging noise.
-_SEED_BAND_TARGETS: Tuple[float, ...] = (0.15, 0.38, 0.62, 0.90)
-
-
-def _seed_target_for_area(area: str) -> float:
-    # Deterministic per-area target so reruns of the same questionnaire
-    # produce the same colour distribution on the dashboard.
-    if not area:
-        return _SEED_BAND_TARGETS[2]
-    idx = abs(hash(area)) % len(_SEED_BAND_TARGETS)
-    return _SEED_BAND_TARGETS[idx]
-
-
-# Rotating narrative stubs for free-text seed answers so the same page
-# doesn't show 40 identical placeholders. Deterministic (indexed by the
-# area hash) so reruns of the same questionnaire produce the same text.
-_FREE_TEXT_SEED_TEMPLATES: Tuple[str, ...] = (
-    "Draft response — {function} team has an operating procedure covering "
-    "{area}; the runbook is version-controlled, but the last independent "
-    "review was over 12 months ago. Evidence pack (policy, RACI, latest "
-    "control test results) is available on request and would need to be "
-    "refreshed before formal attestation.",
-    "Working answer — {function} maintains a documented process for "
-    "{area}, with monthly reporting to the accountable committee. Known "
-    "gap: coverage across all in-scope entities is partial, and evidence "
-    "of end-to-end testing for the past 6 months is not yet consolidated "
-    "in a single pack.",
-    "Initial narrative — controls for {area} are embedded in the "
-    "{function} operating model, with quarterly self-attestation. "
-    "Independent assurance (2LOD / 3LOD) has reviewed the design but "
-    "has not yet retested the operating effectiveness under the new "
-    "regulatory scope.",
-    "Draft — the {function} team owns {area} and operates against a "
-    "policy last approved this financial year. Metrics are captured in "
-    "the operational dashboard; the primary gap is that thresholds have "
-    "not been recalibrated against the new regulatory expectations.",
-)
-
-
-def _seed_free_text_narrative(*, area: str, function: str) -> str:
-    """Return a plausible narrative stub for a free-text question.
-
-    The stub is deterministic (chosen by hashing the area+function pair),
-    reads like a real SME first-draft answer, and is short enough that
-    the reviewer can immediately overwrite it. It always mentions the
-    concrete area and accountable function so the seeded text still
-    feels connected to the question.
-    """
-    key = f"{area}|{function}".strip().lower() or "default"
-    idx = abs(hash(key)) % len(_FREE_TEXT_SEED_TEMPLATES)
-    template = _FREE_TEXT_SEED_TEMPLATES[idx]
-    return template.format(area=area, function=function)
-
-
-def _seed_default_questionnaire_answers(
-    questionnaire: QuestionnairePackage,
-    *,
-    state: Optional[AssessmentState] = None,
-    target_score: Optional[float] = None,
-) -> None:
-    """Pre-populate every closed question with a plausible default answer.
-
-    Rationale: the demo carries 100+ questions, and asking the user to
-    manually select answers before the Dashboard has anything to show is
-    friction. This helper walks each closed question, picks the option
-    whose ``score_value`` is closest to a per-area target
-    (spread across the four severity bands so the dashboard always shows
-    Critical / At risk / Watch / Ready colours), and writes it to both
-    ``state.responses`` and the widget-level session key so Streamlit's
-    selectbox renders with that answer pre-selected on the next run.
-
-    Free-text questions are intentionally left blank (they are optional
-    evidence notes). Multi-select questions receive a single-item list.
-
-    Idempotent: if the question already has a recorded answer, that
-    answer is preserved.
-    """
-    if questionnaire is None:
-                    return
-    state = state or st.session_state.get("assessment_state")
-    if state is None:
-        state = AssessmentState()
-        st.session_state["assessment_state"] = state
-
-    pkg = questionnaire.package
-    questions = list(pkg.get("questions") or [])
-
-    # Spread the four band targets across areas so the dashboard shows
-    # every colour, and shuffle the assignment (deterministically) so the
-    # tiles don't appear in a predictable Critical → At risk → Watch →
-    # Ready sequence. We first *guarantee* one area per band, then hash-
-    # assign the remaining areas so the overall pattern feels random but
-    # is stable across reruns of the same questionnaire.
-    areas_ordered = []
-    seen = set()
-    for q in questions:
-        area = str(q.get("area") or q.get("business_area") or "").strip()
-        if area and area not in seen:
-            seen.add(area)
-            areas_ordered.append(area)
-    areas_ordered.sort()
-
-    area_targets: Dict[str, float] = {}
-    band_count = len(_SEED_BAND_TARGETS)
-    if areas_ordered:
-        # Deterministic pseudo-shuffle keyed off the whole area list so
-        # the questionnaire always renders the same colour layout across
-        # refreshes, but *within* a questionnaire the colours look random.
-        shuffle_seed = abs(hash(tuple(areas_ordered))) % (2**31)
-        rng = random.Random(shuffle_seed)
-        shuffled_areas = list(areas_ordered)
-        rng.shuffle(shuffled_areas)
-
-        # First pass: guarantee at least one area per severity band by
-        # assigning the first ``band_count`` shuffled areas one-per-band.
-        for idx in range(min(band_count, len(shuffled_areas))):
-            area_targets[shuffled_areas[idx]] = _SEED_BAND_TARGETS[idx]
-
-        # Second pass: any remaining areas draw a band at random from the
-        # RNG so the distribution stays deterministic but non-sequential.
-        for area in shuffled_areas[band_count:]:
-            area_targets[area] = _SEED_BAND_TARGETS[rng.randrange(band_count)]
-
-    for q_index, q in enumerate(questions):
-        qid = str(q.get("question_id") or "").strip()
-        if not qid or qid in state.responses:
-            continue
-
-        # Free-text (Open Ended) questions get a plausible SME narrative
-        # so nothing on Page 3 is left blank. The narrative is short and
-        # neutral - the SME can overwrite it, but the scoring engine
-        # already has enough signal to grade the question without user
-        # intervention.
-        if q.get("is_free_text"):
-            area = str(q.get("area") or "the impacted area").strip() or "the impacted area"
-            function = str(q.get("function") or "the accountable function").strip() or "the accountable function"
-            narrative = _seed_free_text_narrative(area=area, function=function)
-            state.responses[qid] = narrative
-            widget_key = f"qprev_widget_ft_{qid}"
-            st.session_state[widget_key] = narrative
-            continue
-
-        raw_options = q.get("options") or []
-        labels = option_labels(raw_options) or []
-        if not labels:
-            continue
-
-        area = str(q.get("area") or q.get("business_area") or "").strip()
-        effective_target = (
-            target_score
-            if target_score is not None
-            else area_targets.get(area, _seed_target_for_area(area))
-        )
-
-        best_label: Optional[str] = None
-        best_delta = 999.0
-        # Second axis of variety: rotate the tie-breaker by question index
-        # so that when multiple options score equally close to the area's
-        # target band (very common for Yes/Partially/No style options)
-        # neighbouring questions still pick different labels. Without this
-        # every question in a "Watch"-band area ends up with the same
-        # "Partially" answer, which looks stuck to the user.
-        preferred_offset = q_index % max(1, len(labels))
-        for opt_index, (opt, label) in enumerate(zip(raw_options, labels)):
-            try:
-                sv = score_value(opt, q)
-            except Exception:
-                sv = None
-            if sv is None:
-                continue
-            # ``score_value`` returns 0-100; normalise for the delta.
-            normalised = sv / 100.0 if sv > 1.5 else sv
-            # Skip "perfect" (> 0.95) only for non-Ready bands so the
-            # Ready band still gets to select the strongest available
-            # option — otherwise questions with just Yes/No end up in
-            # the wrong band.
-            if effective_target < 0.85 and normalised > 0.95:
-                continue
-            delta = abs(normalised - effective_target)
-            # Break ties by preferring the option whose index matches the
-            # per-question rotation, without ever displacing a strictly
-            # closer option.
-            tie_break = 0.0 if opt_index == preferred_offset else 0.01
-            if delta + tie_break < best_delta:
-                best_delta = delta + tie_break
-                best_label = label
-        # Fallback: rotate through the labels by question index so even
-        # questions whose options have no ``score_value`` produce varied
-        # answers across the questionnaire.
-        if best_label is None:
-            n = len(labels)
-            if n == 0:
-                continue
-            fallback_idx = q_index % n
-            best_label = labels[fallback_idx]
-
-        qtype = str(q.get("question_type") or "").lower()
-        if "multi" in qtype:
-            state.responses[qid] = [best_label]
-            widget_key = f"qprev_widget_ms_{qid}"
-            st.session_state[widget_key] = [best_label]
-        else:
-            state.responses[qid] = best_label
-            widget_key = f"qprev_widget_sel_{qid}"
-            st.session_state[widget_key] = best_label
+# NOTE: the "auto-seed default answers" demo helper (previously
+# ``_seed_default_questionnaire_answers`` + its ``_SEED_BAND_TARGETS`` /
+# ``_FREE_TEXT_SEED_TEMPLATES`` / ``_seed_free_text_narrative`` /
+# ``_seed_target_for_area`` support surface) has been removed. Every
+# question - closed and free-text alike - now renders EMPTY on first
+# paint and only records a response after the reviewer interacts with
+# the widget. Removing the seeder is what makes the follow-up chain
+# genuinely dynamic: children stay hidden until the user's own answer
+# to the parent triggers them via ``_get_triggered_followup_ids``.
 
 
 def _ensure_assessment_row_for_bulk_answers() -> None:
@@ -5536,6 +6180,102 @@ def _submit_and_go_to_dashboard() -> None:
     logger.info("Assessment submitted, routing user to Dashboard.")
 
 
+def _is_question_unscoreable(q: Dict[str, Any]) -> bool:
+    """Return True when a closed question can never contribute to the
+    readiness score no matter which option the user picks.
+
+    A closed question is unscoreable when **every** option is a dict
+    carrying ``score_value: None`` — the AI questionnaire generator
+    uses that shape to mark "excluded from scoring" options. If any
+    option is a plain string (falls through to the legacy answer
+    table) or carries a numeric ``score_value``, the question can
+    still score and is kept in the render list.
+
+    Free-text (qualitative) questions always return False — their
+    contribution is judged on answer quality by
+    :func:`services.scoring_engine.score_value`, not on option
+    metadata.
+    """
+    if q.get("is_free_text"):
+        return False
+    opts = q.get("options") or []
+    if not opts:
+        return False
+    for opt in opts:
+        if not isinstance(opt, Mapping):
+            # Plain string option — score_engine step 2 / step 3 can
+            # still score it. Keep the question.
+            return False
+        if "score_value" not in opt:
+            return False
+        if opt.get("score_value") is not None:
+            return False
+    return True
+
+
+def _get_triggered_followup_ids(
+    q: Dict[str, Any], state: AssessmentState
+) -> List[str]:
+    """Return the ordered follow-up question IDs revealed by the user's
+    current answer to ``q``.
+
+    Two mechanisms are honoured (the same ones Agent 3 /
+    :func:`ensure_funnel_followups` populate):
+
+    1. **Per-option** — an option dict carrying ``triggers_followup:
+       True`` + ``followup_question_id: <child_qid>``. Both single- and
+       multi-select answers are considered; every picked option that
+       triggers a follow-up contributes its child ID.
+    2. **Question-level ``trigger_answers``** — when the parent carries
+       ``child_question_ids`` alongside ``trigger_answers`` and one of
+       the picked labels appears in ``trigger_answers``, every listed
+       child ID is revealed. This is the older wiring used by some
+       deterministic branches.
+
+    De-duplicated while preserving first-seen order so the UI renders
+    children in a stable, predictable sequence.
+    """
+    qid = str(q.get("question_id") or "")
+    if not qid:
+        return []
+    current = state.responses.get(qid)
+    if current in (None, "", []):
+        return []
+
+    if isinstance(current, list):
+        selected_labels = [str(v) for v in current if v not in (None, "")]
+    else:
+        selected_labels = [str(current)]
+
+    followup_ids: List[str] = []
+
+    # Mechanism 1 — per-option ``triggers_followup``.
+    opts = q.get("options") or []
+    for label in selected_labels:
+        meta = option_metadata(opts, label)
+        if not meta:
+            continue
+        if not meta.get("triggers_followup"):
+            continue
+        fid = str(meta.get("followup_question_id") or "").strip()
+        if fid and fid not in followup_ids:
+            followup_ids.append(fid)
+
+    # Mechanism 2 — question-level ``trigger_answers`` fallback.
+    trigger_answers = {
+        str(a) for a in (q.get("trigger_answers") or []) if a not in (None, "")
+    }
+    child_ids = [str(c) for c in (q.get("child_question_ids") or []) if c]
+    if child_ids and trigger_answers and any(
+        label in trigger_answers for label in selected_labels
+    ):
+        for cid in child_ids:
+            if cid and cid not in followup_ids:
+                followup_ids.append(cid)
+
+    return followup_ids
+
+
 def _render_questionnaire_answer_cards(
     questions: List[Dict[str, Any]], *, show_all: bool
 ) -> None:
@@ -5563,8 +6303,56 @@ def _render_questionnaire_answer_cards(
         st.info("No questions available.")
         return
 
-    closed_qs = [q for q in questions if not q.get("is_free_text")]
-    free_qs = [q for q in questions if q.get("is_free_text")]
+    # Drop questions that cannot score under any option pick (every
+    # option carries explicit ``score_value: None`` metadata). These
+    # questions used to render with a confusing "This question doesn't
+    # apply to you" caption because every possible answer was tagged
+    # N/A — showing them added noise without any way to actually
+    # contribute to the readiness score.
+    unscoreable_count = sum(1 for q in questions if _is_question_unscoreable(q))
+    if unscoreable_count:
+        logger.info(
+            "Hiding %d unscoreable question(s) from the questionnaire page "
+            "(every option carries score_value=None).",
+            unscoreable_count,
+        )
+    questions = [q for q in questions if not _is_question_unscoreable(q)]
+
+    if not questions:
+        st.info(
+            "No scoreable questions available. Every question in this "
+            "package is tagged as excluded from scoring — regenerate "
+            "the questionnaire (Re-run Agent 3) to produce answerable "
+            "questions."
+        )
+        return
+
+    # Build the ``{question_id: question}`` index over the FULL scoreable
+    # set — children included. Follow-up rendering resolves child IDs
+    # against this index, so children must remain lookup-able even
+    # though we drop them from the top-level render below.
+    question_index: Dict[str, Dict[str, Any]] = {
+        str(q.get("question_id") or ""): q
+        for q in questions
+        if q.get("question_id")
+    }
+
+    # Filter ``is_child`` questions out of the top-level list. Children
+    # only surface via :func:`_render_single_question_answer_card`'s
+    # recursive follow-up hook, so they don't render up front alongside
+    # their parents.
+    child_count = sum(1 for q in questions if q.get("is_child"))
+    if child_count:
+        logger.info(
+            "Deferring %d child question(s) to conditional follow-up "
+            "rendering — they will surface only when the reviewer picks "
+            "the option that triggers them.",
+            child_count,
+        )
+    top_level = [q for q in questions if not q.get("is_child")]
+
+    closed_qs = [q for q in top_level if not q.get("is_free_text")]
+    free_qs = [q for q in top_level if q.get("is_free_text")]
 
     state: AssessmentState = st.session_state["assessment_state"]
     dirty = False
@@ -5587,6 +6375,7 @@ def _render_questionnaire_answer_cards(
             show_all=show_all,
             bucket_label="quantitative",
             start_index=1,
+            question_index=question_index,
         ) or dirty
 
     if free_qs:
@@ -5612,6 +6401,7 @@ def _render_questionnaire_answer_cards(
             show_all=show_all,
             bucket_label="qualitative",
             start_index=len(closed_qs) + 1,
+            question_index=question_index,
         ) or dirty
 
     if dirty:
@@ -5627,6 +6417,7 @@ def _render_questionnaire_answer_bucket(
     show_all: bool,
     bucket_label: str,
     start_index: int = 1,
+    question_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> bool:
     """Render one ordered bucket of question cards (either quantitative or
     qualitative) and return ``True`` if at least one recorded answer
@@ -5643,6 +6434,11 @@ def _render_questionnaire_answer_bucket(
 
     The bucket_label is threaded into the "showing first N of M" hint so
     the caption stays specific to what the user just scrolled past.
+
+    ``question_index`` — passed through to
+    :func:`_render_single_question_answer_card` so per-option
+    ``triggers_followup`` metadata can resolve the child question and
+    render it recursively inside the parent card.
     """
     limit = len(bucket_questions) if show_all else 25
     visible = bucket_questions[:limit]
@@ -5651,6 +6447,7 @@ def _render_questionnaire_answer_bucket(
     for offset, q in enumerate(visible):
         if _render_single_question_answer_card(
             q, state, seq_no=start_index + offset,
+            question_index=question_index,
         ):
             dirty = True
 
@@ -5666,8 +6463,22 @@ def _render_questionnaire_answer_bucket(
     return dirty
 
 
+# Recursion cap for follow-up chains. Agent 3's prompt suggests 2-3
+# levels of depth; this cap protects the UI against an accidental
+# cycle in the question graph (child ``followup_question_id`` pointing
+# back to an ancestor) which would otherwise recurse indefinitely.
+_MAX_FOLLOWUP_DEPTH = 6
+
+
 def _render_single_question_answer_card(
-    q: Dict[str, Any], state: AssessmentState, *, seq_no: Optional[int] = None,
+    q: Dict[str, Any],
+    state: AssessmentState,
+    *,
+    seq_no: Optional[int] = None,
+    question_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    depth: int = 0,
+    parent_seq: str = "",
+    visited: Optional[Set[str]] = None,
 ) -> bool:
     """Render one interactive question card and return ``True`` if the
     user changed the recorded answer on this render (so the caller knows
@@ -5681,6 +6492,18 @@ def _render_single_question_answer_card(
     The card wrapper is emitted as raw HTML because we mix custom-styled
     header rows with real Streamlit widgets — the widgets themselves
     render inline underneath the tag row and above the score badge.
+
+    Follow-up rendering
+    -------------------
+    After the widget + score + footer + explainer, this function looks
+    at the recorded answer via :func:`_get_triggered_followup_ids` and
+    recursively renders every triggered child question **inside** this
+    card's wrapper. Children carry the ``qprev-followup`` class so
+    they render with a subtle indent and a ``Follow-up`` chip. The
+    tree number cascades from the parent — a parent labelled ``Q3``
+    reveals children as ``Q3.1``, ``Q3.2``, and a grand-child as
+    ``Q3.1.1``. ``depth`` is bounded by :data:`_MAX_FOLLOWUP_DEPTH` and
+    ``visited`` guards against cycles in the question graph.
     """
     is_free_text = bool(q.get("is_free_text"))
     area = str(q.get("area") or "—")
@@ -5697,12 +6520,21 @@ def _render_single_question_answer_card(
     else:
         type_class = ""
 
-    # Header tag row: only Q.no, Area, Function, Single/Multi-select, Impact.
-    qno_display = f"Q{int(seq_no)}" if seq_no else str(q.get("question_id") or "")
-    tags = [
-        f'<span class="qprev-tag">{html.escape(qno_display)}</span>',
-        f'<span class="qprev-tag">Area: {html.escape(area)}</span>',
-    ]
+    # Header tag row. Children reuse the parent-driven ``parent_seq``
+    # (e.g. ``Q3.1``, ``Q3.1.2``) so the reviewer can locate them by
+    # sight, while top-level questions keep the simple sequential
+    # ``Q1``, ``Q2``, … labelling.
+    if depth > 0 and parent_seq:
+        qno_display = parent_seq
+    else:
+        qno_display = (
+            f"Q{int(seq_no)}" if seq_no else str(q.get("question_id") or "")
+        )
+    tags: List[str] = []
+    if depth > 0:
+        tags.append('<span class="qprev-tag qprev-tag-followup">Follow-up</span>')
+    tags.append(f'<span class="qprev-tag">{html.escape(qno_display)}</span>')
+    tags.append(f'<span class="qprev-tag">Area: {html.escape(area)}</span>')
     if function:
         tags.append(f'<span class="qprev-tag">Function: {html.escape(function)}</span>')
     tags.append(f'<span class="qprev-tag {type_class}">{html.escape(qtype)}</span>')
@@ -5713,7 +6545,16 @@ def _render_single_question_answer_card(
     # answer the question — so criticality reflects the response, not a
     # pre-assigned tag.
 
-    card_class = "qprev-card free-text" if is_free_text else "qprev-card"
+    card_classes = ["qprev-card"]
+    if is_free_text:
+        card_classes.append("free-text")
+    if depth > 0:
+        # ``qprev-child`` (not ``qprev-followup``) — see the CSS block
+        # comment: ``qprev-followup`` is already claimed by the free-
+        # text brief-answer nudge, so children get their own class.
+        card_classes.append("qprev-child")
+        card_classes.append(f"qprev-child-depth-{min(depth, 3)}")
+    card_class = " ".join(card_classes)
     st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
     st.markdown(
         f'<div class="qprev-tag-row">{"".join(tags)}</div>',
@@ -5725,6 +6566,256 @@ def _render_single_question_answer_card(
     _render_question_score_badge(q, state)
     _render_question_footer(q)
     _render_question_explainer(q)
+
+    # Recursively render any follow-up children this parent's current
+    # answer has triggered. The ``question_index`` is required — we
+    # resolve child IDs against it rather than walking the flat list.
+    # ``visited`` guards against cycles: the same question ID rendering
+    # twice in a single chain would recurse indefinitely.
+    followup_changed = False
+    parent_qid = str(q.get("question_id") or "")
+    if question_index is not None and parent_qid and depth < _MAX_FOLLOWUP_DEPTH:
+        visited = set(visited) if visited else set()
+        if parent_qid not in visited:
+            visited.add(parent_qid)
+            followup_ids = _get_triggered_followup_ids(q, state)
+            for idx, fid in enumerate(followup_ids, start=1):
+                if fid in visited:
+                    continue
+                child_q = question_index.get(fid)
+                if not child_q:
+                    continue
+                if _is_question_unscoreable(child_q):
+                    # Same policy as the top-level filter — hide
+                    # follow-ups that can never contribute to the
+                    # readiness score.
+                    continue
+                child_seq = f"{qno_display}.{idx}"
+                if _render_single_question_answer_card(
+                    child_q,
+                    state,
+                    question_index=question_index,
+                    depth=depth + 1,
+                    parent_seq=child_seq,
+                    visited=visited,
+                ):
+                    followup_changed = True
+
+    # AI-driven dynamic follow-up. Fires for free-text AND closed answers.
+    # For closed questions the helper additionally short-circuits when the
+    # selected option already surfaced a pre-generated child (see loop
+    # above) so we never stack a dynamic follow-up on top of an existing
+    # curated one — the two mechanisms complement each other rather than
+    # duplicate. Suppressed at depth > 0 so a dynamic follow-up on the
+    # parent doesn't cascade infinitely down its own children.
+    if parent_qid and depth == 0:
+        parent_seq_for_dyn = qno_display
+        pregen_ids = _get_triggered_followup_ids(q, state) if question_index is not None else []
+        if _render_dynamic_followup(
+            q,
+            state,
+            parent_seq=parent_seq_for_dyn,
+            pregen_followup_ids=pregen_ids,
+        ):
+            followup_changed = True
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    return changed or followup_changed
+
+
+# Minimum character count required on a FREE-TEXT answer before we spend
+# an LLM roundtrip evaluating it. Below this length the answer is almost
+# certainly too short to justify a nuanced "detailed enough?" verdict and
+# we hide the dynamic follow-up card entirely (the deterministic
+# ``_render_brief_answer_followup`` nudge above the widget already covers
+# obvious short-answer cases). Closed-selection answers (single/multi-
+# select from a pick list) skip this gate — any non-empty selection is
+# a valid signal to evaluate.
+_DYN_FOLLOWUP_MIN_CHARS = 20
+
+
+def _dyn_followup_cache_key(qid: str, answer_hash: str) -> str:
+    """Session-state key for the cached AI verdict on one (qid, answer)."""
+    return f"dyn_followup:{qid}:{answer_hash}"
+
+
+def _normalise_answer_for_hash(answer: Any) -> str:
+    """Turn ``state.responses[qid]`` into a stable string for hashing.
+
+    Multi-select answers arrive as a list — sort the labels so the same
+    selection (in different UI orders) maps to the same hash. Single-
+    select and free-text answers arrive as strings and pass through
+    unchanged after trimming.
+    """
+    if answer in (None, "", []):
+        return ""
+    if isinstance(answer, list):
+        parts = sorted(str(p).strip() for p in answer if str(p).strip())
+        return " | ".join(parts)
+    return str(answer).strip()
+
+
+def _render_dynamic_followup(
+    q: Dict[str, Any],
+    state: AssessmentState,
+    *,
+    parent_seq: str,
+    pregen_followup_ids: Optional[Sequence[str]] = None,
+) -> bool:
+    """Render an AI-generated adaptive follow-up under any parent question.
+
+    Supports **both** answer types:
+
+    * Free-text — always fires when the answer is at least
+      :data:`_DYN_FOLLOWUP_MIN_CHARS` characters long.
+    * Closed (single / multi-select) — fires only when the selected
+      option(s) did NOT already trigger a pre-generated per-option
+      child (see the ``pregen_followup_ids`` gate below). This keeps
+      the two follow-up mechanisms complementary: curated children
+      when they exist, AI-generated fills the gap otherwise.
+
+    Cache & spinner behaviour, and the "narrative-only, not scored"
+    storage contract for the follow-up's own answer, are identical to
+    the earlier free-text-only version — see the module-level docstring
+    on ``_dyn_followup_cache_key``.
+
+    Returns ``True`` when the user changed the follow-up answer on this
+    render so the caller can trigger a re-score / persist.
+    """
+    parent_qid = str(q.get("question_id") or "")
+    if not parent_qid:
+        return False
+
+    is_free_text = bool(q.get("is_free_text"))
+    qtype = str(q.get("question_type") or "").lower()
+    if is_free_text or "free" in qtype:
+        answer_kind = "free_text"
+    elif "multi" in qtype:
+        answer_kind = "multi_select"
+    else:
+        answer_kind = "single_select"
+
+    current_answer = state.responses.get(parent_qid)
+    answer_text = _normalise_answer_for_hash(current_answer)
+    if not answer_text:
+        return False
+
+    # Free-text length gate — closed selections skip it because option
+    # labels are typically short (< 20 chars) but still fully valid
+    # signals.
+    if answer_kind == "free_text" and len(answer_text) < _DYN_FOLLOWUP_MIN_CHARS:
+        return False
+
+    # Hybrid gate for closed questions: if the selected option(s) already
+    # surfaced a pre-generated child, do not stack a second follow-up on
+    # top. This is the "complement, not duplicate" contract the caller
+    # documents.
+    if answer_kind != "free_text" and pregen_followup_ids:
+        return False
+
+    # Assemble parent-option list for the LLM when the parent is closed.
+    parent_options: List[str] = []
+    if answer_kind != "free_text":
+        raw_options = q.get("options") or []
+        parent_options = option_labels(raw_options)
+
+    answer_hash = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()[:16]
+    cache_key = _dyn_followup_cache_key(parent_qid, answer_hash)
+
+    if cache_key not in st.session_state:
+        client = _genai_client()
+        if client is None:
+            st.session_state[cache_key] = None
+            return False
+        with st.spinner("Reviewing your answer for detail..."):
+            try:
+                refinement = evaluate_answer_and_generate_followup(
+                    client,
+                    regulation=str(st.session_state.get("regulation") or ""),
+                    parent_question=str(q.get("question") or ""),
+                    parent_explainer=str(q.get("plain_language_explainer") or ""),
+                    parent_area=str(q.get("area") or ""),
+                    parent_function=str(q.get("function") or ""),
+                    user_answer=answer_text,
+                    client_roles=_selected_client_roles(),
+                    answer_kind=answer_kind,
+                    parent_options=parent_options or None,
+                )
+            except Exception:
+                logger.exception(
+                    "Dynamic follow-up eval crashed. parent_qid=%s "
+                    "answer_kind=%s answer_chars=%d",
+                    parent_qid, answer_kind, len(answer_text),
+                )
+                refinement = None
+        st.session_state[cache_key] = refinement
+
+    refinement: Optional[AIAnswerRefinement] = st.session_state.get(cache_key)
+    if refinement is None or not getattr(refinement, "needs_followup", False):
+        return False
+
+    followup_question = str(getattr(refinement, "followup_question", "") or "").strip()
+    if not followup_question:
+        return False
+    followup_reason = str(getattr(refinement, "followup_reason", "") or "").strip()
+    is_free_text_followup = bool(getattr(refinement, "followup_is_free_text", True))
+    followup_options = [
+        str(o).strip() for o in (getattr(refinement, "followup_options", []) or [])
+        if str(o).strip()
+    ]
+    if not is_free_text_followup and not followup_options:
+        is_free_text_followup = True
+
+    dyn_answer_key = f"dyn_followup_answer:{parent_qid}:{answer_hash}"
+    previous_answer = st.session_state.get(dyn_answer_key)
+
+    st.markdown(
+        '<div class="qprev-card qprev-child qprev-child-depth-1">'
+        '<div class="qprev-tag-row">'
+        f'<span class="qprev-tag qprev-tag-followup">AI-refined follow-up</span>'
+        f'<span class="qprev-tag">{html.escape(parent_seq)}.AI</span>'
+        f'<span class="qprev-tag type-free">Dynamic</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"**{html.escape(followup_question)}**")
+    if followup_reason:
+        st.caption(f"Why this: {followup_reason}")
+
+    widget_key = f"qprev_widget_dyn_{parent_qid}_{answer_hash}"
+    changed = False
+    if is_free_text_followup:
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = (
+                "" if previous_answer in (None, "", []) else str(previous_answer)
+            )
+        new_value = st.text_area(
+            "Follow-up answer",
+            key=widget_key,
+            label_visibility="collapsed",
+            placeholder="Add the missing detail...",
+        )
+        if new_value != (previous_answer or ""):
+            if new_value:
+                st.session_state[dyn_answer_key] = new_value
+            else:
+                st.session_state.pop(dyn_answer_key, None)
+            changed = True
+    else:
+        current_idx = 0
+        if isinstance(previous_answer, str) and previous_answer in followup_options:
+            current_idx = followup_options.index(previous_answer)
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = followup_options[current_idx]
+        new_value = st.radio(
+            "Follow-up answer",
+            options=followup_options,
+            key=widget_key,
+            label_visibility="collapsed",
+        )
+        if new_value != previous_answer:
+            st.session_state[dyn_answer_key] = new_value
+            changed = True
 
     st.markdown('</div>', unsafe_allow_html=True)
     return changed
@@ -5981,19 +7072,13 @@ def _render_question_score_badge(q: Dict[str, Any], state: AssessmentState) -> N
 def _render_question_footer(q: Dict[str, Any]) -> None:
     """Render the compact metadata footer at the bottom of an answer card.
 
-    Only three signals are surfaced here — Confidence, Mapped BRD and
-    Obligations. Team / Impact / Parent / Follow-up / Manual review /
+    Only two signals are surfaced here — Mapped BRD and Obligations.
+    Confidence / Team / Impact / Parent / Follow-up / Manual review /
     Theme / plain-English explainer / evidence-to-prepare have all been
     removed to keep the card tight; the "Why this question?" popover
     remains available for reviewers who want the full context.
     """
     footer_bits: List[str] = []
-    conf = q.get("confidence")
-    if conf is not None:
-        try:
-            footer_bits.append(f"<b>Confidence:</b> {float(conf):.0f}%")
-        except (TypeError, ValueError):
-            footer_bits.append(f"<b>Confidence:</b> {html.escape(str(conf))}")
     mapped = q.get("mapped_requirement_ids") or []
     if mapped:
         preview_ids = ", ".join(html.escape(str(m)) for m in mapped[:3])
@@ -6298,7 +7383,6 @@ def _run_agent3() -> None:
         len((questionnaire.package or {}).get("questions") or []),
         source,
     )
-    _seed_default_questionnaire_answers(questionnaire)
 
 
 # ---------------------------------------------------------------------------
@@ -6311,13 +7395,12 @@ def render_dashboard_page() -> None:
     Layout follows the T+1 Rules Engine reference and the executive
     brief:
       1. **Overall Impact & Readiness** hero row (two big score tiles).
-      2. **Area-wise Readiness Overview** (readiness cards per impacted area).
-      3. **Impact Assessment by Area** (impact-severity cards - HIGH / MEDIUM
+      2. **Readiness Overview By Area** (readiness cards per impacted area).
+      3. **Impact Assessment By Area** (impact-severity cards - HIGH / MEDIUM
          / LOW - per impacted area, mirroring the executive heatmap).
-      4. **Area × Function heatmap** for granular remediation targeting.
-      5. **Area-detailed recommendations** grouped per area, 3-4 concrete
-         action bullets each.
-      6. **Top gaps** and **Question-level scoring detail** for auditors.
+      4. **Prioritized Remediation Recommendations** grouped per area, with
+         3-4 executive-ready bullets each, filtered to Critical / At Risk.
+      5. **Top gaps** and **Question-level scoring detail** for auditors.
 
     All underlying data still comes from ``services.scoring_engine`` —
     presentation is the only change.
@@ -6381,10 +7464,11 @@ def render_dashboard_page() -> None:
         impact_pct=impact_hero_pct,
     )
 
-    # Streamlined dashboard: only the hero + severity banner + area cards
-    # + heatmap + area-detailed recommendations + three expanders below.
-    # The KPI row, AI intelligence panels and weighted-readiness /
-    # weighted-impact detail panels have been intentionally removed - the
+    # Streamlined dashboard: hero + severity banner + area cards
+    # (readiness + impact) + prioritized remediation recommendations +
+    # three expanders below. The KPI row, AI intelligence panels,
+    # weighted-readiness / weighted-impact detail panels, and the
+    # Area × Function heatmap have all been intentionally removed - the
     # weighted calculations still run behind the scenes and drive the
     # numbers in the hero + area cards, but their detail views are no
     # longer rendered here.
@@ -6395,7 +7479,7 @@ def render_dashboard_page() -> None:
     )
 
     st.markdown(
-        '<h4 class="rap-dash-hdr">Area-Wise Readiness Overview</h4>',
+        '<h4 class="rap-dash-hdr">Readiness Overview By Area</h4>',
         unsafe_allow_html=True,
     )
     st.caption(
@@ -6419,19 +7503,15 @@ def render_dashboard_page() -> None:
     _render_dashboard_impact_cards(area_summary)
 
     st.markdown(
-        '<h4 class="rap-dash-hdr">Impacted Area \u00d7 Function Heatmap</h4>',
-        unsafe_allow_html=True,
-    )
-    _render_dashboard_pair_heatmap(pair_scores)
-
-    st.markdown(
-        '<h4 class="rap-dash-hdr">Area-Detailed Recommendations</h4>',
+        '<h4 class="rap-dash-hdr">Prioritized Remediation Recommendations '
+        'For Critically Impacted Business Functions - Clear Business Outcomes'
+        '</h4>',
         unsafe_allow_html=True,
     )
     st.caption(
-        "Agent 4 groups every actionable gap by impacted area and expands "
-        "each into 3-4 executive-ready bullets covering escalation, "
-        "ownership, evidence and success criteria."
+        "Agent 4 groups every actionable gap by impacted area and readiness "
+        "and expands each into 3-4 executive-ready bullets covering "
+        "escalation, ownership, evidence and success criteria."
     )
     _autorun_recommendations_if_needed(questionnaire, scoring)
     recs = st.session_state.get("recommendations") or []
@@ -6590,9 +7670,9 @@ def _readiness_severity_from_score(readiness: Optional[float]) -> Tuple[str, str
     canonical severity labels + matching CSS class (higher readiness =
     better).
 
-    Uses the same thresholds as :func:`_severity_class` so the "Area-Wise
-    Readiness Overview" tiles, area recommendation cards and the
-    heatmap all share one four-band colour ladder:
+    Uses the same thresholds as :func:`_severity_class` so the
+    "Readiness Overview By Area" tiles and area recommendation cards
+    all share one four-band colour ladder:
 
       - readiness <  25%      -> CRITICAL   (crit  / red)
       - readiness 25 - 50%    -> AT RISK    (risk  / amber)
@@ -6649,12 +7729,16 @@ def _impact_severity_from_score(impact: Optional[float]) -> Tuple[str, str]:
 def _render_rich_recommendations(recs: List[Any]) -> None:
     """Render the consulting-grade rich recommendations as tall stacked cards.
 
-    Each card carries what / why / how / priority / expected outcome /
-    dependencies plus implementation steps, success metrics, mapped
-    requirements and obligations, and the accountable owner. The
-    short-term / long-term / quick-wins timelines are computed on the
-    dataclass but intentionally not rendered in the card - product
-    feedback preferred the shorter surface.
+    Each card carries what / why / how / expected outcome / dependencies
+    plus implementation steps, success metrics, mapped requirements and
+    obligations, and the accountable owner. The short-term / long-term /
+    quick-wins timelines are computed on the dataclass but intentionally
+    not rendered in the card - product feedback preferred the shorter
+    surface.
+
+    Only recommendations for **Critical** and **At Risk** areas are
+    surfaced; Watch / Ready areas are considered under control and their
+    recommendations (if any) are filtered out at render time.
     """
     if not recs:
         st.caption("No consulting-grade recommendations yet.")
@@ -6669,8 +7753,24 @@ def _render_rich_recommendations(recs: List[Any]) -> None:
     def _rank(pr: str) -> int:
         return {"high": 0, "medium": 1, "low": 2}.get((pr or "").strip().lower(), 3)
 
+    # Keep only recommendations whose severity is Critical or At Risk so
+    # the dashboard stays focused on the areas that actually need
+    # remediation attention.
+    _CRITICAL_SEVERITIES = {"critical", "at risk"}
+    recs_filtered = [
+        r for r in recs
+        if str(_get(r, "severity", "") or "").strip().lower() in _CRITICAL_SEVERITIES
+    ]
+
+    if not recs_filtered:
+        st.caption(
+            "No Critical or At Risk areas — no remediation recommendations "
+            "to surface for this run."
+        )
+        return
+
     recs_sorted = sorted(
-        recs, key=lambda r: _rank(str(_get(r, "priority", "Medium"))),
+        recs_filtered, key=lambda r: _rank(str(_get(r, "priority", "Medium"))),
     )
 
     st.markdown('<div class="dash-rich-rec-grid">', unsafe_allow_html=True)
@@ -6699,12 +7799,15 @@ def _render_rich_recommendations(recs: List[Any]) -> None:
         identified_gap = str(_get(r, "identified_gap", "") or "")
 
         pill_css = _severity_pill_for_severity(severity) if severity else "watch"
+        # Priority CSS class is still used for the card border colour so
+        # High-priority items pop visually, but the "Priority: <label>"
+        # pill itself is no longer rendered — product feedback: the
+        # severity pill already conveys the same signal.
         priority_css = {"high": "crit", "medium": "watch", "low": "ready"}.get(
             priority.lower(), "watch"
         )
 
         badges = (
-            f'<span class="dash-pill {priority_css}">Priority: {html.escape(priority)}</span>'
             f'<span class="dash-pill {pill_css}">{html.escape(severity)}</span>'
         )
         if by_ai:
@@ -7434,14 +8537,12 @@ def _render_dashboard_hero(
         impact = max(0.0, min(100.0, 100.0 - readiness))
     else:
         impact = max(0.0, min(100.0, float(impact_pct)))
-    read_css = _severity_class(readiness)
+    read_label, read_css = _readiness_severity_from_score(readiness)
     imp_label, imp_css = _impact_severity_from_score(impact)
 
-    # Readiness tile shows only the headline number - product feedback
-    # was that the confidence caption / gap tooltip was visually noisy
-    # and, worse, occasionally leaked HTML because the tooltip payload
-    # contained special characters. Impact tile keeps its severity pill
-    # because that is what users asked for on that side.
+    # Both hero tiles now surface their severity label as a pill so the
+    # user can read the rating (Critical / At Risk / Watch / Ready) at
+    # a glance without having to interpret the raw percentage.
     html_out = (
         '<div class="dash-hero">'
         f'<div class="dash-hero-tile impact-tile {imp_css}">'
@@ -7454,6 +8555,8 @@ def _render_dashboard_hero(
         f'<div class="dash-hero-tile readiness-tile {read_css}">'
         '<div class="dash-hero-cap">Overall Readiness Score</div>'
         f'<div class="dash-hero-value">{readiness:.1f}%</div>'
+        f'<div class="dash-hero-sub">Readiness rating: '
+        f'<span class="dash-pill {read_css}">{read_label}</span></div>'
         f'<div class="dash-hero-bar {read_css}"><span style="width:{readiness:.1f}%"></span></div>'
         '</div>'
         '</div>'
@@ -7462,7 +8565,7 @@ def _render_dashboard_hero(
 
 
 def _render_dashboard_readiness_cards(area_summary: Dict[str, Dict[str, Any]]) -> None:
-    """Render an area-wise readiness overview as coloured progress cards.
+    """Render the Readiness Overview By Area as coloured progress cards.
 
     Sorted by readiness ascending so the least-ready areas surface at the
     top - the same ranking a remediation lead would want.
@@ -7746,98 +8849,6 @@ def _render_dashboard_summary_cards(df: pd.DataFrame, label: str) -> None:
         )
     cards_html.append("</div>")
     st.markdown("".join(cards_html), unsafe_allow_html=True)
-
-
-def _render_dashboard_pair_heatmap(pair_scores: Dict[Any, float]) -> None:
-    """Render the area × function score matrix as a grouped-tile heatmap.
-
-    Each tile shows both the **Impact** and **Readiness** score plus the
-    matching band label (e.g. ``Impact: 27.0 Critical`` on line 1 and
-    ``Readiness: 73.0 At Risk`` on line 2). ``pair_scores`` may arrive
-    with tuple keys ``(area, function)`` from the live scoring result,
-    or with string keys ``"area | function"`` from a persisted /
-    JSON-encoded snapshot — both are supported.
-    """
-    if not pair_scores:
-        st.info("No area × function scores yet — answer more closed questions.")
-        return
-
-    # Per-pair impact is sourced from the weighted-impact heatmap rows
-    # when available; missing pairs fall back to the legacy `100 - readiness`
-    # derivation. This keeps the heatmap Impact numbers consistent with the
-    # rest of the dashboard (single source of truth) while still rendering
-    # every pair that has a readiness score.
-    weighted_impact: Optional[WeightedImpactResult] = st.session_state.get(
-        "weighted_impact"
-    )
-    impact_by_pair: Dict[Tuple[str, str], float] = {}
-    if weighted_impact is not None:
-        for row in weighted_impact.heatmap_rows:
-            impact_by_pair[(str(row.get("area", "")), str(row.get("function", "")))] = (
-                float(row.get("impact_score", 0.0))
-            )
-
-    grouped: Dict[str, Dict[str, Optional[float]]] = {}
-    for key, val in pair_scores.items():
-        if isinstance(key, tuple) and len(key) == 2:
-            area, function = key
-        elif isinstance(key, str) and " | " in key:
-            area, function = key.split(" | ", 1)
-        else:
-            continue
-        try:
-            score_val: Optional[float] = float(val)
-        except (TypeError, ValueError):
-            score_val = None
-        grouped.setdefault(area, {})[function] = score_val
-
-    if not grouped:
-        st.info("No area × function scores yet — answer more closed questions.")
-        return
-
-    html_out: List[str] = ['<div class="dash-heatmap">']
-    for area in sorted(grouped.keys()):
-        pairs = grouped[area]
-        numeric = [v for v in pairs.values() if v is not None]
-        avg = round(sum(numeric) / len(numeric), 1) if numeric else None
-        avg_html = f"Avg Readiness {avg:.1f}%" if avg is not None else "No answers"
-        html_out.append(
-            f'<div class="dash-heatgroup">'
-            f'<div class="dash-heatgroup-title">'
-            f'<span>{html.escape(str(area))}</span>'
-            f'<span class="dash-heatgroup-avg">{avg_html}</span>'
-            f'</div>'
-            f'<div class="dash-heat-tiles">'
-        )
-        for function in sorted(pairs.keys()):
-            readiness = pairs[function]
-            if readiness is None:
-                html_out.append(
-                    f'<div class="dash-heat-tile none">'
-                    f'<div class="dash-heat-cap">{html.escape(str(function))}</div>'
-                    f'<div class="dash-heat-score">Impact: —</div>'
-                    f'<div class="dash-heat-score">Readiness: —</div>'
-                    f'</div>'
-                )
-                continue
-            weighted_pair_impact = impact_by_pair.get((str(area), str(function)))
-            if weighted_pair_impact is not None:
-                impact = max(0.0, min(100.0, float(weighted_pair_impact)))
-            else:
-                impact = max(0.0, min(100.0, 100.0 - float(readiness)))
-            impact_label, _ = _impact_severity_from_score(impact)
-            readiness_label, _ = _readiness_severity_from_score(readiness)
-            css = _severity_class(readiness)
-            html_out.append(
-                f'<div class="dash-heat-tile {css}">'
-                f'<div class="dash-heat-cap">{html.escape(str(function))}</div>'
-                f'<div class="dash-heat-score">Impact: {impact:.1f} {html.escape(impact_label)}</div>'
-                f'<div class="dash-heat-score">Readiness: {readiness:.1f} {html.escape(readiness_label)}</div>'
-                f'</div>'
-            )
-        html_out.append("</div></div>")
-    html_out.append("</div>")
-    st.markdown("".join(html_out), unsafe_allow_html=True)
 
 
 def _render_dashboard_top_gap_cards(top_gaps: Any) -> None:

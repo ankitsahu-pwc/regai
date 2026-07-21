@@ -60,6 +60,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from utils.docx_parser import (
     DocxSource,
     clean_text,
+    extract_full_text,
     iter_sectioned_tables,
     normalise_header,
 )
@@ -414,8 +415,39 @@ def _section_prefix(section_label: str, source_id: str) -> str:
 # Requirement extraction from DOCX (now uses utils.docx_parser)
 # ---------------------------------------------------------------------------
 
+# Headers that must appear literally on every requirement table. The
+# "alignment" column is handled separately below because its label varies
+# with the regulation the BRD was written for — DORA runs write it as
+# ``"DORA Alignment"`` (``doraalignment`` when normalised), Housing Finance
+# runs write ``"HOUSING FINANCE Alignment"`` (``housingfinancealignment``),
+# and so on. Requiring the literal ``"doraalignment"`` token here would
+# make the parser reject every non-DORA BRD the app itself produces, so
+# we accept ANY normalised header ending in ``"alignment"``.
 _REQUIRED_HEADERS = ("id", "category", "requirement", "detailedrequirement",
-                     "doraalignment", "priority", "acceptancecriteria")
+                     "priority", "acceptancecriteria")
+
+_ALIGNMENT_HEADER_SUFFIX = "alignment"
+
+
+def _find_alignment_header(headers: Sequence[str]) -> Optional[str]:
+    """Return the normalised header used for the regulation-alignment column.
+
+    Preference order:
+      1. Exact ``doraalignment`` match (legacy / DORA BRDs).
+      2. Any header ending in ``"alignment"`` (Housing Finance, GDPR, etc.).
+      3. Any header containing ``"alignment"`` (defensive — e.g. if a
+         downstream tool adds a prefix/suffix that trails the token).
+    Returns ``None`` when no alignment-flavoured column is present.
+    """
+    if "doraalignment" in headers:
+        return "doraalignment"
+    for h in headers:
+        if h.endswith(_ALIGNMENT_HEADER_SUFFIX):
+            return h
+    for h in headers:
+        if _ALIGNMENT_HEADER_SUFFIX in h:
+            return h
+    return None
 
 
 def read_docx_requirements(source: DocxSource) -> List[Requirement]:
@@ -423,7 +455,11 @@ def read_docx_requirements(source: DocxSource) -> List[Requirement]:
 
     Equivalent to the original v11 ``read_docx_requirements`` but the
     document-iteration boilerplate has been replaced by a call to
-    :func:`utils.docx_parser.iter_sectioned_tables`.
+    :func:`utils.docx_parser.iter_sectioned_tables`. The regulation-
+    alignment column is discovered dynamically via
+    :func:`_find_alignment_header` so BRDs written for any regulation
+    (DORA, Housing Finance, MiFID II, GDPR, ...) round-trip through the
+    parser — previously only DORA-labelled BRDs could be re-parsed.
     """
     requirements: List[Requirement] = []
     counters: Dict[str, int] = defaultdict(int)
@@ -432,6 +468,9 @@ def read_docx_requirements(source: DocxSource) -> List[Requirement]:
             continue
         headers = [normalise_header(h) for h in rows[0]]
         if not all(h in headers for h in _REQUIRED_HEADERS):
+            continue
+        alignment_header = _find_alignment_header(headers)
+        if alignment_header is None:
             continue
         idx = {h: i for i, h in enumerate(headers)}
         conf_idx = idx.get("aiconfidence")
@@ -447,7 +486,7 @@ def read_docx_requirements(source: DocxSource) -> List[Requirement]:
             counters[prefix] += 1
             combined = " ".join([
                 section_label, source_id, title, detail,
-                row[idx["doraalignment"]], row[idx["acceptancecriteria"]],
+                row[idx[alignment_header]], row[idx["acceptancecriteria"]],
             ])
             requirements.append(Requirement(
                 source_section=section_label,
@@ -456,13 +495,163 @@ def read_docx_requirements(source: DocxSource) -> List[Requirement]:
                 category=row[idx["category"]],
                 requirement=title,
                 detail=detail,
-                alignment=row[idx["doraalignment"]],
+                alignment=row[idx[alignment_header]],
                 priority=row[idx["priority"]],
                 acceptance=row[idx["acceptancecriteria"]],
                 confidence=clamp_confidence(row[conf_idx] if conf_idx is not None else 95),
                 themes=infer_themes(combined),
             ))
     return requirements
+
+
+def _classified_requirement_to_requirement(
+    cr: Any,
+    ordinal: int,
+    regulation: str,
+) -> Requirement:
+    """Convert a :class:`ClassifiedRequirement` (Pydantic) to the internal
+    :class:`Requirement` dataclass so the AI fallback plugs into the same
+    downstream pipeline that consumes strict-parser output.
+
+    Notes
+    -----
+    * ``source_section`` is synthesised as ``"AI Classified"`` because the
+      LLM does not know the BRD's numbered heading structure. The rest of
+      the pipeline only uses this for display grouping so a stable label
+      is fine.
+    * ``normalized_id`` follows the same ``PREFIX-###`` convention used
+      by the strict parser via :func:`_section_prefix`, keyed off the
+      LLM's ``source_id`` when it looks like one of the standard
+      prefixes; otherwise we default to ``FR`` (functional requirement)
+      because that is the most common bucket for AI-recovered items.
+    * ``confidence`` is set to :data:`CONFIDENCE_FLOOR` for AI-recovered
+      items — we deliberately do NOT give them the 95 that strict
+      parsing awards, so downstream consumers (and any UI that surfaces
+      the confidence score) can see at a glance that these items came
+      from a best-effort LLM classification rather than a structured
+      table row.
+    """
+    src_id = str(getattr(cr, "source_id", "") or "").strip() or f"AI-{ordinal:03d}"
+    title = str(getattr(cr, "requirement", "") or "").strip()
+    detail = str(getattr(cr, "detail", "") or "").strip()
+    category = str(getattr(cr, "category", "") or "").strip()
+    alignment = str(getattr(cr, "alignment", "") or "").strip()
+    priority = str(getattr(cr, "priority", "") or "Should").strip() or "Should"
+    acceptance = str(getattr(cr, "acceptance", "") or "").strip()
+
+    section_label = "AI Classified"
+    prefix = _section_prefix(section_label, src_id)
+    if prefix == "BR-PRO" and not src_id.lower().startswith("br-pro"):
+        # _section_prefix defaults very aggressively to BR-PRO on unknown
+        # section labels; when the LLM's source_id doesn't confirm that
+        # bucket, fall back to FR which is the safest general prefix.
+        prefix = "FR"
+
+    combined = " ".join([section_label, src_id, title, detail, alignment, acceptance])
+    return Requirement(
+        source_section=section_label,
+        source_id=src_id,
+        normalized_id=f"{prefix}-{ordinal:03d}",
+        category=category,
+        requirement=title,
+        detail=detail,
+        alignment=alignment or (regulation or ""),
+        priority=priority,
+        acceptance=acceptance,
+        confidence=CONFIDENCE_FLOOR,
+        themes=infer_themes(combined),
+    )
+
+
+def _classified_obligation_to_obligation(co: Any, ordinal: int) -> Any:
+    """Convert a :class:`ClassifiedObligation` (Pydantic) to the shared
+    :class:`models.workflow_models.Obligation` dataclass.
+
+    The downstream questionnaire generator reads obligations via
+    ``getattr`` so a Pydantic model would technically work as-is, but
+    using the canonical dataclass keeps behaviour identical between
+    Agent 1-produced obligations and AI-recovered ones (serialisation,
+    dataclass introspection, dict conversion in exports, etc.).
+
+    The import of ``Obligation`` is deferred to function body to keep
+    the module-level import graph flat — we do not want
+    :mod:`services.questionnaire_generator` to hard-depend on
+    :mod:`models.workflow_models` when this fallback path is not used.
+    """
+    from models.workflow_models import Obligation  # local import — see docstring
+
+    obl_id = str(getattr(co, "obligation_id", "") or "").strip() or f"AI-OBL-{ordinal:03d}"
+    return Obligation(
+        obligation_id=obl_id,
+        title=str(getattr(co, "title", "") or "").strip(),
+        theme=str(getattr(co, "theme", "") or "").strip(),
+        compliance_requirement=str(getattr(co, "compliance_requirement", "") or "").strip(),
+        impacted_area=str(getattr(co, "impacted_area", "") or "").strip(),
+        impacted_function=str(getattr(co, "impacted_function", "") or "").strip(),
+        control_expectations=list(getattr(co, "control_expectations", []) or []),
+        evidence_needs=list(getattr(co, "evidence_needs", []) or []),
+        priority=str(getattr(co, "priority", "") or "Should").strip() or "Should",
+    )
+
+
+def read_docx_via_ai_classifier(
+    source: DocxSource,
+    regulation: str,
+    client: Any,
+) -> Tuple[List[Requirement], List[Any]]:
+    """AI fallback for :func:`read_docx_requirements`.
+
+    When the strict table parser finds zero requirement rows (e.g. the
+    uploaded BRD is not in the app-native table format, or was authored
+    by hand in Word without the expected column layout), this helper
+    asks the LLM to classify the document's free-form text into a
+    structured list of requirements + obligations, then converts those
+    Pydantic records into the module-local :class:`Requirement`
+    dataclass and shared :class:`~models.workflow_models.Obligation`
+    dataclass so the rest of the pipeline is oblivious to the fallback.
+
+    Returns ``([], [])`` when the client is unavailable or the LLM call
+    fails — the caller then surfaces the original strict-parser error
+    to the user. We never fabricate requirements without an LLM in the
+    loop.
+    """
+    if client is None:
+        logger.info(
+            "AI classifier fallback skipped: no GenAIClient available "
+            "(offline mode). regulation=%s", regulation,
+        )
+        return [], []
+
+    try:
+        docx_text = extract_full_text(source, include_tables=True)
+    except Exception:
+        logger.exception(
+            "AI classifier fallback: failed to extract text from DOCX. "
+            "regulation=%s", regulation,
+        )
+        return [], []
+
+    from services.brd_classifier import classify_brd_document  # local import
+    result = classify_brd_document(client, docx_text=docx_text, regulation=regulation)
+    if result is None:
+        return [], []
+
+    requirements = [
+        _classified_requirement_to_requirement(cr, i + 1, regulation)
+        for i, cr in enumerate(result.requirements or [])
+        if str(getattr(cr, "requirement", "") or "").strip()
+    ]
+    obligations = [
+        _classified_obligation_to_obligation(co, i + 1)
+        for i, co in enumerate(result.obligations or [])
+        if str(getattr(co, "title", "") or "").strip()
+    ]
+    logger.info(
+        "AI classifier fallback produced %d requirements + %d obligations. "
+        "regulation=%s",
+        len(requirements), len(obligations), regulation,
+    )
+    return requirements, obligations
 
 
 def requirements_from_report(
@@ -1399,6 +1588,42 @@ def evaluate_responses(questions: Sequence[Question], responses: Mapping[str, An
     }
 
 
+def _obligation_to_dict(obl: Any) -> Dict[str, Any]:
+    """Serialise an obligation record for the questionnaire package.
+
+    Accepts three shapes we see in practice:
+
+    * ``models.workflow_models.Obligation`` dataclass — from Agent 1 or
+      the AI classifier's post-conversion helper.
+    * Pydantic v1 model — some upstream callers (e.g. tests) pass the
+      raw ``ClassifiedObligation`` from :mod:`services.brd_classifier`.
+    * Plain dict — already serialised (from a loaded JSON package).
+
+    Falls back to a minimal ``{"obligation_id": "", "title": str(obl)}``
+    dict when the object has none of the recognised shapes, so a stray
+    record never breaks package serialisation.
+    """
+    if obl is None:
+        return {}
+    if isinstance(obl, dict):
+        return dict(obl)
+    try:
+        return asdict(obl)
+    except TypeError:
+        pass
+    for attr in ("model_dump", "dict"):
+        fn = getattr(obl, attr, None)
+        if callable(fn):
+            try:
+                return dict(fn())
+            except Exception:
+                pass
+    return {
+        "obligation_id": str(getattr(obl, "obligation_id", "") or ""),
+        "title": str(getattr(obl, "title", "") or str(obl)),
+    }
+
+
 def package_dict(
     regulation: str,
     requirements: Sequence[Requirement],
@@ -1406,6 +1631,8 @@ def package_dict(
     questions: Sequence[Question],
     overall_confidence: int,
     metrics: Dict[str, float],
+    *,
+    obligations: Sequence[Any] = (),
 ) -> Dict[str, Any]:
     mode = (metrics or {}).get("package_confidence_mode", PACKAGE_CONFIDENCE_MODE)
     note = (
@@ -1442,6 +1669,14 @@ def package_dict(
             "regulatory_taxonomy": REGULATORY_TAXONOMY.get(regulation.upper(), {}),
         },
         "requirements": [asdict(r) for r in requirements],
+        # Every obligation the questionnaire was built against — either
+        # Agent 1's :class:`~models.workflow_models.Obligation` dataclasses
+        # in the "Generate BRD/FRD" flow, or the AI-classifier's
+        # equivalent records in the "Use existing BRD/FRD" upload flow.
+        # Persisted here (instead of only inside ``metadata.metrics``)
+        # so downstream code and UI tiles can count / display them
+        # without needing access to the runtime ``analysis`` object.
+        "obligations": [_obligation_to_dict(o) for o in (obligations or []) if o is not None],
         "impact_pairs": [asdict(p) for p in pairs],
         "questions": [asdict(q) for q in questions],
         "answer_scores": ANSWER_SCORES,
@@ -1501,7 +1736,10 @@ def _build_package(
         "Questionnaire package assembled. questions=%d overall_confidence=%d",
         len(questions), overall,
     )
-    return package_dict(regulation, requirements, pairs, questions, overall, metrics)
+    return package_dict(
+        regulation, requirements, pairs, questions, overall, metrics,
+        obligations=obligations,
+    )
 
 
 def build_questionnaire_package(
@@ -1523,17 +1761,73 @@ def build_questionnaire_package(
     questionnaire agent so the generated questions are scoped to the
     selected client type and grounded in the live regulatory obligations
     and Agent 1 impact + readiness assessments.
+
+    Parser strategy — two tiers
+    ---------------------------
+    1. **Strict table parser** (:func:`read_docx_requirements`). Fast,
+       deterministic, expects the app-native column layout described in
+       the error message below. When this returns at least one row we
+       use it and skip the LLM entirely.
+    2. **AI classifier fallback** (:func:`read_docx_via_ai_classifier`).
+       When the strict parser returns zero rows AND a live
+       :class:`~services.genai_service.GenAIClient` is available, we
+       forward the DOCX's free-form text to the LLM which classifies it
+       into requirements + obligations. Any obligations recovered this
+       way are *merged* with the caller-supplied ``obligations`` before
+       Agent 3 fires, so an uploaded free-form BRD ends up feeding the
+       questionnaire with both structured requirements AND the
+       underlying regulatory duties the BRD is aligning to.
+
+    Only when *both* tiers produce zero requirements do we raise the
+    schema-hint ``ValueError``.
     """
     requirements = read_docx_requirements(source)
+    merged_obligations: List[Any] = list(obligations or [])
+    if not requirements:
+        ai_reqs, ai_obls = read_docx_via_ai_classifier(source, regulation, client)
+        if ai_reqs:
+            requirements = ai_reqs
+            if ai_obls:
+                # Track obligation_ids we already have so the AI-recovered
+                # bucket does not duplicate anything Agent 1 already
+                # produced. When the same ID appears in both lists the
+                # caller-supplied entry wins — it carries the richer
+                # role-applicability data that Agent 1 attaches.
+                existing_ids = {
+                    str(getattr(o, "obligation_id", "") or "").strip()
+                    for o in merged_obligations
+                    if str(getattr(o, "obligation_id", "") or "").strip()
+                }
+                for extra in ai_obls:
+                    extra_id = str(getattr(extra, "obligation_id", "") or "").strip()
+                    if extra_id and extra_id in existing_ids:
+                        continue
+                    merged_obligations.append(extra)
+                    if extra_id:
+                        existing_ids.add(extra_id)
+            logger.info(
+                "Questionnaire pipeline is using AI-classified BRD content. "
+                "requirements=%d obligations=%d (of which caller_supplied=%d, "
+                "ai_recovered=%d)",
+                len(requirements), len(merged_obligations),
+                len(obligations or []), len(ai_obls),
+            )
     if not requirements:
         raise ValueError(
-            "No BRD/FRD requirement tables were found. Ensure the DOCX contains tables with "
-            "the columns: ID, Category, Requirement, Detailed Requirement, DORA Alignment, "
-            "Priority, Acceptance Criteria (AI Confidence optional)."
+            "No BRD/FRD requirements could be extracted from the uploaded DOCX. "
+            "For the fastest, most reliable path, ensure the file contains "
+            "tables with the columns: ID, Category, Requirement, Detailed "
+            "Requirement, <regulation> Alignment, Priority, Acceptance "
+            "Criteria (AI Confidence optional). The <regulation> Alignment "
+            "column can carry any label ending in 'Alignment' (e.g. 'DORA "
+            "Alignment', 'HOUSING FINANCE Alignment', 'MiFID II Alignment'). "
+            "Free-form BRDs are also supported when a GenAI client is "
+            "configured — check that the OpenAI/Anthropic API key is set "
+            "and try again."
         )
     return _build_package(
         requirements, regulation,
-        obligations=obligations,
+        obligations=merged_obligations,
         rtm_entries=rtm_entries,
         impact=impact,
         readiness=readiness,
@@ -1764,6 +2058,7 @@ __all__ = [
     "package_dict",
     "question_kind",
     "read_docx_requirements",
+    "read_docx_via_ai_classifier",
     "regulatory_basis_for",
     "requirements_from_report",
     "score_keywords",

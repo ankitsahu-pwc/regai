@@ -2052,9 +2052,32 @@ def build_brd_frd_report(
             status=status,
         )
 
-    context = intelligence_package.context_text or offline_baseline_for(regulation)
+    # Compose the prompt context from the two possible sources:
+    #   (1) Stage 1 live regulator publications (``intelligence_package.context_text``)
+    #   (2) The user's uploaded regulation document (``extra_context``)
+    #
+    # Priority rules:
+    #   * If the uploaded document is present, always include it verbatim.
+    #   * If live content is present, include it too (uploaded document
+    #     appended after so the LLM reads the user's own text last).
+    #   * If BOTH are missing, fall back to the neutral offline
+    #     disclaimer so the LLM does not silently improvise from
+    #     pretrained knowledge.
+    #
+    # The previous logic prepended the offline "no live content"
+    # disclaimer even when the caller had already provided the uploaded
+    # regulation document, which was misleading (it made the prompt
+    # claim we had no source while the user's own text sat right below).
+    context_sections: List[str] = []
+    if intelligence_package.context_text:
+        context_sections.append(intelligence_package.context_text)
     if extra_context:
-        context = f"{context}\n\n--- Uploaded regulation document context ---\n{extra_context}"
+        context_sections.append(
+            f"--- Uploaded regulation document context ---\n{extra_context}"
+        )
+    if not context_sections:
+        context_sections.append(offline_baseline_for(regulation))
+    context = "\n\n".join(context_sections)
 
     # BRD/FRD content is intentionally CLIENT-AGNOSTIC.
     #
@@ -2085,14 +2108,34 @@ def build_brd_frd_report(
     )
     used_genai = report is not None
     if report is None:
-        logger.warning(
-            "BRD generator: GenAI failed, using offline fallback. reason=%s",
-            genai_failure_reason,
+        # HARD-FAIL contract (2026-07): the deterministic offline BRD
+        # scaffold is authored around the DORA operating model (ICT
+        # risk, Register of Information, RTS/ITS, TLPT, ...). Even after
+        # relabeling ``DORA -> {regulation}`` it would misrepresent
+        # obligations for any non-DORA regulation, and it would give
+        # DORA runs a canned scaffold instead of an authoritative
+        # generation. The offline path is therefore removed from the
+        # runtime pipeline for every regulation. When GenAI is
+        # unreachable we surface a clear, actionable error and let the
+        # caller decide how to proceed (retry / upload a document /
+        # wait for GenAI).
+        logger.error(
+            "BRD generator: GenAI unavailable, aborting to avoid DORA-shaped "
+            "fallback content. regulation=%s reason=%s",
+            regulation, genai_failure_reason,
         )
-        status("Using deterministic offline fallback BRD content.")
-        report = generate_offline_fallback_brd(regulation=regulation)
-    else:
-        logger.info("BRD generator: GenAI path succeeded, %d guardrail bundles.", len(guardrail_reports))
+        status(
+            f"GenAI Shared Service unavailable for `{regulation}`. "
+            "BRD generation cannot proceed."
+        )
+        raise RuntimeError(
+            "BRD generation cannot proceed for regulation "
+            f"`{regulation}`: the PwC GenAI Shared Service is currently "
+            f"unavailable ({genai_failure_reason or 'no response'}). "
+            "Retry once the service is reachable, or upload an existing "
+            "BRD / FRD DOCX on Page 1 to skip the LLM-generated path."
+        )
+    logger.info("BRD generator: GenAI path succeeded, %d guardrail bundles.", len(guardrail_reports))
 
     report = ensure_minimum_detail(report, regulation=regulation)
     report = apply_confidence_floor(report)

@@ -172,40 +172,35 @@ class RegulatoryIntelligencePackage:
 # ---------------------------------------------------------------------------
 # Offline fallback context (used by the BRD generator when Stage 1 is empty)
 # ---------------------------------------------------------------------------
-
-_OFFLINE_DORA_BASELINE = """
-DORA Regulation Baseline:
-- Regulation: Digital Operational Resilience Act, Regulation (EU) 2022/2554.
-- Applicability: EU financial entities and ICT third-party service providers.
-- Core Pillars: ICT risk management; ICT incident reporting; resilience testing;
-  ICT third-party risk; information sharing.
-- Reporting Orientation: detection, classification, escalation, notification,
-  interim update, closure, root cause and remediation evidence.
-- Third-Party Orientation: register of ICT service providers; criticality;
-  contractual clauses; subcontracting; exit plans; concentration risk.
-- Control Orientation: every DORA obligation must be linked to policies,
-  procedures, controls, evidence, testing, owners and remediation status.
-""".strip()
+#
+# The pipeline used to carry a hard-coded DORA baseline that was substituted
+# whenever Stage 1 returned nothing for the ``DORA`` label. That leaked DORA
+# content into runs targeting different regulations and made DORA searches
+# silently succeed against a canned scaffold instead of the live regulator
+# corpus. The new contract is regulation-agnostic: every regulation - DORA
+# included - either flows through live official content, an uploaded
+# regulation document, or the neutral "no authoritative source available"
+# disclaimer below. There is no per-regulation baseline any more.
 
 
 def offline_baseline_for(regulation: str) -> str:
-    """Return a generic offline regulatory baseline when Stage 1 found nothing.
+    """Return a regulation-neutral offline baseline when Stage 1 is empty.
 
-    DORA has a baked-in baseline (used historically by ``brd_frd_generator``);
-    for any other regulation we synthesise a neutral context block so the BRD
-    generator can still produce a usable artefact without making it look like
-    an authoritative source.
+    The baseline is intentionally short and honest about the fact that no
+    authoritative source could be retrieved for the caller's regulation
+    code. It carries no regulation-specific obligations, so it can never
+    misrepresent DORA (or any other regulation) content when downstream
+    agents render it into a BRD / questionnaire.
     """
-    label = (regulation or "").strip()
-    if label.upper() == "DORA":
-        return _OFFLINE_DORA_BASELINE
+    label = (regulation or "").strip() or "Selected regulation"
     return (
-        f"{label or 'Selected regulation'} - Offline Baseline\n"
-        "- Stage 1 returned no live content from approved regulator domains.\n"
+        f"{label} - Offline Baseline\n"
+        "- Stage 1 returned no live content from approved regulator domains "
+        f"for `{label}`.\n"
         "- Treat downstream BRD/FRD content as derived from the LLM's pretrained\n"
         "  knowledge rather than from an authoritative regulatory publication.\n"
-        "- Re-run with regulatory search enabled, or upload the regulation PDF\n"
-        "  on Page 1 to provide authoritative context."
+        f"- Re-run with regulatory search enabled and `{label}` as the target,\n"
+        "  or upload the regulation PDF on Page 1 to provide authoritative context."
     )
 
 

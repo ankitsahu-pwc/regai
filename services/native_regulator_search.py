@@ -159,30 +159,42 @@ _REGULATION_SYNONYMS: Dict[str, List[str]] = {
 }
 
 
-def _relevance_terms(query: str) -> List[str]:
-    """Expand the query into a list of lowercase search-friendly terms.
+def _relevance_terms(query: str) -> tuple[List[str], List[str]]:
+    """Expand the query into two lowercase term buckets.
 
-    Combines the raw query, its kebab-case form, and any synonyms from
-    :data:`_REGULATION_SYNONYMS`. We later require *at least one* of these
-    terms to appear in the result URL or title.
+    Returns a tuple ``(phrase_terms, word_terms)``:
+
+    * ``phrase_terms`` — the full raw query, its kebab-case form, and any
+      synonym phrases from :data:`_REGULATION_SYNONYMS`. A single match on
+      one of these is a *strong* relevance signal (the whole phrase or a
+      known acronym expansion appears in the URL/title) and is enough on
+      its own to accept a result.
+    * ``word_terms`` — individual per-word tokens (>= 3 chars) from the raw
+      query. These are weak relevance signals on their own — a query like
+      ``"Housing Finance"`` splits into ``["housing", "finance"]`` and a
+      DORA page on ESMA that happens to contain the word ``"finance"``
+      must not pass the relevance gate on that alone. Callers therefore
+      require **every** ``word_term`` to appear before accepting on this
+      bucket (see :func:`_matches_relevance`).
     """
 
-    terms: List[str] = []
+    phrase_terms: List[str] = []
+    word_terms: List[str] = []
     q = (query or "").strip().lower()
     if not q:
-        return terms
+        return phrase_terms, word_terms
 
-    terms.append(q)
+    phrase_terms.append(q)
     kebab = re.sub(r"\s+", "-", q)
     if kebab != q:
-        terms.append(kebab)
+        phrase_terms.append(kebab)
 
-    # Per-word terms with >= 3 chars (lets "MiFID II" match results titled
-    # with just "MiFID").
+    # Per-word tokens: only meaningful for multi-word queries (for a
+    # single-word query the token equals the phrase we already added).
     for word in re.split(r"\s+", q):
         word = word.strip()
-        if len(word) >= 3 and word not in terms:
-            terms.append(word)
+        if len(word) >= 3 and word not in word_terms:
+            word_terms.append(word)
 
     # Synonyms from the glossary -- check both full-query and per-word keys.
     keys_to_check = {q}
@@ -190,10 +202,35 @@ def _relevance_terms(query: str) -> List[str]:
     for key in keys_to_check:
         for syn in _REGULATION_SYNONYMS.get(key.strip().lower(), ()):
             syn_l = syn.lower()
-            if syn_l not in terms:
-                terms.append(syn_l)
+            if syn_l not in phrase_terms:
+                phrase_terms.append(syn_l)
 
-    return terms
+    return phrase_terms, word_terms
+
+
+def _matches_relevance(
+    blob: str, phrase_terms: List[str], word_terms: List[str]
+) -> bool:
+    """Return True when ``blob`` (lowercase URL + title) is relevant.
+
+    Accept semantics:
+
+    * Any single ``phrase_term`` match (raw query / kebab / synonym) is a
+      strong signal on its own.
+    * Otherwise, **every** ``word_term`` must appear. This closes the
+      false-positive door where a generic per-word token like ``finance``
+      alone (from a query like ``"Housing Finance"``) would previously
+      admit unrelated pages such as ESMA's Digital Operational Resilience
+      Act (DORA) content.
+    """
+
+    if not phrase_terms and not word_terms:
+        return True
+    if any(t and t in blob for t in phrase_terms):
+        return True
+    if word_terms and all(t in blob for t in word_terms):
+        return True
+    return False
 
 
 def _parse_drupal_style_results(
@@ -218,13 +255,18 @@ def _parse_drupal_style_results(
       * Title text must be non-trivial (>= 8 chars after stripping HTML)
         and must not be a known chrome label or a language-switcher entry.
 
-    Relevance gate: at least one of the query terms expanded by
-    :func:`_relevance_terms` (raw query, kebab form, per-word, and known
-    abbreviation synonyms like ``"dora" -> "digital operational resilience"``)
-    must appear in the result URL or title.
+    Relevance gate (see :func:`_matches_relevance`): either
+
+      * one phrase-level term (raw query, kebab form, or a synonym phrase
+        like ``"dora" -> "digital operational resilience"``) appears in
+        the URL/title, **or**
+      * every per-word token from the query appears in the URL/title
+        (AND semantics on multi-word queries so a stray ``"finance"`` in
+        a DORA URL does not admit the page for a ``"Housing Finance"``
+        search).
     """
 
-    relevance_terms = _relevance_terms(query)
+    phrase_terms, word_terms = _relevance_terms(query)
     seen: set[str] = set()
     out: List[NativeSearchHit] = []
 
@@ -281,11 +323,13 @@ def _parse_drupal_style_results(
         if not (has_drupal_marker or deep_enough):
             continue
 
-        # Relevance gate: URL or title must mention one of the expanded
-        # query terms (handles abbreviations -> expanded names).
-        if relevance_terms:
+        # Relevance gate: URL or title must satisfy the phrase-OR-all-words
+        # rule from ``_matches_relevance`` (handles abbreviations -> expanded
+        # names while forbidding a single generic per-word match from
+        # admitting unrelated pages).
+        if phrase_terms or word_terms:
             blob = (title + " " + href).lower()
-            if not any(term in blob for term in relevance_terms):
+            if not _matches_relevance(blob, phrase_terms, word_terms):
                 continue
 
         if href in seen:
