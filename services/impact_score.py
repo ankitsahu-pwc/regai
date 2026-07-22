@@ -249,15 +249,28 @@ def _score_business_capability(
     obligations: Sequence[Mapping[str, Any]],
     impact_pairs: Sequence[Mapping[str, Any]],
 ) -> Tuple[float, str, List[str]]:
-    areas: Counter[str] = Counter()
+    # Count *canonical* area buckets so ``"Risk & Controls framework"``
+    # and ``"Risk & Controls framework / Cyber Security"`` land in the
+    # same top-level capability instead of double-counting. Bucket key
+    # is case-insensitive; display label is the first-seen casing so
+    # the UI reads naturally.
+    counts: Counter[str] = Counter()
+    display: Dict[str, str] = {}
     for o in obligations:
-        area = str(o.get("impacted_area") or "").strip()
-        if area:
-            areas[area] += 1
+        raw = o.get("impacted_area")
+        key = _area_bucket_key(raw)
+        if key:
+            counts[key] += 1
+            display.setdefault(key, canonicalise_area(raw))
     for p in impact_pairs:
-        area = str(p.get("area") or "").strip()
-        if area:
-            areas[area] += 1
+        raw = p.get("area")
+        key = _area_bucket_key(raw)
+        if key:
+            counts[key] += 1
+            display.setdefault(key, canonicalise_area(raw))
+    areas: Counter[str] = Counter(
+        {display.get(k, k): v for k, v in counts.items()}
+    )
 
     distinct = len(areas)
     # Spec bands.
@@ -494,6 +507,140 @@ def _norm(text: Any) -> str:
     return str(text or "").strip().lower()
 
 
+# ---------------------------------------------------------------------------
+# Impacted-area canonicalisation
+# ---------------------------------------------------------------------------
+#
+# The BRD classifier (LLM) emits ``impacted_area`` on each obligation as a
+# free-form string. It is often inconsistent — the same underlying business
+# capability sometimes comes back as::
+#
+#     "Risk & Controls framework"
+#     "Risk & Controls framework / Cyber Security"
+#     "Risk & Controls Framework / Third-Party"
+#     "Risk and Controls framework"      # ampersand vs "and"
+#
+# In the downstream dashboard those distinct strings used to become
+# **independent** peer cards, which created the confusing scenario of the
+# same-looking parent showing "Critical / 100% impact" while the compound
+# child showed "Ready / 0% impact" (real user bug report, 2026-07).
+#
+# ``canonicalise_area`` collapses every compound label onto its top-level
+# parent segment so the impact model, readiness rollup and dashboard cards
+# all share one canonical bucket per business capability. The sub-
+# classification is preserved separately by callers that want to expose
+# a drill-down (see :func:`sub_classifications_for`).
+#
+# Rules:
+#     * Anything after the first ``/`` (or the fancy Unicode variants
+#       ``|`` / ``›`` / ``›`` / ``>>`` / ``:``) is a sub-classification
+#       and is dropped from the canonical bucket.
+#     * The remaining head is normalised: extra whitespace collapsed,
+#       leading/trailing separators trimmed, ``and`` / ``&`` unified so
+#       ``"risk and controls framework"`` and ``"risk & controls
+#       framework"`` land in the same bucket.
+#     * Case is preserved for the *first* seen spelling of a bucket so
+#       the dashboard label reads naturally; comparison is
+#       case-insensitive under the hood.
+
+_AREA_SPLIT_RE = re.compile(r"\s*(?:/|\||>|>>|›|:)\s*", flags=re.UNICODE)
+_AREA_WS_RE = re.compile(r"\s+", flags=re.UNICODE)
+
+
+def area_bucket_key(name: Any) -> str:
+    """Return the case-insensitive bucket key for ``name``.
+
+    Lowercase + whitespace-collapsed + ``and``/``&`` unified so
+    ``"Risk & Controls Framework"``, ``"risk and controls framework"``
+    and ``"Risk & Controls framework / Cyber Security"`` all collapse
+    to the same bucket. Used only for equality / dict keying — the
+    display form is preserved separately by :func:`canonicalise_area`.
+
+    Callers outside :mod:`services.impact_score` that need to aggregate
+    LLM-emitted area labels (e.g. :mod:`services.scoring_engine`) should
+    use this helper for the counter key and record the first-seen
+    :func:`canonicalise_area` output as the human-readable display.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    head = _AREA_SPLIT_RE.split(raw, maxsplit=1)[0]
+    head = _AREA_WS_RE.sub(" ", head).strip().lower()
+    # Unify " and " ↔ " & " on both sides of the boundary. Do it after
+    # lowercase so ``"AND"`` in ALL CAPS also folds in.
+    head = head.replace(" and ", " & ")
+    return head
+
+
+# Deprecated private alias kept so any pre-refactor call sites in tests
+# / notebooks stay wired. Do not use for new code.
+_area_bucket_key = area_bucket_key
+
+
+def canonicalise_area(name: Any) -> str:
+    """Return the canonical top-level area label for ``name``, preserving
+    the original casing of the first segment.
+
+    Empty / non-string inputs yield an empty string. Callers should treat
+    that as "no area assigned" and skip counting.
+
+    Note: two inputs that only differ in case (``"Risk & Controls
+    Framework"`` vs ``"Risk & Controls framework"``) return two
+    superficially-different strings here, but callers keying by
+    :func:`_area_bucket_key` will collapse them to a single bucket. When
+    you need bucket-equality use :func:`area_matches` instead of ``==``.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    head = _AREA_SPLIT_RE.split(raw, maxsplit=1)[0].strip()
+    head = _AREA_WS_RE.sub(" ", head)
+    return head
+
+
+def area_matches(name: Any, other: Any) -> bool:
+    """Case-insensitive equality after canonicalisation + ampersand-unification.
+
+    Used when we need to look up an area name inside a dict whose keys came
+    from a *different* code path than the counter we are populating (e.g.
+    ``area_readiness`` was built with the raw label but we now key by
+    canonical head).
+    """
+    a = _area_bucket_key(name)
+    b = _area_bucket_key(other)
+    return bool(a) and a == b
+
+
+def sub_classifications_for(names: Iterable[Any]) -> Dict[str, List[str]]:
+    """Return ``{canonical_head: [sub_classification, ...]}`` for callers
+    that want to render a tooltip / expander of the raw child labels that
+    were folded into each parent bucket.
+
+    Duplicate sub-classifications collapse to one entry; the order
+    preserves first-seen occurrence which reads well in the UI.
+    """
+    out: Dict[str, List[str]] = {}
+    seen: Dict[str, set] = {}
+    for raw in names:
+        raw_str = str(raw or "").strip()
+        if not raw_str:
+            continue
+        head = canonicalise_area(raw_str)
+        if not head:
+            continue
+        # Everything after the first separator, if any.
+        parts = _AREA_SPLIT_RE.split(raw_str, maxsplit=1)
+        if len(parts) > 1:
+            child = _AREA_WS_RE.sub(" ", parts[1].strip())
+            if child:
+                bucket = out.setdefault(head, [])
+                seen_set = seen.setdefault(head, set())
+                if child.lower() not in seen_set:
+                    bucket.append(child)
+                    seen_set.add(child.lower())
+    return out
+
+
 def _req_text(r: Mapping[str, Any]) -> str:
     return " ".join(
         str(r.get(field_) or "")
@@ -596,6 +743,16 @@ class WeightedImpactResult:
     # Recommendation seeds.
     recommendations_input: List[Dict[str, Any]]
 
+    # Sub-classifications that were folded into each canonical area
+    # bucket during roll-up (see ``canonicalise_area``). Keyed by the
+    # canonical head, e.g. ``{"Risk & Controls framework": ["Cyber
+    # Security", "Third-Party"]}``. Empty when the LLM never emitted
+    # any ``Parent / Child`` labels. The dashboard exposes this as a
+    # tooltip / expander on each rolled-up impact card. Defaulted so
+    # older persisted results (loaded before this field existed)
+    # deserialise cleanly.
+    area_sub_classifications: Dict[str, List[str]] = field(default_factory=dict)
+
     def as_dict(self) -> Dict[str, Any]:
         """JSON-safe copy for persistence + session-state round-trip."""
         return {
@@ -636,6 +793,9 @@ class WeightedImpactResult:
             ],
             "overall_priority_score": self.overall_priority_score,
             "recommendations_input": [dict(r) for r in self.recommendations_input],
+            "area_sub_classifications": {
+                k: list(v) for k, v in (self.area_sub_classifications or {}).items()
+            },
         }
 
 
@@ -934,25 +1094,72 @@ def compute_weighted_impact(
     # --- Priority / heatmap -------------------------------------------
     # Per-area impact: log-saturation of obligation + pair count so an area
     # touched by many obligations lands above one with a single mention.
-    area_signal_counter: Counter[str] = Counter()
+    # Areas are counted by their *canonical* head (see
+    # ``canonicalise_area``) so an LLM-emitted ``"Risk & Controls
+    # framework / Cyber Security"`` folds into the ``"Risk & Controls
+    # framework"`` bucket rather than producing a second peer card that
+    # contradicts the parent's status.
+    # Case-insensitive bucketing with a first-seen display registry so
+    # the UI label reads consistently (see ``_area_bucket_key`` /
+    # ``canonicalise_area``).
+    _bucket_counts: Counter[str] = Counter()
+    _bucket_display: Dict[str, str] = {}
+    _bucket_raws: Dict[str, List[str]] = {}
     for o in obligations:
-        a = str(o.get("impacted_area") or "").strip()
-        if a:
-            area_signal_counter[a] += 1
+        raw = str(o.get("impacted_area") or "").strip()
+        key = _area_bucket_key(raw)
+        if key:
+            _bucket_counts[key] += 1
+            _bucket_display.setdefault(key, canonicalise_area(raw))
+            if raw:
+                _bucket_raws.setdefault(key, []).append(raw)
     for p in impact_pairs:
-        a = str(p.get("area") or "").strip()
-        if a:
-            area_signal_counter[a] += 1
+        raw = str(p.get("area") or "").strip()
+        key = _area_bucket_key(raw)
+        if key:
+            _bucket_counts[key] += 1
+            _bucket_display.setdefault(key, canonicalise_area(raw))
+            if raw:
+                _bucket_raws.setdefault(key, []).append(raw)
+
+    # Re-key into the display form so downstream lookups (which the
+    # dashboard hits by display name) work directly.
+    area_signal_counter: Counter[str] = Counter()
+    area_raw_labels: Dict[str, List[str]] = {}
+    for key, cnt in _bucket_counts.items():
+        disp = _bucket_display.get(key, key)
+        area_signal_counter[disp] = cnt
+        if _bucket_raws.get(key):
+            area_raw_labels[disp] = list(_bucket_raws[key])
 
     def _area_impact(count: int) -> float:
         # Slightly steeper than the factor saturation so a "hot" area
         # gets a headline-worthy score.
         return _count_saturation(count, half_life=2.5)
 
-    area_readiness_map: Dict[str, float] = {
+    # Bridge the readiness dict to the (case-insensitive) canonical
+    # buckets we just built. When the readiness dict was assembled
+    # upstream from the raw ``impacted_area`` labels we now roll every
+    # raw key into its bucket key, then look up the first-seen display
+    # form for the output. Values are averaged (unweighted here — the
+    # readiness dict has already been signal-weighted upstream in
+    # ``scoring_engine.evaluate_state``).
+    area_readiness_raw: Dict[str, float] = {
         str(k).strip(): float(v)
         for k, v in (area_readiness or {}).items()
     }
+    _rdy_sum: Dict[str, float] = {}
+    _rdy_n: Dict[str, int] = {}
+    for raw_key, value in area_readiness_raw.items():
+        bkey = _area_bucket_key(raw_key)
+        if not bkey:
+            continue
+        _rdy_sum[bkey] = _rdy_sum.get(bkey, 0.0) + value
+        _rdy_n[bkey] = _rdy_n.get(bkey, 0) + 1
+    area_readiness_map: Dict[str, float] = {}
+    for bkey, total in _rdy_sum.items():
+        disp = _bucket_display.get(bkey, bkey)
+        area_readiness_map[disp] = total / max(1, _rdy_n[bkey])
 
     priority_areas: List[PriorityAreaBreakdown] = []
     for area, count in area_signal_counter.most_common():
@@ -970,21 +1177,29 @@ def compute_weighted_impact(
         )
     priority_areas.sort(key=lambda r: r.priority_score, reverse=True)
 
-    # Area x Function heatmap - based on impact_pairs.
-    pair_readiness_map: Dict[Tuple[str, str], float] = {
-        (str(k[0]).strip(), str(k[1]).strip()): float(v)
-        for k, v in (pair_readiness or {}).items()
-    }
+    # Area x Function heatmap - based on impact_pairs. Canonicalise the
+    # area side to match the priority-area rollup so drill-downs from a
+    # card to its heatmap cells work with the same bucket names. Keyed
+    # by the display label so it lines up with ``priority_areas``.
+    pair_readiness_map: Dict[Tuple[str, str], float] = {}
+    for k, v in (pair_readiness or {}).items():
+        bkey = _area_bucket_key(k[0])
+        if not bkey:
+            continue
+        disp = _bucket_display.get(bkey, canonicalise_area(k[0]))
+        pair_readiness_map[(disp, str(k[1]).strip())] = float(v)
+
     heatmap_rows: List[Dict[str, Any]] = []
     pair_signal_counter: Counter[Tuple[str, str]] = Counter()
     for p in impact_pairs:
-        a = str(p.get("area") or "").strip()
+        bkey = _area_bucket_key(p.get("area"))
         f = str(p.get("function") or "").strip()
-        if not a or not f:
+        if not bkey or not f:
             continue
+        disp = _bucket_display.get(bkey, canonicalise_area(p.get("area")))
         # Weight by number of mapped requirements so hot cells surface first.
         reqs = p.get("requirement_ids") or []
-        pair_signal_counter[(a, f)] += max(1, len(reqs))
+        pair_signal_counter[(disp, f)] += max(1, len(reqs))
     for (area, func), count in pair_signal_counter.most_common(50):
         pair_imp = _count_saturation(count, half_life=3.0)
         pair_rdy = pair_readiness_map.get((area, func), 0.0)
@@ -1017,6 +1232,18 @@ def compute_weighted_impact(
         })
     rec_input.sort(key=lambda r: r["weighted_score"], reverse=True)
 
+    # Deduplicate the raw labels we captured while rolling up each
+    # canonical area bucket. Only entries that carried an actual
+    # sub-classification (i.e. had something after the first ``/``)
+    # end up in the returned dict, so an area whose LLM tags were all
+    # bare parents contributes no tooltip content — the dashboard
+    # renderer treats an empty list as "nothing to expand".
+    area_sub_classifications: Dict[str, List[str]] = sub_classifications_for(
+        raw
+        for raws in area_raw_labels.values()
+        for raw in raws
+    )
+
     result = WeightedImpactResult(
         overall_impact_score=overall,
         impact_rating=impact_rating(overall),
@@ -1033,6 +1260,7 @@ def compute_weighted_impact(
         priority_areas=priority_areas,
         overall_priority_score=overall_priority,
         recommendations_input=rec_input,
+        area_sub_classifications=area_sub_classifications,
     )
     logger.info(
         "Weighted impact computed. overall=%.2f rating=%s priority=%.2f",

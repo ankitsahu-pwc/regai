@@ -87,6 +87,7 @@ class RecommendationAgent:
         branch_log: Optional[Sequence[Mapping[str, Any]]] = None,
         analysis: Optional[RegulatoryAnalysis] = None,
         client_roles: Optional[Sequence[str]] = None,
+        weighted_impact: Optional[Any] = None,
     ) -> RecommendationResult:
         """Produce a structured recommendation bundle.
 
@@ -178,6 +179,7 @@ class RecommendationAgent:
             package=questionnaire.package,
             impact=scoring.impact,
             readiness=scoring.readiness,
+            weighted_impact=weighted_impact,
             client=self.client if enrich_with_genai else None,
             enrich_with_genai=bool(enrich_with_genai and self.client is not None),
         )

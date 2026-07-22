@@ -162,9 +162,32 @@ class RegulatoryIntelligencePackage:
                 "query": c.query,
             })
 
+        def _year(row: Dict[str, Any]) -> int:
+            """Parse the publication year for the freshness sort key.
+
+            Undated results collapse to ``0`` so they sink to the
+            bottom of their (source_type, confidence) bucket rather
+            than mixing randomly with dated ones. This mirrors the
+            same freshness-aware ordering that Stage 1's Native/DDGS
+            paths apply — see ``official_regulation_fetcher._sort_key``.
+            """
+            raw = row.get("publication_date") or ""
+            try:
+                return int(str(raw)[:4])
+            except (TypeError, ValueError):
+                return 0
+
+        # Sort keys (all descending except source-type priority which
+        # is a small numeric rank where lower is better):
+        #   1. Source-type priority (Official > Legislation > Consulting)
+        #   2. Confidence score (relevance)
+        #   3. Publication year (freshness — latest first)
+        # The confidence and year keys are wrapped in ``-`` so ``sort``
+        # (which is ascending) still ranks highest first.
         rows.sort(key=lambda row: (
             priority_index.get(row["source_type"], 99),
             -float(row.get("confidence_score") or 0.0),
+            -_year(row),
         ))
         return rows
 
@@ -295,6 +318,7 @@ class RegulatoryIntelligenceService:
         include_consulting: bool = True,
         include_offline_baseline: bool = True,
         char_budget: int = 12000,
+        exhaustive: bool = False,
         status: StatusCallback = _noop,
     ) -> RegulatoryIntelligencePackage:
         """Run Stage 1 + Stage 2 and return the combined intelligence package.
@@ -306,16 +330,29 @@ class RegulatoryIntelligenceService:
         ``include_offline_baseline=True`` (default) keeps the historical
         behaviour of appending an offline baseline as a defensive belt so the
         BRD generator never sees an empty context string.
+
+        ``exhaustive=True`` forwards to Stage 1 to enable multi-variant
+        native search per regulator, a wider DDGS template set, and
+        relaxed early-stop / wall-clock caps. Set this when the user
+        has uploaded a regulation document and expects a full sweep of
+        every publication the approved regulators expose.
         """
         diagnostics: List[str] = []
         errors: List[str] = []
 
         # ---- Stage 1 -------------------------------------------------------
-        status("Stage 1: searching approved regulator domains.")
+        if exhaustive:
+            status(
+                "Stage 1 (exhaustive): sweeping every approved regulator "
+                "domain for the uploaded regulation."
+            )
+        else:
+            status("Stage 1: searching approved regulator domains.")
         stage1 = self._stage1(
             regulation,
             regulator_selection,
             max_results_per_query=max_official_results,
+            exhaustive=exhaustive,
             status=status,
         )
         official_results: List[OfficialRegulationResult] = list(stage1.get("results") or [])
@@ -419,6 +456,7 @@ def gather_regulatory_intelligence(
     regulator_selection: Optional[Sequence[str]] = None,
     consulting_selection: Optional[Sequence[str]] = None,
     include_consulting: bool = True,
+    exhaustive: bool = False,
     status: StatusCallback = _noop,
 ) -> RegulatoryIntelligencePackage:
     """Module-level helper used by the BRD generator and the Streamlit UI."""
@@ -427,6 +465,7 @@ def gather_regulatory_intelligence(
         regulator_selection=regulator_selection,
         consulting_selection=consulting_selection,
         include_consulting=include_consulting,
+        exhaustive=exhaustive,
         status=status,
     )
 

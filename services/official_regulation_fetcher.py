@@ -35,6 +35,7 @@ from .search_config import (
     is_regulator_url,
     is_regulatory_search_enabled,
     regulator_for_url,
+    regulatory_exhaustive_max_results,
     regulatory_max_results,
     resolve_regulators,
     search_backends,
@@ -128,9 +129,75 @@ def _default_query_templates() -> List[str]:
     # domain. This is the same low-volume pattern the original code used,
     # plus the new allow-list guarantee that Wikipedia / blogs / news never
     # leak into the BRD context.
+    #
+    # We tack on ``latest {current_year}`` on the RTS/guidelines query so
+    # the ranker biases toward the most recent technical standards /
+    # guideline consolidations rather than 5-year-old drafts. The
+    # ``latest`` keyword rarely appears verbatim in regulator pages, but
+    # the year token dramatically improves the freshness of the search
+    # engine's ranking. Query construction stays cheap (still 2 default
+    # queries) so the polite-delay budget is unchanged.
+    current_year = datetime.now(timezone.utc).year
     return [
         "{regulation} regulation official text",
-        "{regulation} RTS technical standards guidelines",
+        f"{{regulation}} RTS technical standards guidelines latest {current_year}",
+    ]
+
+
+def _exhaustive_query_templates() -> List[str]:
+    """Query templates used in exhaustive (post-upload) mode.
+
+    We deliberately widen the coverage across the common publication
+    types every major regulator uses (RTS/ITS, guidelines, Q&As,
+    consultation / discussion / policy papers, notifications /
+    master circulars / directions / delegated acts). The templates
+    are regulator-agnostic — DDGS ranks the ones that actually apply
+    to the selected regulators to the top, and the URL allow-list
+    post-filter drops the rest.
+
+    Overridable via ``REGULATORY_EXHAUSTIVE_QUERY_TEMPLATES`` (newline-
+    separated) for corporate environments that want a curated list.
+    """
+    raw = os.getenv("REGULATORY_EXHAUSTIVE_QUERY_TEMPLATES", "").strip()
+    if raw:
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+    current_year = datetime.now(timezone.utc).year
+    return [
+        "{regulation} regulation official text",
+        f"{{regulation}} RTS ITS technical standards latest {current_year}",
+        "{regulation} guidelines",
+        "{regulation} Q&A questions and answers",
+        "{regulation} consultation paper discussion paper",
+        "{regulation} policy statement supervisory statement",
+        "{regulation} notification circular direction",
+        "{regulation} delegated regulation implementing regulation",
+    ]
+
+
+def _exhaustive_native_variants(regulation: str) -> List[str]:
+    """Query variants sent to each regulator's own native site search.
+
+    Regulator search engines usually accept a plain string, so we
+    submit a small set of variants per regulator (in parallel across
+    all regulators) rather than one bare query. The variants cover
+    the same publication-type space as
+    :func:`_exhaustive_query_templates` but are shorter, matching how
+    users actually type queries into regulator site search boxes.
+
+    Duplicate URLs across variants are deduped downstream, so the
+    only cost of adding a variant is one extra HTTP call per
+    regulator (all issued in parallel, so wall-clock impact is
+    bounded by the slowest regulator's response time).
+    """
+    label = (regulation or "").strip()
+    if not label:
+        return []
+    return [
+        label,
+        f"{label} guidelines",
+        f"{label} technical standards",
+        f"{label} consultation",
+        f"{label} circular direction notification",
     ]
 
 
@@ -141,14 +208,36 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _runtime_caps() -> Dict[str, Any]:
+def _runtime_caps(*, exhaustive: bool = False) -> Dict[str, Any]:
     """Caps that prevent Stage 1 from running forever on a wide regulator set.
 
     We run queries SEQUENTIALLY with a small inter-query delay, because DDGS
     aggressively rate-limits concurrent requests from the same IP (the symptom
     is `DDGSException: No results found` for queries that work fine in
     isolation).
+
+    ``exhaustive=True`` swaps in a much wider budget so a post-upload
+    sweep can pull every publication the selected regulators expose
+    for the detected regulation — the polite delay is preserved so
+    DDGS is not blacklisted, but every other cap is relaxed.
     """
+    if exhaustive:
+        return {
+            "max_total_queries": _env_int(
+                "REGULATORY_EXHAUSTIVE_MAX_QUERIES", 40
+            ),
+            # Effectively disable the early-stop; we still cap so a pathological
+            # regulator set does not blow up memory.
+            "early_stop_results": _env_int(
+                "REGULATORY_EXHAUSTIVE_EARLY_STOP", 500
+            ),
+            "max_total_seconds": _env_int(
+                "REGULATORY_EXHAUSTIVE_MAX_SECONDS", 90
+            ),
+            "inter_query_delay_ms": _env_int(
+                "REGULATORY_EXHAUSTIVE_DELAY_MS", 500
+            ),
+        }
     return {
         # Hard upper bound on total queries dispatched. We now use 2-3 plain
         # queries (not one per regulator) so this can be tight without losing
@@ -164,24 +253,62 @@ def _runtime_caps() -> Dict[str, Any]:
     }
 
 
-def build_queries(regulation: str, regulators: Sequence[RegulatorSource]) -> List[Dict[str, str]]:
+def build_queries(
+    regulation: str,
+    regulators: Sequence[RegulatorSource],
+    *,
+    exhaustive: bool = False,
+) -> List[Dict[str, str]]:
     """Build the search queries for Stage 1.
 
-    The query volume is intentionally low — a small number of plain queries
-    biased toward the *full set* of selected regulators rather than one
-    query per regulator. The URL allow-list post-filter
-    (:func:`is_regulator_url`) is what guarantees that only regulator-domain
-    hits survive; the search engine is only there to *find* the URLs.
+    Live mode
+    ---------
+    The query volume is intentionally low — a small number of plain
+    queries biased toward the *full set* of selected regulators
+    rather than one query per regulator. The URL allow-list
+    post-filter (:func:`is_regulator_url`) is what guarantees that
+    only regulator-domain hits survive; the search engine is only
+    there to *find* the URLs.
 
-    When a specific subset of regulators is selected (not "ALL"), the first
-    query is augmented with the regulator names to bias the ranking toward
-    those regulators. Even without that augmentation, plain regulation
-    queries reliably return regulator URLs (eur-lex, eba, esma, etc.) in the
-    top 5-10 results.
+    When a specific subset of regulators is selected (not "ALL"),
+    the first query is augmented with the regulator names to bias
+    the ranking toward those regulators.
+
+    Exhaustive mode
+    ---------------
+    Triggered when the user has uploaded a document (BRD/FRD or a
+    regulation PDF) so we know the exact regulation label to sweep.
+    We fan out **one biased query per selected regulator** and use
+    the wider template list (``_exhaustive_query_templates``) so
+    every common publication type (RTS/ITS, guidelines, Q&As,
+    consultation papers, notifications, master circulars, delegated
+    acts, ...) gets a targeted query. The URL allow-list still
+    guarantees that only approved-domain hits survive.
     """
     label = (regulation or "").strip()
     if not label:
         return []
+
+    out: List[Dict[str, str]] = []
+
+    if exhaustive:
+        # One biased query per regulator so each regulator gets a
+        # dedicated shot at ranking its own publications, plus the
+        # wider template list to sweep common publication types.
+        for reg in regulators:
+            out.append({
+                "query": f"{reg.name} {label}".strip(),
+                "domain": "",
+                "regulator_code": reg.code,
+            })
+        for tpl in _exhaustive_query_templates():
+            out.append({
+                "query": tpl.format(regulation=label).strip(),
+                "domain": "",
+                "regulator_code": "",
+            })
+        return out
+
     templates = _default_query_templates()
 
     # If the user picked a small subset of regulators, build one extra
@@ -193,7 +320,6 @@ def build_queries(regulation: str, regulators: Sequence[RegulatorSource]) -> Lis
     if 1 <= total_regulators <= 4:
         biased_query = f"{' '.join(regulator_names)} {label} regulation"
 
-    out: List[Dict[str, str]] = []
     if biased_query:
         out.append({
             "query": biased_query.strip(),
@@ -287,6 +413,86 @@ def _extract_publication_date(text: str) -> Optional[str]:
     return None
 
 
+def _publication_year(publication_date: Optional[str]) -> int:
+    """Return the parsed year from ``publication_date`` or ``0`` when absent.
+
+    Used as a secondary sort key so that within the same confidence
+    bucket the most recent publication surfaces first. Undated
+    documents get ``0`` and therefore sink to the bottom of their
+    bucket — this matches the "latest sources" reviewer requirement
+    (undated snippets are almost always cached/legacy content).
+    """
+    if not publication_date:
+        return 0
+    try:
+        return int(str(publication_date)[:4])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sort_key(result: "OfficialRegulationResult") -> Tuple[float, int]:
+    """Sort key for the Stage 1 ranker.
+
+    Primary: negative confidence score (highest relevance first).
+    Secondary: negative publication year (most recent first). This is
+    the sort key used everywhere in the fetcher so callers see a
+    stable, freshness-aware ordering whether the results came from
+    the native adapters, the DDGS fallback, or the TTL cache.
+    """
+    return (-float(result.confidence_score or 0.0), -_publication_year(result.publication_date))
+
+
+def _freshness_bonus(publication_date: Optional[str]) -> float:
+    """Return a small confidence bonus that favours newer publications.
+
+    The regulator search returns a mix of publications spanning decades
+    (an EBA guideline from 2015, a fresh RTS from 2024, an EUR-Lex
+    consolidated regulation with no explicit date, etc.). Reviewers
+    consistently ask for the **latest** authoritative source when they
+    are drafting a BRD or gap report, so we bake a freshness signal
+    directly into the confidence score. This keeps the downstream
+    ranking honest: a highly relevant recent publication naturally
+    rises above an equally relevant but decade-old one, without
+    starving well-scored older documents whose confidence already
+    reflects strong keyword/ID matches.
+
+    Bonus schedule (added to the base relevance score, capped so it
+    can never dominate a strong relevance match on its own):
+
+    * Published in the current year        -> +0.10
+    * Published in the prior year          -> +0.08
+    * Published in the last 3 years        -> +0.05
+    * Published in the last 5 years        -> +0.02
+    * Older, or no parseable date          -> +0.00
+
+    We deliberately do not penalise undated documents: EUR-Lex and
+    several regulator sites strip the publication date from snippets,
+    so a zero bonus is the safest default (they neither help nor hurt
+    the ranking).
+    """
+    if not publication_date:
+        return 0.0
+    try:
+        year = int(str(publication_date)[:4])
+    except (TypeError, ValueError):
+        return 0.0
+    current_year = datetime.now(timezone.utc).year
+    delta = current_year - year
+    if delta < 0:
+        # Unlikely but defensive: a mis-parsed future date should not
+        # get a fake future-freshness bonus.
+        return 0.05
+    if delta == 0:
+        return 0.10
+    if delta == 1:
+        return 0.08
+    if delta <= 3:
+        return 0.05
+    if delta <= 5:
+        return 0.02
+    return 0.0
+
+
 def _score_confidence(result: "OfficialRegulationResult", regulation: str) -> float:
     """Heuristic confidence score in ``[0.5, 0.99]``.
 
@@ -296,6 +502,7 @@ def _score_confidence(result: "OfficialRegulationResult", regulation: str) -> fl
       * Regulation ID detected                   -> +0.15
       * Publication type detected                -> +0.1
       * Publication date detected                -> +0.05
+      * Freshness bonus (see :func:`_freshness_bonus`) -> +0.0 – +0.10
     """
     score = 0.5
     label = (regulation or "").lower()
@@ -307,6 +514,7 @@ def _score_confidence(result: "OfficialRegulationResult", regulation: str) -> fl
         score += 0.1
     if result.publication_date:
         score += 0.05
+    score += _freshness_bonus(result.publication_date)
     return round(min(score, 0.99), 2)
 
 
@@ -319,6 +527,7 @@ def fetch_official_regulations(
     regulator_selection: Optional[Sequence[str]] = None,
     *,
     max_results_per_query: Optional[int] = None,
+    exhaustive: bool = False,
     status: StatusCallback = _noop,
 ) -> Dict[str, Any]:
     """Search only approved regulator domains for the supplied ``regulation``.
@@ -332,7 +541,18 @@ def fetch_official_regulations(
         ``["ALL"]`` to search every approved regulator.
     max_results_per_query
         Per-backend per-query limit. Defaults to
-        :func:`search_config.regulatory_max_results`.
+        :func:`search_config.regulatory_max_results` (or
+        :func:`search_config.regulatory_exhaustive_max_results` when
+        ``exhaustive=True``).
+    exhaustive
+        When ``True``, run the fetcher in exhaustive mode: multiple
+        native query variants per regulator (all issued in parallel),
+        a wider DDGS template set, one biased DDGS query per selected
+        regulator, and relaxed early-stop / wall-clock caps. This is
+        the mode used after a document is uploaded — the caller
+        knows the exact regulation and wants every publication the
+        approved regulators expose for it. Live-preview callers
+        should leave this ``False`` to keep Page 1 snappy.
     status
         Optional progress callback (Streamlit ``st.status`` writer).
 
@@ -352,9 +572,13 @@ def fetch_official_regulations(
     # ------------------------------------------------------------------
     # Short-circuit: TTL cache. This is only a wall-clock optimisation -
     # exact same result payload is returned. Cache misses fall through
-    # to the normal path below.
+    # to the normal path below. ``exhaustive`` is baked into the cache
+    # key so a live-preview payload can never be served for an
+    # exhaustive request or vice versa.
     # ------------------------------------------------------------------
-    cache_key = _cache_key(regulation, regulator_selection, max_results_per_query)
+    cache_key = _cache_key(
+        regulation, regulator_selection, max_results_per_query, exhaustive=exhaustive,
+    )
     cached_payload = _cache_get(cache_key)
     if cached_payload is not None:
         status(
@@ -418,7 +642,10 @@ def fetch_official_regulations(
     # dedup / ranking / logs stay stable and deterministic.
     # ------------------------------------------------------------------
     timeout = search_timeout_seconds()
-    native_max_results = regulatory_max_results()
+    native_max_results = (
+        regulatory_exhaustive_max_results() if exhaustive
+        else regulatory_max_results()
+    )
     native_started = time.monotonic()
 
     native_supported = set(native_supported_codes())
@@ -428,33 +655,66 @@ def fetch_official_regulations(
     per_reg_hits: Dict[str, List[Any]] = {}
     per_reg_errors: Dict[str, str] = {}
 
-    def _run_one_native(reg: RegulatorSource) -> Tuple[str, List[Any], Optional[str]]:
+    # In exhaustive mode we submit multiple query variants per
+    # regulator (bare label + "guidelines" + "technical standards" +
+    # "consultation" + "circular/direction"). Live mode keeps the
+    # single-variant behaviour so Page 1 previews remain snappy.
+    native_variants: List[str] = (
+        _exhaustive_native_variants(regulation) if exhaustive else [regulation]
+    )
+    if not native_variants:
+        native_variants = [regulation]
+
+    def _run_one_native(
+        reg: RegulatorSource, query_variant: str,
+    ) -> Tuple[str, str, List[Any], Optional[str]]:
         try:
             return (
                 reg.code,
+                query_variant,
                 list(native_search(
-                    reg.code, regulation,
+                    reg.code, query_variant,
                     max_results=native_max_results, timeout=timeout,
                 ) or []),
                 None,
             )
         except Exception as exc:  # noqa: BLE001
-            return (reg.code, [], f"{type(exc).__name__}: {exc}")
+            return (
+                reg.code, query_variant, [],
+                f"{type(exc).__name__}: {exc}",
+            )
 
     if ordered_native_regs:
+        # Fan every (regulator, variant) pair out through a bounded
+        # thread pool. Wall-clock collapses to the slowest single
+        # request instead of the sum across regulators + variants.
         max_workers = max(
-            1, min(len(ordered_native_regs), _env_int("REGULATORY_NATIVE_WORKERS", 8)),
+            1,
+            min(
+                len(ordered_native_regs) * len(native_variants),
+                _env_int("REGULATORY_NATIVE_WORKERS", 12 if exhaustive else 8),
+            ),
         )
+        submissions: List[Tuple[RegulatorSource, str]] = [
+            (r, v) for r in ordered_native_regs for v in native_variants
+        ]
         with ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="reg-native",
         ) as pool:
-            for fut in as_completed(
-                {pool.submit(_run_one_native, r): r for r in ordered_native_regs}
-            ):
-                code, hits, err = fut.result()
-                per_reg_hits[code] = hits
+            futures = {
+                pool.submit(_run_one_native, reg, variant): (reg, variant)
+                for reg, variant in submissions
+            }
+            for fut in as_completed(futures):
+                code, _variant, hits, err = fut.result()
+                # Multiple variants per regulator can produce
+                # overlapping URLs; the downstream ``seen_urls`` set
+                # dedupes them, so we simply concatenate here.
+                per_reg_hits.setdefault(code, []).extend(hits)
                 if err is not None:
-                    per_reg_errors[code] = err
+                    # Keep the first failing variant's error message
+                    # so the surface diagnostic stays readable.
+                    per_reg_errors.setdefault(code, err)
 
     # Merge in original regulator order for deterministic dedup + ranking.
     for reg in ordered_native_regs:
@@ -499,7 +759,10 @@ def fetch_official_regulations(
 
     if native_codes_used:
         status(
-            f"Stage 1 native search complete (parallel x{len(native_codes_used)}): "
+            f"Stage 1 native search complete (parallel x"
+            f"{len(native_codes_used) * len(native_variants)} calls "
+            f"across {len(native_codes_used)} regulator(s) x "
+            f"{len(native_variants)} query variant(s)): "
             f"tried {len(native_codes_used)} regulator(s) "
             f"({', '.join(native_codes_used)}) -> {len(results)} hit(s) "
             f"in {time.monotonic() - native_started:.1f}s."
@@ -511,7 +774,7 @@ def fetch_official_regulations(
     #   (b) native search alone already cleared the early-stop threshold.
     # This keeps locked-down corporate networks free of DDGS errors when
     # native results already cover the user's selection.
-    caps_early = _runtime_caps()["early_stop_results"]
+    caps_early = _runtime_caps(exhaustive=exhaustive)["early_stop_results"]
     selected_codes = {r.code for r in regulators}
     native_codes = set(native_supported_codes())
     all_selected_are_native = selected_codes and selected_codes.issubset(native_codes)
@@ -532,7 +795,7 @@ def fetch_official_regulations(
             f"Skipping DDGS fallback."
         )
         status(diagnostics[-1])
-        results.sort(key=lambda r: r.confidence_score, reverse=True)
+        results.sort(key=_sort_key)
         payload = {
             "results": results,
             "regulators": payload_regulators,
@@ -551,7 +814,7 @@ def fetch_official_regulations(
         msg = "DDGS / duckduckgo_search not installed; Stage 1 native results only."
         diagnostics.append(msg)
         status(msg)
-        results.sort(key=lambda r: r.confidence_score, reverse=True)
+        results.sort(key=_sort_key)
         payload = {
             "results": results,
             "regulators": payload_regulators,
@@ -563,10 +826,10 @@ def fetch_official_regulations(
         _cache_put(cache_key, payload)
         return payload
 
-    queries = build_queries(regulation, regulators)
+    queries = build_queries(regulation, regulators, exhaustive=exhaustive)
     if not queries:
         diagnostics.append("No regulation label supplied; Stage 1 cannot build queries.")
-        results.sort(key=lambda r: r.confidence_score, reverse=True)
+        results.sort(key=_sort_key)
         return {
             "results": results,
             "regulators": payload_regulators,
@@ -577,8 +840,11 @@ def fetch_official_regulations(
         }
 
     backends = search_backends()
-    max_per_query = max_results_per_query or regulatory_max_results()
-    caps = _runtime_caps()
+    max_per_query = max_results_per_query or (
+        regulatory_exhaustive_max_results() if exhaustive
+        else regulatory_max_results()
+    )
+    caps = _runtime_caps(exhaustive=exhaustive)
 
     # Apply the hard cap on the dispatched query count *before* we start so
     # the user sees the actual planned workload in the status message.
@@ -686,7 +952,7 @@ def fetch_official_regulations(
         if delay_seconds > 0 and idx < len(queries) - 1:
             time.sleep(delay_seconds)
 
-    results.sort(key=lambda r: r.confidence_score, reverse=True)
+    results.sort(key=_sort_key)
     elapsed = time.monotonic() - started
 
     diagnostics.append(
@@ -724,24 +990,32 @@ _REG_BY_CODE: Dict[str, RegulatorSource] = {r.code: r for r in APPROVED_REGULATO
 # ---------------------------------------------------------------------------
 _CACHE_TTL_SECONDS: int = _env_int("REGULATORY_SEARCH_CACHE_TTL_SECONDS", 300)
 _CACHE_MAX_ENTRIES: int = _env_int("REGULATORY_SEARCH_CACHE_MAX_ENTRIES", 64)
-_STAGE1_CACHE: Dict[Tuple[str, Tuple[str, ...], int], Tuple[float, Dict[str, Any]]] = {}
+_STAGE1_CACHE: Dict[Tuple[str, Tuple[str, ...], int, bool], Tuple[float, Dict[str, Any]]] = {}
 
 
 def _cache_key(
     regulation: str,
     regulator_selection: Optional[Sequence[str]],
     max_results_per_query: Optional[int],
-) -> Tuple[str, Tuple[str, ...], int]:
-    """Stable cache key for a Stage 1 fetch."""
+    *,
+    exhaustive: bool = False,
+) -> Tuple[str, Tuple[str, ...], int, bool]:
+    """Stable cache key for a Stage 1 fetch.
+
+    ``exhaustive`` is included so a live-preview payload can never be
+    served for an exhaustive request (and vice versa) — they return
+    different result set sizes and would otherwise poison each other.
+    """
     codes = tuple(sorted(str(c).upper() for c in (regulator_selection or ["ALL"])))
     return (
         str(regulation or "").strip().upper(),
         codes,
         int(max_results_per_query or 0),
+        bool(exhaustive),
     )
 
 
-def _cache_get(key: Tuple[str, Tuple[str, ...], int]) -> Optional[Dict[str, Any]]:
+def _cache_get(key: Tuple[str, Tuple[str, ...], int, bool]) -> Optional[Dict[str, Any]]:
     if _CACHE_TTL_SECONDS <= 0:
         return None
     entry = _STAGE1_CACHE.get(key)
@@ -754,7 +1028,7 @@ def _cache_get(key: Tuple[str, Tuple[str, ...], int]) -> Optional[Dict[str, Any]
     return payload
 
 
-def _cache_put(key: Tuple[str, Tuple[str, ...], int], payload: Dict[str, Any]) -> None:
+def _cache_put(key: Tuple[str, Tuple[str, ...], int, bool], payload: Dict[str, Any]) -> None:
     if _CACHE_TTL_SECONDS <= 0:
         return
     # Only cache "successful-ish" responses; skip empty error-only payloads

@@ -635,6 +635,24 @@ def regulatory_max_results() -> int:
     )
 
 
+def regulatory_exhaustive_max_results() -> int:
+    """Hits requested per query when Stage 1 runs in **exhaustive** mode.
+
+    Exhaustive mode is triggered when the user uploads a regulation
+    document (BRD/FRD or a raw regulation PDF/DOCX) — at that point we
+    know exactly which regulation is at hand and want to enumerate as
+    many authoritative publications as the selected regulators expose.
+    The default is intentionally higher than ``regulatory_max_results``
+    so each per-regulator native site search returns a broad slate of
+    hits in a single round-trip, without changing the tighter budget
+    used for cheap live previews.
+    """
+    return _env_int(
+        "REGULATORY_EXHAUSTIVE_MAX_RESULTS",
+        os.getenv("REGULATORY_SEARCH_MAX_RESULTS_EXHAUSTIVE", "40"),
+    )
+
+
 def consulting_max_results() -> int:
     return _env_int("CONSULTING_SEARCH_MAX_RESULTS", "4")
 
@@ -680,6 +698,7 @@ __all__ = [
     "is_consulting_search_enabled",
     "search_backends",
     "regulatory_max_results",
+    "regulatory_exhaustive_max_results",
     "consulting_max_results",
     "search_timeout_seconds",
 ]

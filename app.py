@@ -90,6 +90,10 @@ from services.client_roles import (
     get_institution_type,
     normalize_client_roles,
 )
+from services.regulation_detector import (
+    DetectedRegulation,
+    detect_regulation_from_upload,
+)
 from services.regulatory_intelligence_service import (
     RegulatoryIntelligencePackage,
     gather_regulatory_intelligence,
@@ -108,6 +112,7 @@ from services.recommendation_service import Recommendation
 from services.scoring_engine import (
     AssessmentState,
     answered,
+    canonicalise_evaluation_dict,
     evaluate as _scoring_evaluate,
     pair_heatmap_rows,
     score_free_text_answer,
@@ -1184,6 +1189,28 @@ button[data-testid="stBaseButton-primary"]:hover {
     color: #2d2d2d;
     line-height: 1.2;
 }
+/* Rollup chip: appears next to a card title when the impact/readiness
+   card aggregates multiple LLM-emitted sub-classifications (e.g. the
+   "Risk & Controls framework" card that folds "Cyber Security",
+   "Third-Party" etc. into a single bucket). Hover surfaces the native
+   browser tooltip that spells out the folded labels. */
+.dash-sub-chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 7px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: #555;
+    background: #eef1f4;
+    border: 1px solid #d7dbe0;
+    border-radius: 999px;
+    vertical-align: middle;
+    cursor: help;
+}
+.dash-card.crit  .dash-sub-chip { background: #fbe6e6; border-color: #f2c2c2; color: #7a1414; }
+.dash-card.risk  .dash-sub-chip { background: #fbeeda; border-color: #f0d29b; color: #7a4b0e; }
+.dash-card.watch .dash-sub-chip { background: #e9f5e9; border-color: #bfe1bf; color: #275327; }
+.dash-card.ready .dash-sub-chip { background: #d9edd9; border-color: #a8ceac; color: #17441e; }
 .dash-card-meta {
     font-size: 0.78rem;
     color: var(--dash-muted);
@@ -1852,6 +1879,29 @@ div[data-baseweb="select"]:focus-within > div,
     font-size: 0.8rem;
     font-weight: 600;
 }
+.opt-reg-detected {
+    display: block;
+    margin-top: 0.45rem;
+    padding: 0.4rem 0.6rem;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+}
+.opt-reg-detected.opt-reg-detected-strong {
+    background: rgba(21, 101, 192, 0.10);
+    border: 1px solid #90caf9;
+    color: #0d47a1 !important;
+}
+.opt-reg-detected.opt-reg-detected-weak {
+    background: rgba(245, 124, 0, 0.10);
+    border: 1px dashed #ffb74d;
+    color: #7a3f00 !important;
+}
+.opt-reg-detected .opt-reg-detected-meta {
+    font-weight: 500;
+    opacity: 0.85;
+    margin-left: 0.35rem;
+}
 
 /* Code blocks (dark background, light monospace text) */
 [data-testid="stCodeBlock"], [data-testid="stCodeBlock"] pre,
@@ -2500,9 +2550,197 @@ def _genai_client() -> Optional[GenAIClient]:
     return st.session_state.get("_genai_client")
 
 
+def _apply_detected_regulation_from_upload(
+    path: Path,
+    *,
+    kind: str,
+    original_name: Optional[str] = None,
+) -> Optional[DetectedRegulation]:
+    """Detect the regulation named in an uploaded file and update session state.
+
+    Called from every upload path (regulation-doc card AND BRD/FRD
+    uploader). Reads the document text, runs the two-tier
+    :mod:`services.regulation_detector`, and — when a confident match
+    is produced — overwrites ``st.session_state["regulation"]`` so
+    downstream stages (native regulator search, Agent 1 prompt,
+    questionnaire generation, exports) run against the regulation the
+    user *actually* uploaded rather than the historic ``"DORA"`` default.
+
+    The detected value is also stashed in
+    ``st.session_state["_detected_regulation"]`` (last-writer-wins) so
+    the UI can render a small "Detected: DORA" chip near the upload
+    widget and reviewers can spot mis-detections at a glance.
+
+    We only overwrite the session value when the detector produced a
+    **confident** hit (see :attr:`DetectedRegulation.is_confident`).
+    Weak hints are surfaced to the user but the current regulation
+    label is preserved — this avoids yanking the label away from a
+    user who typed something specific in the sidebar even when the
+    doc's opening pages happened to name another regulation as an
+    aside.
+
+    Returns the :class:`DetectedRegulation` (which may be
+    :meth:`DetectedRegulation.unknown` when detection failed) so
+    callers can render a confirmation / warning chip. Returns
+    ``None`` when detection could not even be attempted (missing
+    file / unsupported extension).
+    """
+    if not path or not path.exists():
+        return None
+
+    # Any upload — regardless of whether the detector produces a
+    # confident hit — implies the user wants a comprehensive sweep of
+    # the approved regulator domains for the resulting regulation
+    # label, not just the top handful DDGS returns for a live
+    # preview. We set the flag before running detection so that even
+    # if the detector fails and we fall back to the user's typed
+    # ``regulation`` value, the follow-on ``_auto_fetch_regulatory_intelligence``
+    # call still runs Stage 1 in exhaustive mode.
+    st.session_state["_reg_intel_exhaustive"] = True
+    # Ensure the next auto-fetch actually re-executes (see
+    # ``_auto_fetch_regulatory_intelligence`` — it short-circuits when
+    # the fingerprint matches). Blowing the cached package away here
+    # also guarantees no live-preview result lingers on Page 1 after
+    # an upload.
+    st.session_state["_reg_intel_last_fingerprint"] = None
+    st.session_state["regulatory_intelligence_package"] = None
+
+    try:
+        detected = detect_regulation_from_upload(path, client=_genai_client())
+    except Exception:
+        logger.exception(
+            "Regulation detection failed for upload. path=%s kind=%s",
+            path, kind,
+        )
+        return None
+
+    if not detected.is_known:
+        logger.info(
+            "Regulation detector produced no hit for uploaded %s. "
+            "Keeping current regulation=%s (path=%s).",
+            kind, st.session_state.get("regulation"),
+            (original_name or path.name),
+        )
+        st.session_state["_detected_regulation"] = detected
+        return detected
+
+    st.session_state["_detected_regulation"] = detected
+
+    current = str(st.session_state.get("regulation") or "").strip()
+    if detected.is_confident and detected.code and current.upper() != detected.code.upper():
+        logger.info(
+            "Overriding regulation label from uploaded %s. "
+            "previous=%s detected=%s confidence=%.2f method=%s file=%s",
+            kind, current or "<empty>", detected.code,
+            detected.confidence, detected.method,
+            (original_name or path.name),
+        )
+        st.session_state["regulation"] = detected.code
+        # Reset the cached intelligence package so the auto-fetch on
+        # Page 1 refreshes for the newly detected regulation the next
+        # time the setup page renders. This keeps the "Retrieved
+        # Regulator Sources" table in sync with the uploaded document.
+        st.session_state["_reg_intel_last_fingerprint"] = None
+        st.session_state["regulatory_intelligence_package"] = None
+
+    # Jurisdiction-aware regulator scoping.
+    # When the detector produces both a confident hit AND a preferred
+    # regulator list (populated from the glossary — see
+    # ``RegulationEntry.preferred_regulator_codes``), narrow the
+    # ``Regulator Scope`` multiselect so the live search only queries
+    # the domains that actually publish authoritative content for the
+    # detected regulation. Without this, an Indian Housing Finance
+    # upload used to trigger EBA/ESMA hits alongside RBI/NHB — the
+    # user's screenshot showed exactly this leakage.
+    #
+    # Contract:
+    # * Only apply when the current selection is the default "ALL"
+    #   OR the currently-selected codes are a strict SUPERSET of the
+    #   preferred list (i.e. the user has not explicitly narrowed
+    #   the scope to something else). This preserves manual overrides
+    #   the reviewer typed in the multiselect.
+    # * If the user narrowed to, say, ["FCA"], we leave it alone —
+    #   they have made an explicit choice and detection should not
+    #   silently overwrite it.
+    if detected.is_confident and detected.preferred_regulator_codes:
+        current_scope = list(st.session_state.get("regulator_selection") or [])
+        current_upper = {c.upper() for c in current_scope}
+        preferred = list(detected.preferred_regulator_codes)
+        preferred_upper = {c.upper() for c in preferred}
+
+        is_default_all = (
+            not current_scope
+            or current_upper == {"ALL"}
+        )
+        # "Superset" means the user has not narrowed the scope further
+        # than the detector's own recommendation. If the current
+        # selection contains every preferred code plus at least one
+        # extra (e.g. EBA/ESMA hanging around from a prior DORA run),
+        # we consider it safe to retighten.
+        is_broader_than_preferred = (
+            not is_default_all
+            and preferred_upper.issubset(current_upper)
+            and current_upper - preferred_upper
+        )
+
+        if is_default_all or is_broader_than_preferred:
+            logger.info(
+                "Narrowing regulator scope for detected %s. "
+                "previous=%s preferred=%s",
+                detected.code, current_scope or ["ALL"], preferred,
+            )
+            st.session_state["regulator_selection"] = preferred
+            # The multiselect widget in ``_render_regulator_selector``
+            # binds to key ``regulator_selection_widget``; its
+            # ``default=`` argument is only honoured on the first
+            # render. Setting the widget-key value here ensures the
+            # UI reflects the narrowed scope on the next rerun even
+            # if the multiselect has already been instantiated once.
+            st.session_state["regulator_selection_widget"] = preferred
+            # Force the intel fetch to redo with the tighter scope.
+            st.session_state["_reg_intel_last_fingerprint"] = None
+            st.session_state["regulatory_intelligence_package"] = None
+            # Remember what we auto-picked so the UI can show a tiny
+            # "auto-scoped to <regulators>" hint under the multiselect
+            # and let the user click a "reset to ALL" button if they
+            # disagree with the detector.
+            st.session_state["_auto_scoped_regulators"] = {
+                "regulation": detected.code,
+                "codes": preferred,
+            }
+
+    return detected
+
+
 def _get_orchestrator() -> RegulatoryWorkflowOrchestrator:
-    """Return a singleton orchestrator bound to the current GenAI client."""
+    """Return a singleton orchestrator bound to the current GenAI client.
+
+    The instance is cached in ``st.session_state["_orchestrator"]`` so we
+    don't pay the boot cost on every widget interaction. **However**, when
+    the underlying agent classes gain a new keyword argument (as happened
+    with ``weighted_impact`` on ``run_recommendations`` / ``recommend``),
+    an orchestrator instance created *before* the code change still binds
+    the old method signature — calling the new kwarg then raises
+    ``TypeError`` inside the autorun wrapper, which silently swallows
+    it and leaves ``rich_recommendations`` empty. To make the app
+    self-healing, we probe the cached instance for the current expected
+    signature; if it looks stale we rebuild it in place.
+    """
     orch = st.session_state.get("_orchestrator")
+    if orch is not None:
+        try:
+            import inspect
+            sig = inspect.signature(orch.run_recommendations)
+            if "weighted_impact" not in sig.parameters:
+                logger.info(
+                    "Rebuilding cached orchestrator: signature is stale "
+                    "(missing 'weighted_impact' kwarg on run_recommendations)."
+                )
+                orch = None
+        except (TypeError, ValueError):
+            # Some built-in / C-implemented callables don't expose a
+            # signature; fall back to trusting the cache in that case.
+            pass
     if orch is None:
         orch = RegulatoryWorkflowOrchestrator(client=_genai_client())
         st.session_state["_orchestrator"] = orch
@@ -2808,23 +3046,34 @@ def _selected_regulator_codes() -> List[str]:
 def _selected_client_roles() -> List[str]:
     """Return the client roles that should be fed into the downstream pipeline.
 
-    **Product decision (2026-07):** The Client Role selector on Page 1 is
-    now purely **informational / display-only**. The user still picks the
-    institution type so they see their choice reflected on Page 1, but the
-    selection is intentionally NOT propagated into Agent 1 (regulatory
-    analysis), Agent 3 (questionnaire filter), or any other downstream
-    stage — the pipeline runs role-agnostic. This eliminates the
-    deterministic role-aware overhead (~50-300 ms/pipeline plus the same
-    per Page 2 render) without changing what the user sees at role-pick
-    time.
+    **Product decision (2026-07 revised):** The Client Role selector on
+    Page 1 is now **fully wired** into the downstream pipeline again.
+    The user's selection is propagated into:
 
-    The raw selection is still available at
-    ``st.session_state["client_roles"]`` for UI use (chips, labels,
-    export metadata). Only this helper — the boundary between UI and
-    pipeline — returns an empty list so no agent branches on it.
+    * **Agent 1** (regulatory analysis) — the role-aware interpretation
+      engine emits per-role rationales and scopes obligations to the
+      selected institution type(s).
+    * **Agent 3** (questionnaire generator) — the AI prompt receives
+      "HARD SCOPING RULES" listing the selected role(s) and instructs
+      the LLM to (a) skip requirements that do not apply to any of
+      those roles and (b) frame every question in role-specific
+      language (e.g. "trading desk" vs. "core banking").
+    * **Agent 3 post-processing** (``_apply_role_filter``) — drops
+      questions whose mapped obligations are marked as
+      ``NOT_APPLICABLE`` for every selected role and annotates each
+      kept question with a per-role verdict + rationale.
+    * **Agent 4** (recommendations) — the client profile bundle and
+      role list flow through the orchestrator so the deterministic
+      severity + narrative templates can specialise on institution
+      type.
+
+    An empty selection is treated as "no role scoping" so the pipeline
+    still produces output when the user has not picked anything yet
+    (Agent 1 will fall back to the roles it inferred from the BRD, if
+    any).
     """
-    # Deliberately return an empty list — see docstring.
-    return []
+    raw = st.session_state.get("client_roles") or []
+    return normalize_client_roles(raw)
 
 
 def _current_client_profile() -> Dict[str, List[str]]:
@@ -2998,11 +3247,12 @@ def _render_client_profile_selector() -> None:
 def _render_client_roles_selector() -> None:
     """Client Role setup: the multi-select at the top of Page 1.
 
-    **Product decision (2026-07):** The Client Role selector is now
-    **display-only** — the user picks their institution type(s) so the
-    choice is visible on Page 1 and captured in export metadata, but the
-    pipeline runs **role-agnostic**. See ``_selected_client_roles`` for
-    the boundary function that returns an empty list to downstream agents.
+    **Product decision (2026-07 revised):** The Client Role selector is
+    now **fully wired** into the downstream pipeline again. The user's
+    selection scopes Agent 1's regulatory interpretation, Agent 3's
+    question generation + role filter, and Agent 4's recommendations.
+    See ``_selected_client_roles`` for the boundary function that
+    returns the normalized selection to downstream agents.
     """
     options = list(INSTITUTION_TYPE_NAMES)
     current_raw = st.session_state.get("client_roles") or []
@@ -3031,15 +3281,32 @@ def _render_client_roles_selector() -> None:
         default=current,
         format_func=_fmt,
         help=(
-            "Informational only. Your selection is displayed on this page "
-            "and included in the export metadata, but the downstream "
-            "regulatory analysis, BRD/RTM generation, questionnaire, and "
-            "recommendations run role-agnostic — the same output is "
-            "produced regardless of which institution type(s) you pick."
+            "Scopes the whole pipeline. Every selected institution type "
+            "is passed to Agent 1 (role-aware regulatory interpretation), "
+            "Agent 3 (question generation + role applicability filter — "
+            "questions that do not apply to any selected role are dropped "
+            "and the ones kept are phrased in role-specific language) and "
+            "Agent 4 (recommendations). Pick more than one to run the "
+            "analysis for a mixed-mandate group; leave empty to let the "
+            "engine fall back to the roles it can infer from the BRD."
         ),
         key="client_roles_widget",
     )
     st.session_state["client_roles"] = list(selection)
+
+    # If the user has already generated an analysis / questionnaire in
+    # this session with a DIFFERENT role selection, warn them that they
+    # need to regenerate before the downstream artefacts pick up the
+    # new scope. We only ever surface this hint after the first
+    # analysis lands (``_last_pipeline_client_roles`` is set at that
+    # point) so a fresh session does not get the notice on first pick.
+    previous = st.session_state.get("_last_pipeline_client_roles")
+    if previous is not None and normalize_client_roles(selection) != normalize_client_roles(previous):
+        st.info(
+            "Client role selection changed. Re-run **Generate BRD/FRD** "
+            "and **Generate Questionnaire** so Agent 1, Agent 3 and the "
+            "recommendations pick up the new institution scope."
+        )
 
     if selection:
         # Render a compact per-role summary card so the user knows what
@@ -3118,12 +3385,54 @@ def _render_regulator_selector() -> None:
             "no button click needed.\n"
             "• Each regulator's own site-search is queried first (EBA, ESMA, EIOPA, FCA, …); "
             "a general web search is used only as a fallback.\n"
-            "• Wikipedia, blogs and generic search results are never used."
+            "• Wikipedia, blogs and generic search results are never used.\n"
+            "• Uploading a regulation or BRD document auto-narrows this scope to the "
+            "regulators that publish that regime — click **Reset to ALL regulators** below "
+            "if you want to broaden it back."
         ),
         key="regulator_selection_widget",
     )
     if not st.session_state["regulator_selection"]:
         st.session_state["regulator_selection"] = [_ALL_REGULATOR_CODE]
+
+    # If the uploaded document just auto-narrowed the scope, surface a
+    # compact hint + one-click override. This is the escape hatch for
+    # scenarios like "I uploaded an Indian regulation but I actually
+    # want to sanity-check what European banks are doing about it".
+    auto_scope = st.session_state.get("_auto_scoped_regulators") or {}
+    current_codes = _selected_regulator_codes()
+    if (
+        auto_scope
+        and set(auto_scope.get("codes") or []) == set(current_codes)
+        and current_codes  # never show hint when already ALL
+    ):
+        codes_pretty = ", ".join(auto_scope.get("codes") or [])
+        reg_code = auto_scope.get("regulation") or ""
+        hint_col, btn_col = st.columns([5, 2])
+        with hint_col:
+            st.caption(
+                f"Auto-narrowed to {codes_pretty} based on detected "
+                f"regulation ({reg_code}). Pick additional regulators above, "
+                "or reset to search every approved regulator."
+            )
+        with btn_col:
+            if st.button(
+                "Reset to ALL regulators",
+                key="_reset_regulator_scope_btn",
+                help=(
+                    "Widen the search back to every approved regulator. "
+                    "Useful when you want to compare, e.g., how European "
+                    "supervisors are treating a domestic regulation."
+                ),
+                use_container_width=True,
+            ):
+                st.session_state["regulator_selection"] = [_ALL_REGULATOR_CODE]
+                st.session_state["regulator_selection_widget"] = [_ALL_REGULATOR_CODE]
+                st.session_state.pop("_auto_scoped_regulators", None)
+                # Force the intel fetch to re-run under the widened scope.
+                st.session_state["_reg_intel_last_fingerprint"] = None
+                st.session_state["regulatory_intelligence_package"] = None
+                st.rerun()
 
 
 def _auto_fetch_regulatory_intelligence(regulation: str) -> None:
@@ -3132,20 +3441,37 @@ def _auto_fetch_regulatory_intelligence(regulation: str) -> None:
     Runs when the selection (or the regulation code) has changed since the
     last fetch. Silent about failure modes — only surfaces a compact result
     line. All heavy diagnostics have been dropped so the page stays clean.
+
+    Reads ``st.session_state["_reg_intel_exhaustive"]`` — set to
+    ``True`` by every upload path (:func:`_apply_detected_regulation_from_upload`)
+    — to swap in the exhaustive Stage 1 sweep: multiple native query
+    variants per regulator, wider DDGS templates, and relaxed
+    early-stop caps so the "Retrieved Regulator Sources" table
+    shows every publication the approved regulators expose for the
+    detected regulation instead of only the top handful. The flag is
+    baked into the fingerprint so a later re-selection with the flag
+    still set re-runs exhaustively, and a live-preview pass never
+    poisons an exhaustive slot in the Stage 1 cache.
     """
     current_selection = _selected_regulator_codes()
-    fingerprint = (regulation, tuple(current_selection))
+    exhaustive = bool(st.session_state.get("_reg_intel_exhaustive"))
+    fingerprint = (regulation, tuple(current_selection), exhaustive)
     last_fingerprint = st.session_state.get("_reg_intel_last_fingerprint")
     if fingerprint == last_fingerprint:
         return
 
-    with st.spinner("Processing..."):
+    spinner_msg = (
+        "Sweeping every approved regulator domain for publications tied "
+        "to the uploaded regulation..." if exhaustive else "Processing..."
+    )
+    with st.spinner(spinner_msg):
         try:
             package = gather_regulatory_intelligence(
                 regulation,
                 regulator_selection=current_selection,
                 consulting_selection=None,
                 include_consulting=False,
+                exhaustive=exhaustive,
                 status=lambda _msg: None,
             )
         except Exception:
@@ -4166,6 +4492,14 @@ def _restore_assessment_from_db(assessment_id: int) -> bool:
             pass
     st.session_state["assessment_state"] = state
     if rec.get("evaluation"):
+        # Persisted snapshots produced before the area-canonicalisation
+        # fix kept compound labels like ``"Risk & Controls framework /
+        # Cyber Security"`` in the raw dict. Fold them now so a legacy
+        # snapshot renders one card per top-level capability, matching
+        # what a fresh scoring pass would emit. ``canonicalise_evaluation_dict``
+        # is idempotent — a snapshot that was already canonical when
+        # written comes back unchanged.
+        canonicalise_evaluation_dict(rec["evaluation"])
         st.session_state["evaluation"] = rec["evaluation"]
         st.session_state["scoring_result"] = ScoringResult(evaluation=rec["evaluation"])
     if rec.get("recommendations"):
@@ -4324,6 +4658,16 @@ def _render_optional_regulation_card() -> None:
         file_id = getattr(reg_file, "file_id", None) or f"{reg_file.name}:{reg_file.size}"
         if st.session_state.get("_last_reg_upload_id") != file_id:
             saved = save_upload(reg_file, UPLOAD_DIR)
+            # PRIORITY 1: detect the regulation directly from the
+            # uploaded document text BEFORE we save the DB row, so the
+            # DB row is stamped with the correct regulation code
+            # (previously the row was always stamped with the historic
+            # ``"DORA"`` default from session_state, which then leaked
+            # into every downstream export).
+            with st.spinner("Detecting regulation from uploaded document..."):
+                _apply_detected_regulation_from_upload(
+                    saved, kind="regulation", original_name=reg_file.name,
+                )
             doc_id = db.save_document(
                 name=reg_file.name, kind="regulation", path=str(saved),
                 mime=getattr(reg_file, "type", None),
@@ -4333,10 +4677,101 @@ def _render_optional_regulation_card() -> None:
             st.session_state["regulation_doc_id"] = doc_id
             st.session_state["regulation_doc_name"] = reg_file.name
             st.session_state["_last_reg_upload_id"] = file_id
+            # Force a rerun so the "Regulation Code" text_input and
+            # the regulator-source panel pick up the newly detected
+            # value on their next render (text_input reads its default
+            # from ``st.session_state["regulation"]`` at widget-render
+            # time, so a rerun is the cleanest way to refresh it).
+            st.rerun()
+
+    # Render the "Detected: XYZ" chip whenever a regulation was
+    # detected on the current session. Kept OUTSIDE the ``if
+    # reg_file is not None:`` block so the chip survives across
+    # reruns without depending on the file lingering in the widget.
+    detected = st.session_state.get("_detected_regulation")
+    if isinstance(detected, DetectedRegulation) and detected.is_known:
+        method_label = "keyword match" if detected.method == "keyword" else (
+            "LLM classification" if detected.method == "llm" else "detection"
+        )
+        confidence_pct = int(round(detected.confidence * 100))
+        chip_class = "opt-reg-detected-strong" if detected.is_confident else "opt-reg-detected-weak"
+        st.markdown(
+            '<div class="opt-reg-detected {cls}">'
+            'Detected regulation: <strong>{code}</strong> '
+            '<span class="opt-reg-detected-meta">({pct}% confidence via {method})</span>'
+            '</div>'.format(
+                cls=chip_class,
+                code=html.escape(detected.code),
+                pct=confidence_pct,
+                method=html.escape(method_label),
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def _run_deferred_regulation_detection() -> None:
+    """Detect regulation for previously-uploaded documents once per session.
+
+    Guards Priority 1 for two cases the fresh-upload wiring cannot
+    handle on its own:
+
+    * The document was uploaded in a prior session (before the
+      detector was wired in). ``session_state`` still carries the
+      historic ``"DORA"`` default and no ``_detected_regulation``
+      chip is stashed, so the intel block prints "ON for DORA" even
+      though the attached document is a totally different regulation.
+    * The user manually cleared the ``Regulation Code`` text_input
+      and the "or DORA" fallback in the intel block is now masking
+      the real regulation the uploaded doc is about.
+
+    The helper runs at most ONCE per session (idempotent via the
+    ``_detected_regulation`` marker) and prefers ``regulation_doc_id``
+    over ``brd_doc_id`` because the regulation document is the more
+    authoritative source. Silent on failure — a document we cannot
+    open leaves session state untouched.
+    """
+    if st.session_state.get("_detected_regulation"):
+        return
+
+    stale_reg_id = st.session_state.get("regulation_doc_id")
+    stale_brd_id = st.session_state.get("brd_doc_id")
+    stale_path: Optional[Path] = None
+    stale_kind: str = ""
+    stale_name: Optional[str] = None
+
+    if stale_reg_id:
+        rec = db.get_document(int(stale_reg_id))
+        if rec and Path(rec["path"]).exists():
+            stale_path = Path(rec["path"])
+            stale_kind = "regulation (deferred)"
+            stale_name = rec.get("name")
+    elif stale_brd_id:
+        rec = db.get_document(int(stale_brd_id))
+        if rec and Path(rec["path"]).exists():
+            stale_path = Path(rec["path"])
+            stale_kind = "brd/frd (deferred)"
+            stale_name = rec.get("name")
+
+    if stale_path is None:
+        return
+
+    with st.spinner(
+        f"Detecting regulation from previously uploaded {stale_kind}..."
+    ):
+        _apply_detected_regulation_from_upload(
+            stale_path, kind=stale_kind, original_name=stale_name,
+        )
 
 
 def render_setup_page() -> None:
     st.subheader("1. Setup")
+
+    # Deferred regulation detection safety-net — runs BEFORE any
+    # widget that depends on ``st.session_state["regulation"]`` so
+    # the "Regulation Code" text_input and the intel block's "ON for
+    # X" banner both pick up the detected label on the same rerun
+    # rather than requiring an extra round-trip.
+    _run_deferred_regulation_detection()
 
     # STEP 1 (before anything else): Client Role-Aware Regulatory
     # Interpretation. The selection here is a first-class input for every
@@ -4344,11 +4779,22 @@ def render_setup_page() -> None:
     # selected institution type(s), not against a generic FS baseline.
     _render_client_roles_selector()
 
-    # STEP 1b (Client Profile keyword multi-selects) has been removed from
-    # the Setup page. The underlying ``client_profile`` session_state
-    # bundle still flows through Agent 1 / BRD / RTM / questionnaire /
-    # recommendations — it just defaults to an empty keyword bag until
-    # we surface the picker again on another page.
+    # STEP 1b: Client Profile keyword multi-selects. Six dropdowns
+    # (Organization Profile, Business Lines, Products in Scope,
+    # Countries of Operation, Legal Entities, Vendor & Third Parties)
+    # that let the user tag the client the way you would tag a CV.
+    # Every keyword flows into Agent 1's regulatory interpretation,
+    # the BRD/FRD prompt, the RTM, the questionnaire and Agent 4's
+    # recommendations — so the analysis is scoped to the specific
+    # client rather than generic FS baseline. Widgets are wrapped in
+    # a collapsed expander so the picker does not dominate the top of
+    # the page; the underlying ``client_profile`` session_state bundle
+    # is populated regardless of whether the expander is opened.
+    with st.expander(
+        "Step 1b · Client Profile Keywords (optional but recommended)",
+        expanded=is_client_profile_populated(_current_client_profile()),
+    ):
+        _render_client_profile_selector()
 
     left, right = st.columns([2, 1], gap="large")
 
@@ -4402,6 +4848,19 @@ def render_setup_page() -> None:
                 )
                 if st.session_state.get("_last_brd_upload_id") != brd_file_id:
                     target_path = save_upload(brd_file, UPLOAD_DIR)
+                    # PRIORITY 1: detect the regulation from the
+                    # uploaded BRD content BEFORE the DB row is saved,
+                    # so the row's ``regulation`` column reflects the
+                    # regulation the user actually uploaded rather than
+                    # the historic ``"DORA"`` default. The detected
+                    # value flows through to Agent 1's regulator
+                    # search, native adapters, prompt hardening and
+                    # every export downstream.
+                    with st.spinner("Detecting regulation from uploaded BRD/FRD..."):
+                        _apply_detected_regulation_from_upload(
+                            target_path, kind="brd/frd",
+                            original_name=brd_file.name,
+                        )
                     doc_id = db.save_document(
                         name=brd_file.name, kind="brd", path=str(target_path),
                         mime=getattr(brd_file, "type", None),
@@ -4412,12 +4871,22 @@ def render_setup_page() -> None:
                     st.session_state["brd_source"] = "uploaded"
                     st.session_state["_last_brd_upload_id"] = brd_file_id
                     st.success(f"Saved BRD `{brd_file.name}` (ID = {doc_id}).")
+                    # Refresh so the "Regulation Code" text_input picks
+                    # up the newly detected regulation immediately.
+                    st.rerun()
             elif use_sample:
                 sample = SAMPLE_DIR / "DORA_Tier2_Detailed_DetailedBRDFRD.docx"
                 if not sample.exists():
                     st.error("Bundled sample BRD is missing. Drop a DOCX into `sample_data/`.")
                 else:
                     target_path = sample
+                    # Detect from the bundled sample as well - the
+                    # sample happens to be DORA today but the detection
+                    # path stays generic so a future sample swap does
+                    # not require a code change.
+                    _apply_detected_regulation_from_upload(
+                        target_path, kind="brd/frd", original_name=sample.name,
+                    )
                     doc_id = db.save_document(
                         name=sample.name, kind="brd", path=str(sample),
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -4445,6 +4914,28 @@ def render_setup_page() -> None:
     has_brd = bool(st.session_state.get("brd_doc_id"))
     has_reg = bool(st.session_state.get("regulation_doc_id"))
     has_quest = bool(st.session_state.get("questionnaire"))
+
+    # PRIORITY 2: retrieve the right + latest sources for uploads too.
+    # When the user is in "Use existing BRD/FRD" mode (which is the
+    # historic gap: no live search runs in that mode) we still want to
+    # surface authoritative, current publications matching the
+    # regulation the app just detected from the uploaded document.
+    # Running the same auto-fetch that "Generate" mode uses populates
+    # ``regulatory_intelligence_package`` so downstream stages
+    # (questionnaire enhancer, gap analysis, exports) inherit the same
+    # source list a "Generate" run would.
+    #
+    # The fingerprint cache inside :func:`_auto_fetch_regulatory_intelligence`
+    # keeps this cheap: after the first fetch per (regulation,
+    # regulator selection) tuple the call is a no-op.
+    if (
+        mode == "Use existing BRD/FRD"
+        and (has_brd or has_reg)
+        and is_regulatory_search_enabled()
+    ):
+        regulation_for_fetch = str(st.session_state.get("regulation") or "").strip()
+        if regulation_for_fetch:
+            _auto_fetch_regulatory_intelligence(regulation_for_fetch)
 
     if mode == "Generate BRD/FRD from regulation":
         setup_ready = True
@@ -4580,6 +5071,12 @@ def _run_agent1_and_agent2_with_status() -> None:
             len(getattr(analysis, "requirements", []) or []),
         )
         st.session_state["analysis"] = analysis
+        # Remember which client role selection this analysis was built
+        # for so the Client Role selector on Page 1 can warn the user if
+        # they change the selection without re-running the pipeline.
+        st.session_state["_last_pipeline_client_roles"] = list(
+            _selected_client_roles()
+        )
 
         # Impact + Confidence assessments are intentionally DEFERRED here.
         # They consume 2 additional LLM round-trips (~22s in parallel)
@@ -4673,6 +5170,19 @@ def _parse_uploaded_brd_requirements() -> Optional[int]:
     if not path.exists():
         st.error(f"Saved BRD file is missing on disk: {path}")
         return None
+
+    # Safety-net: if this BRD was saved in a prior session (before the
+    # detector was wired into the upload widget) it may still be
+    # associated with the historic ``"DORA"`` label. Re-run detection
+    # here so the questionnaire pipeline sees the regulation the
+    # document is actually about. Detection is idempotent — when the
+    # session_state label already matches the document's content the
+    # helper is a no-op.
+    if not st.session_state.get("_detected_regulation"):
+        _apply_detected_regulation_from_upload(
+            path, kind="brd/frd (deferred)", original_name=rec.get("name"),
+        )
+
     from services.questionnaire_generator import (
         derive_impact_pairs,
         read_docx_requirements,
@@ -7444,6 +7954,13 @@ def render_dashboard_page() -> None:
     answered = int(result.get("answered_count") or 0)
     unanswered = int(result.get("unanswered_count") or 0)
     total = answered + unanswered
+    # Defensive canonicalisation: if the evaluation dict was produced or
+    # loaded before the area-rollup fix landed, this collapses any lingering
+    # ``"Parent / Child"`` labels into their top-level bucket. It is a
+    # no-op for dicts that are already canonical, so calling it here on
+    # every render is safe and avoids stale-cache surprises on the
+    # dashboard. See ``services.scoring_engine.canonicalise_evaluation_dict``.
+    canonicalise_evaluation_dict(result)
     pair_scores: Dict[Any, float] = result.get("pair_scores") or {}
     area_summary: Dict[str, Dict[str, Any]] = result.get("area_summary") or {}
     function_summary: Dict[str, Dict[str, Any]] = result.get("function_summary") or {}
@@ -7483,9 +8000,10 @@ def render_dashboard_page() -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "Every impacted area ranked by its current readiness (higher is "
-        "better). Colour follows the standard Critical / At Risk / Watch / "
-        "Ready ladder."
+        "**Readiness** measures *how well the organisation is currently "
+        "performing* on this area, computed from the questionnaire answers "
+        "(higher is better). Bands: Critical (< 25%), At Risk (25 - 50%), "
+        "Watch (50 - 75%), Ready (\u2265 75%)."
     )
     _render_dashboard_readiness_cards(area_summary)
 
@@ -7494,11 +8012,14 @@ def render_dashboard_page() -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "Impact severity uses the impact ladder (higher impact = worse): "
-        "Critical (\u2265 75%), At Risk (50 - 75%), "
-        "Watch (25 - 50%), Ready (< 25%). "
-        "Readiness scores use the mirror ladder (higher readiness = better) "
-        "so the two axes always agree."
+        "**Impact** measures *how much regulatory pressure* this area is "
+        "under — a log-saturation of the number of obligations touching "
+        "the area (higher is worse). Bands: Critical (\u2265 75%), At Risk "
+        "(50 - 75%), Watch (25 - 50%), Ready (< 25%). "
+        "Impact and Readiness are **independent axes**, so an area can be "
+        "*Critical impact + Ready readiness* (heavily-regulated but "
+        "well-controlled — keep close watch) or *Low impact + Low "
+        "readiness* (lightly-regulated but under-answered — tactical fix)."
     )
     _render_dashboard_impact_cards(area_summary)
 
@@ -7555,6 +8076,7 @@ def render_dashboard_page() -> None:
                 branch_log=list(rec_state.branch_log),
                 analysis=st.session_state.get("analysis"),
                 client_roles=_selected_client_roles(),
+                weighted_impact=st.session_state.get("weighted_impact"),
             )
             if recommendation_result.used_genai:
                 st.toast("Recommendations enriched via GenAI.")
@@ -7587,11 +8109,28 @@ def _autorun_recommendations_if_needed(
         return
     result = scoring.evaluation or {}
     genai_on = bool(st.session_state.get("genai_available"))
+    weighted_impact = st.session_state.get("weighted_impact")
+    # Fold the top-3 highest-impact areas into the fingerprint. If the
+    # dashboard's Impact panel starts flagging new Critical / At risk
+    # areas (independent of any readiness change), we want Agent 4 to
+    # re-run so the recommendations pipeline picks them up. Without
+    # this, an impact-only signal change would leave the "No Critical
+    # or At Risk areas" caption stale.
+    impact_fp: Tuple[Tuple[str, float], ...] = tuple()
+    if weighted_impact is not None:
+        try:
+            impact_fp = tuple(
+                (str(row.area).lower(), round(float(row.impact_score or 0.0), 1))
+                for row in list(getattr(weighted_impact, "priority_areas", []) or [])[:3]
+            )
+        except Exception:
+            impact_fp = tuple()
     fingerprint = (
         round(float(result.get("compliance_score_pct") or 0.0), 1),
         int(result.get("answered_count") or 0),
         len(result.get("pair_scores") or {}),
         genai_on,
+        impact_fp,
     )
     if st.session_state.get("dashboard_recs_fingerprint") == fingerprint:
         return
@@ -7611,6 +8150,7 @@ def _autorun_recommendations_if_needed(
                 branch_log=list(rec_state.branch_log),
                 analysis=st.session_state.get("analysis"),
                 client_roles=_selected_client_roles(),
+                weighted_impact=st.session_state.get("weighted_impact"),
             )
         st.session_state["recommendations"] = recommendation_result.recommendations
         st.session_state["rich_recommendations"] = recommendation_result.rich_recommendations
@@ -7763,10 +8303,42 @@ def _render_rich_recommendations(recs: List[Any]) -> None:
     ]
 
     if not recs_filtered:
-        st.caption(
-            "No Critical or At Risk areas — no remediation recommendations "
-            "to surface for this run."
-        )
+        # If the empty state fires while the Impact panel is showing
+        # Critical / At Risk cards, the recommendations pipeline and
+        # the impact model are out of sync. This can happen when the
+        # cached recommendation batch was generated *before* the
+        # ``weighted_impact`` signal was wired in (a stale
+        # ``rich_recommendations`` snapshot in session state). Surface
+        # a diagnostic + one-click regenerate so the user can heal it.
+        wi = st.session_state.get("weighted_impact")
+        stale_impact_recs = 0
+        if wi is not None:
+            try:
+                for row in getattr(wi, "priority_areas", []) or []:
+                    if float(getattr(row, "impact_score", 0.0) or 0.0) >= 50.0:
+                        stale_impact_recs += 1
+            except Exception:
+                stale_impact_recs = 0
+        if stale_impact_recs > 0:
+            st.warning(
+                f"The Impact Assessment cards above show **{stale_impact_recs} "
+                "Critical / At Risk area(s)** but the recommendation batch "
+                "cached in this session was produced before the impact "
+                "signal was fed to Agent 4. Click **Regenerate "
+                "recommendations** (in *Advanced controls* below) to "
+                "refresh the list."
+            )
+            # Force autorun on the next rerun by clearing the fingerprint.
+            st.session_state.pop("dashboard_recs_fingerprint", None)
+        else:
+            st.caption(
+                "No Critical or At Risk recommendations for this run. A "
+                "recommendation is surfaced only when the area's readiness "
+                "**and/or** its weighted impact score cross the Critical or "
+                "At Risk band. Impact-only spikes without a matching "
+                "readiness gap will still list under the Impact Assessment "
+                "cards above."
+            )
         return
 
     recs_sorted = sorted(
@@ -8564,6 +9136,48 @@ def _render_dashboard_hero(
     st.markdown(html_out, unsafe_allow_html=True)
 
 
+def _area_sub_classifications() -> Dict[str, List[str]]:
+    """Return the ``{canonical_area: [sub_classification, ...]}`` map that
+    the weighted-impact roll-up produced for the current session, if any.
+
+    Reads ``st.session_state["weighted_impact"]`` — populated by
+    :func:`services.impact_score.compute_weighted_impact`. Returns an
+    empty dict when the impact model has not been computed yet, so
+    callers can treat the result as best-effort documentation and skip
+    the tooltip rendering when nothing was folded.
+    """
+    wi = st.session_state.get("weighted_impact")
+    if wi is None:
+        return {}
+    subs = getattr(wi, "area_sub_classifications", None) or {}
+    return {
+        str(k): [str(v) for v in (vals or [])]
+        for k, vals in subs.items()
+    }
+
+
+def _area_tooltip_attr(area_name: str, subs_map: Dict[str, List[str]]) -> str:
+    """Build the ``title="..."`` fragment for a dashboard card.
+
+    The tooltip lists the raw sub-classifications that were rolled up
+    into ``area_name`` so a reviewer who sees the aggregated card can
+    still see what specific labels the LLM emitted (e.g. Cyber Security
+    / Third-Party / …). Returns an empty string when no sub-labels
+    exist, in which case the caller should omit the attribute
+    entirely rather than emit an empty ``title=""``.
+    """
+    subs = subs_map.get(area_name) or []
+    if not subs:
+        return ""
+    joined = ", ".join(subs[:12])
+    if len(subs) > 12:
+        joined += f", … (+{len(subs) - 12} more)"
+    return html.escape(
+        f"Includes sub-classifications: {joined}",
+        quote=True,
+    )
+
+
 def _render_dashboard_readiness_cards(area_summary: Dict[str, Dict[str, Any]]) -> None:
     """Render the Readiness Overview By Area as coloured progress cards.
 
@@ -8587,12 +9201,21 @@ def _render_dashboard_readiness_cards(area_summary: Dict[str, Dict[str, Any]]) -
         rows.append((str(name), comp, status, qcount))
     rows.sort(key=lambda r: r[1])
 
+    subs_map = _area_sub_classifications()
+
     cards: List[str] = ['<div class="dash-cards readiness-grid">']
     for name, comp, status, qcount in rows:
         css = _severity_label_from_status(status) or _severity_class(comp)
+        tooltip = _area_tooltip_attr(name, subs_map)
+        title_attr = f' title="{tooltip}"' if tooltip else ""
+        chip = (
+            f' <span class="dash-sub-chip" title="{tooltip}">+{len(subs_map[name])}</span>'
+            if tooltip and subs_map.get(name)
+            else ""
+        )
         cards.append(
-            f'<div class="dash-card {css}">'
-            f'<div class="dash-card-title">{html.escape(name)}</div>'
+            f'<div class="dash-card {css}"{title_attr}>'
+            f'<div class="dash-card-title">{html.escape(name)}{chip}</div>'
             f'<div class="dash-card-meta">'
             f'<span class="dash-pill {css}">{html.escape(status)}</span> '
             f'&nbsp;<b>{comp:.1f}%</b> readiness &nbsp;\u00b7&nbsp; '
@@ -8646,12 +9269,26 @@ def _render_dashboard_impact_cards(area_summary: Dict[str, Dict[str, Any]]) -> N
         rows.append((str(name), comp, impact, status))
     rows.sort(key=lambda r: -r[2])
 
+    subs_map = _area_sub_classifications()
+
     cards: List[str] = ['<div class="dash-cards impact-grid">']
     for name, readiness, impact, status in rows:
         label, css = _impact_severity_from_score(impact)
+        tooltip = _area_tooltip_attr(name, subs_map)
+        title_attr = f' title="{tooltip}"' if tooltip else ""
+        # Small chip next to the title (e.g. "+3") that carries the
+        # same tooltip on hover — useful on the impact panel because
+        # the counter tells the reviewer at a glance that the card
+        # rolls up multiple sub-classifications. Chip is omitted when
+        # nothing was folded.
+        chip = (
+            f' <span class="dash-sub-chip" title="{tooltip}">+{len(subs_map[name])}</span>'
+            if tooltip and subs_map.get(name)
+            else ""
+        )
         cards.append(
-            f'<div class="dash-card {css}">'
-            f'<div class="dash-card-title">{html.escape(name)}</div>'
+            f'<div class="dash-card {css}"{title_attr}>'
+            f'<div class="dash-card-title">{html.escape(name)}{chip}</div>'
             f'<div class="dash-card-meta">'
             f'<span class="dash-pill {css}">{label}</span> '
             f'&nbsp;<b>{impact:.1f}%</b> impact'

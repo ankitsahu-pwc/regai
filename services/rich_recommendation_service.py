@@ -1086,6 +1086,7 @@ def _deterministic_rich_recommendations(
     obligations_by_area: Optional[Mapping[str, List[str]]] = None,
     impact: Optional[ImpactAssessment] = None,
     readiness: Optional[ReadinessAssessment] = None,
+    weighted_impact: Optional[Any] = None,
 ) -> List[RichRecommendation]:
     """Compose consulting-grade recommendations without GenAI.
 
@@ -1108,6 +1109,49 @@ def _deterministic_rich_recommendations(
     obligations_by_area = obligations_by_area or {}
     results: List[RichRecommendation] = []
 
+    # Build a fast area → impact_score lookup from the weighted impact
+    # result (the same source the dashboard's Impact Assessment cards
+    # use). Without this the recommendation pipeline could only see the
+    # older ``ImpactAssessment`` dimensions, so an area that showed
+    # Critical / 100 % impact on the dashboard silently produced no
+    # recommendation whenever its readiness happened to be high. Lookup
+    # is case-insensitive so it matches ``priority_areas`` that were
+    # produced from LLM-canonicalised labels.
+    weighted_impact_by_area: Dict[str, float] = {}
+    if weighted_impact is not None:
+        try:
+            for row in getattr(weighted_impact, "priority_areas", []) or []:
+                key = str(getattr(row, "area", "")).strip().lower()
+                if key:
+                    weighted_impact_by_area[key] = float(
+                        getattr(row, "impact_score", 0.0) or 0.0
+                    )
+        except Exception:
+            logger.exception(
+                "weighted_impact.priority_areas unreadable — falling back to "
+                "legacy ImpactAssessment for severity resolution."
+            )
+            weighted_impact_by_area = {}
+
+    def _impact_severity_from_weighted(area_name: str) -> str:
+        """Return a severity label (``"critical"`` / ``"high"`` / ``""``)
+        derived from the weighted-impact score of ``area_name``, if any.
+        Bands mirror ``_impact_severity_from_score`` on the dashboard so
+        the two panels agree on which areas count as Critical / At risk.
+        """
+        val = weighted_impact_by_area.get(str(area_name or "").strip().lower())
+        if val is None:
+            return ""
+        if val >= 75.0:
+            return "critical"
+        if val >= 50.0:
+            # ``_priority_from_readiness_impact`` treats ``"high"`` as
+            # At risk, which matches the dashboard's amber / risk band.
+            return "high"
+        if val >= 25.0:
+            return "medium"
+        return ""
+
     sorted_areas = sorted(
         area_summary.items(),
         key=lambda kv: float(kv[1].get("Compliance %") or 0.0),
@@ -1118,8 +1162,13 @@ def _deterministic_rich_recommendations(
     counter = 1
     for area_idx, (area, summary) in enumerate(sorted_areas):
         readiness_pct = float(summary.get("Compliance %") or 0.0)
-        impact_severity_label = ""
-        if impact:
+        # Prefer the weighted-impact severity (same signal as the
+        # dashboard Impact Cards). Fall back to the older
+        # ``ImpactAssessment`` when the caller has not supplied a
+        # weighted-impact result yet — this preserves behaviour for
+        # older code paths / tests that only wire ``impact``.
+        impact_severity_label = _impact_severity_from_weighted(area)
+        if not impact_severity_label and impact:
             for dim in impact.dimensions():
                 if any(
                     area.lower() in it.lower() or it.lower() in area.lower()
@@ -1335,6 +1384,7 @@ def build_rich_recommendations(
     package: Mapping[str, Any],
     impact: Optional[ImpactAssessment] = None,
     readiness: Optional[ReadinessAssessment] = None,
+    weighted_impact: Optional[Any] = None,
     client: Optional[Any] = None,
     enrich_with_genai: bool = True,
 ) -> List[RichRecommendation]:
@@ -1371,6 +1421,7 @@ def build_rich_recommendations(
         obligations_by_area=obligations_by_area,
         impact=impact,
         readiness=readiness,
+        weighted_impact=weighted_impact,
     )
 
     if not enrich_with_genai or client is None:

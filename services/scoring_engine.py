@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 from .ai_branch_generator import LLMInvoker, generate_option_followups
 from .branch_registry import lookup_branch
+from .impact_score import area_bucket_key, canonicalise_area
 from .questionnaire_generator import (
     ANSWER_SCORES,
     Question,
@@ -965,6 +966,11 @@ def evaluate(
     area_num: Dict[str, float] = defaultdict(float)
     area_den: Dict[str, float] = defaultdict(float)
     area_counts: Dict[str, int] = defaultdict(int)
+    # ``area_bucket_key`` → first-seen ``canonicalise_area`` display
+    # string. Used to keep the aggregation key stable when the LLM
+    # emits the same top-level capability with slightly different
+    # casing / punctuation on different obligations.
+    _area_bucket_display: Dict[str, str] = {}
     func_num: Dict[str, float] = defaultdict(float)
     func_den: Dict[str, float] = defaultdict(float)
     func_counts: Dict[str, int] = defaultdict(int)
@@ -1023,7 +1029,23 @@ def evaluate(
         answered_count += 1
         total_num += score * weight
         total_den += 100 * weight
-        area = q.get("area")
+        # Canonicalise the ``area`` label so LLM-emitted compound tags
+        # like ``"Risk & Controls framework / Cyber Security"`` roll up
+        # into their top-level parent (``"Risk & Controls framework"``).
+        # Without this the dashboard shows two peer cards for the same
+        # underlying capability, which produced the "Critical / 100%"
+        # vs "Ready / 0%" contradiction in the impact panel. Bucketing
+        # is case-insensitive; the first-seen ``canonicalise_area``
+        # spelling is used as the display key so the UI reads naturally.
+        # When the question carries no area (``None`` / empty), preserve
+        # the original ``None`` key so downstream rollups behave exactly
+        # as before for that edge case.
+        raw_area = q.get("area")
+        bkey = area_bucket_key(raw_area)
+        if bkey:
+            area = _area_bucket_display.setdefault(bkey, canonicalise_area(raw_area))
+        else:
+            area = raw_area
         function = q.get("function")
         area_num[area] += score * weight
         area_den[area] += 100 * weight
@@ -1100,6 +1122,168 @@ def evaluate(
         "area_summary": area_summary,
         "function_summary": function_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Rehydration canonicaliser
+# ---------------------------------------------------------------------------
+#
+# When an old assessment is loaded from the SQLite snapshot, its persisted
+# ``evaluation`` dict was produced by a previous version of :func:`evaluate`
+# that did **not** roll compound ``impacted_area`` labels
+# (e.g. ``"Risk & Controls framework / Cyber Security"``) into their
+# top-level bucket. Reusing that dict verbatim would leak the old
+# per-sub-classification rows onto the dashboard even though the underlying
+# scoring logic has since been fixed.
+#
+# ``canonicalise_evaluation_dict`` folds the four area-keyed sections of
+# the persisted dict (``area_scores``, ``area_summary``, ``pair_scores``,
+# ``requirement_scores`` is unaffected) into canonical buckets in-place.
+# It is idempotent so a freshly-scored dict (already canonical) survives
+# the call unchanged, letting the caller apply it unconditionally.
+
+
+def canonicalise_evaluation_dict(evaluation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Fold compound area labels in a persisted evaluation dict.
+
+    ``evaluation`` is mutated *and* returned. Passing ``None`` returns
+    ``None`` unchanged. Idempotent: an already-canonical dict comes back
+    untouched.
+
+    Sections handled:
+
+    * ``area_scores``     — signal-weighted average of the folded rows.
+    * ``area_summary``    — Compliance %, CXO status and Questions scored
+                            are re-derived from the folded average and
+                            summed question count.
+    * ``pair_scores``     — the *area* half of each ``(area, function)``
+                            tuple is folded; function stays as-is.
+
+    Weighting for the averaging step reads ``Questions scored`` off the
+    original ``area_summary`` entry when present. When it is missing (e.g.
+    an older snapshot that only carried ``area_scores``), every row gets
+    weight 1 so behaviour degrades gracefully.
+    """
+    if not isinstance(evaluation, dict):
+        return evaluation
+
+    area_summary = evaluation.get("area_summary")
+    if not isinstance(area_summary, dict):
+        area_summary = None
+    area_scores = evaluation.get("area_scores")
+    if not isinstance(area_scores, dict):
+        area_scores = None
+    pair_scores = evaluation.get("pair_scores")
+    if not isinstance(pair_scores, dict):
+        pair_scores = None
+
+    display_map: Dict[str, str] = {}
+
+    def _bucket(raw: Any) -> Tuple[str, str]:
+        bkey = area_bucket_key(raw)
+        if not bkey:
+            return ("", str(raw or ""))
+        disp = display_map.setdefault(bkey, canonicalise_area(raw))
+        return (bkey, disp)
+
+    if area_summary:
+        merged: Dict[str, Dict[str, Any]] = {}
+        weighted_score: Dict[str, float] = {}
+        weight_total: Dict[str, float] = {}
+        for raw_key, summary in area_summary.items():
+            bkey, disp = _bucket(raw_key)
+            if not bkey:
+                merged[str(raw_key)] = summary
+                continue
+            entry = merged.get(disp)
+            try:
+                score = float(
+                    summary.get("compliance_score_pct")
+                    or summary.get("Compliance %")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                score = 0.0
+            try:
+                qcount = int(
+                    summary.get("questions_scored")
+                    or summary.get("Questions scored")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                qcount = 0
+            w = max(1, qcount)
+            weighted_score[disp] = weighted_score.get(disp, 0.0) + score * w
+            weight_total[disp] = weight_total.get(disp, 0.0) + w
+            if entry is None:
+                merged[disp] = dict(summary)
+            else:
+                entry["Questions scored"] = int(entry.get("Questions scored", 0) or 0) + qcount
+                # Recomputed below from weighted average; drop stale fields.
+                entry.pop("Compliance %", None)
+                entry.pop("compliance_score_pct", None)
+                entry.pop("CXO status", None)
+                entry.pop("Recommended executive action", None)
+        for name, entry in merged.items():
+            total_w = weight_total.get(name)
+            if total_w:
+                avg = weighted_score[name] / total_w
+                entry["Compliance %"] = round(avg, 1)
+                try:
+                    status_label, action_label = cxo_status(avg)
+                    entry.setdefault("CXO status", status_label)
+                    entry.setdefault("Recommended executive action", action_label)
+                except Exception:
+                    pass
+        evaluation["area_summary"] = merged
+
+    if area_scores:
+        num_by: Dict[str, float] = {}
+        den_by: Dict[str, float] = {}
+        summary_after = evaluation.get("area_summary") or {}
+        for raw_key, val in area_scores.items():
+            bkey, disp = _bucket(raw_key)
+            if not bkey:
+                continue
+            try:
+                s = float(val)
+            except (TypeError, ValueError):
+                continue
+            w_entry = summary_after.get(disp) or {}
+            try:
+                w = float(w_entry.get("Questions scored") or 1)
+            except (TypeError, ValueError):
+                w = 1.0
+            w = max(1.0, w)
+            num_by[disp] = num_by.get(disp, 0.0) + s * w
+            den_by[disp] = den_by.get(disp, 0.0) + w
+        evaluation["area_scores"] = {
+            k: round(num_by[k] / den_by[k], 1) for k in num_by if den_by[k]
+        }
+
+    if pair_scores:
+        num_pair: Dict[Tuple[str, str], float] = {}
+        cnt_pair: Dict[Tuple[str, str], int] = {}
+        for raw_key, val in pair_scores.items():
+            try:
+                raw_area, func = raw_key
+            except (TypeError, ValueError):
+                continue
+            bkey, disp = _bucket(raw_area)
+            if not bkey:
+                continue
+            try:
+                s = float(val)
+            except (TypeError, ValueError):
+                continue
+            key = (disp, str(func or "").strip())
+            num_pair[key] = num_pair.get(key, 0.0) + s
+            cnt_pair[key] = cnt_pair.get(key, 0) + 1
+        evaluation["pair_scores"] = {
+            k: round(num_pair[k] / cnt_pair[k], 1) for k in num_pair
+        }
+
+    return evaluation
 
 
 # ---------------------------------------------------------------------------

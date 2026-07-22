@@ -210,18 +210,24 @@ class RegulatoryWorkflowOrchestrator:
         regulator_selection: Optional[Sequence[str]] = None,
         consulting_selection: Optional[Sequence[str]] = None,
         include_consulting: bool = True,
+        exhaustive: bool = False,
         status: StatusCallback = _noop,
     ) -> RegulatoryIntelligencePackage:
         """Run the hierarchical regulator + consulting search.
 
         Exposed on the orchestrator so the UI can preview sources on Page 1
         without going through Agent 1's full BRD generation pipeline.
+
+        ``exhaustive=True`` forwards to Stage 1 to enable the wide
+        multi-variant sweep used after a regulation document has been
+        uploaded.
         """
         return gather_regulatory_intelligence(
             regulation,
             regulator_selection=regulator_selection,
             consulting_selection=consulting_selection,
             include_consulting=include_consulting,
+            exhaustive=exhaustive,
             status=status,
         )
 
@@ -415,6 +421,7 @@ class RegulatoryWorkflowOrchestrator:
         branch_log: Optional[Any] = None,
         analysis: Optional[RegulatoryAnalysis] = None,
         client_roles: Optional[Sequence[str]] = None,
+        weighted_impact: Optional[Any] = None,
     ) -> RecommendationResult:
         logger.info(
             "Agent 4 (Recommendations) invoked. min_severity=%s top_n=%d enrich=%s",
@@ -434,6 +441,7 @@ class RegulatoryWorkflowOrchestrator:
                     branch_log=branch_log,
                     analysis=analysis,
                     client_roles=client_roles,
+                    weighted_impact=weighted_impact,
                 )
             except Exception:
                 logger.exception("Agent 4 (Recommendations) crashed.")
